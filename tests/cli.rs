@@ -87,6 +87,7 @@ struct Request {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
+    target: Option<String>,
     body: Vec<u8>,
 }
 
@@ -179,6 +180,10 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Request> {
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.parse::<usize>().ok())
         .unwrap_or(0);
+    let target = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-target"))
+        .map(|(_, value)| value.clone());
     let mut body = buffer[header_end..].to_vec();
     while body.len() < content_length {
         let count = stream.read(&mut chunk).ok()?;
@@ -192,6 +197,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Request> {
         method,
         path,
         headers,
+        target,
         body,
     })
 }
@@ -1468,6 +1474,538 @@ fn two_profiles_do_not_overlap_writes_to_the_same_vault() {
     assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
 }
 
+fn aws_config(
+    directory: &Path,
+    port: u16,
+    endpoint_suffix: &str,
+    provider_name: &str,
+    access_key: &str,
+    secret_key: &str,
+) {
+    for (name, value) in [("access-key", access_key), ("secret-key", secret_key)] {
+        let path = directory.join(name);
+        std::fs::write(&path, value).expect("write AWS credential fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("AWS credential fixture mode");
+        }
+    }
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "{provider_name}"
+[providers.{provider_name}]
+kind = "aws-secrets-manager"
+region = "us-east-1"
+endpoint = "http://127.0.0.1:{port}{endpoint_suffix}"
+access_key_file = "access-key"
+secret_key_file = "secret-key"
+allow_http_loopback = true
+"#
+        ),
+    )
+    .expect("write AWS config");
+}
+
+fn gcp_config(directory: &Path, port: u16, project: &str, provider_name: &str) {
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "{provider_name}"
+[providers.{provider_name}]
+kind = "gcp-secret-manager"
+project = "{project}"
+endpoint = "http://127.0.0.1:{port}"
+allow_anonymous = true
+allow_http_loopback = true
+"#
+        ),
+    )
+    .expect("write GCP config");
+}
+
+#[test]
+fn two_cloud_profiles_share_one_write_lock_across_processes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("port").port();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_in_flight = Arc::clone(&in_flight);
+    let thread_max = Arc::clone(&max_in_flight);
+    let thread_release = Arc::clone(&release);
+    let thread_stop = Arc::clone(&stop);
+    thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let in_flight = Arc::clone(&thread_in_flight);
+                    let max_in_flight = Arc::clone(&thread_max);
+                    let release = Arc::clone(&thread_release);
+                    thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let Some(request) = read_request(&mut stream) else {
+                            return;
+                        };
+                        if request.target.as_deref() == Some("secretsmanager.PutSecretValue") {
+                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_in_flight.fetch_max(now, Ordering::SeqCst);
+                            while !release.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        let response = simple_response("200 OK", "{}");
+                        let _ = stream.write_all(response.as_bytes());
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let lock_dir = private_dir();
+    let lock_dir = lock_dir.to_string_lossy().to_string();
+    let alpha = tempfile_dir();
+    let beta = tempfile_dir();
+    // Same region and endpoint; one spelling has a trailing slash and the
+    // second profile uses a different name and different fake credentials.
+    aws_config(&alpha, port, "", "aws", "alpha-key", "alpha-secret");
+    aws_config(&beta, port, "/", "other", "beta-key", "beta-secret");
+
+    let alpha_dir = alpha.clone();
+    let beta_dir = beta.clone();
+    let lock_for_first = lock_dir.clone();
+    let lock_for_second = lock_dir.clone();
+    let first = thread::spawn(move || {
+        run(
+            &alpha_dir,
+            &["set", "nsvault-lock-aws"],
+            &[("NSVAULT_LOCK_DIR", lock_for_first.as_str())],
+            Some(b"from-alpha\n"),
+        )
+    });
+    let started = std::time::Instant::now();
+    while in_flight.load(Ordering::SeqCst) == 0 {
+        if started.elapsed() > Duration::from_secs(10) {
+            release.store(true, Ordering::SeqCst);
+            stop.store(true, Ordering::SeqCst);
+            panic!("first AWS write never reached the fixture");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let second = thread::spawn(move || {
+        run(
+            &beta_dir,
+            &["set", "nsvault-lock-aws"],
+            &[("NSVAULT_LOCK_DIR", lock_for_second.as_str())],
+            Some(b"from-beta\n"),
+        )
+    });
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        in_flight.load(Ordering::SeqCst),
+        1,
+        "second AWS profile reached the emulator while the first write was held"
+    );
+    release.store(true, Ordering::SeqCst);
+    let first = first.join().expect("first thread");
+    let second = second.join().expect("second thread");
+    stop.store(true, Ordering::SeqCst);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(!stderr(&first).contains("alpha-secret"));
+    assert!(!stderr(&second).contains("beta-secret"));
+    assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gcp_project_id_and_number_share_one_write_lock_across_processes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("port").port();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_in_flight = Arc::clone(&in_flight);
+    let thread_max = Arc::clone(&max_in_flight);
+    let thread_release = Arc::clone(&release);
+    let thread_stop = Arc::clone(&stop);
+    thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let in_flight = Arc::clone(&thread_in_flight);
+                    let max_in_flight = Arc::clone(&thread_max);
+                    let release = Arc::clone(&thread_release);
+                    thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let Some(request) = read_request(&mut stream) else {
+                            return;
+                        };
+                        if request.method == "POST" && request.path.ends_with(":addVersion") {
+                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_in_flight.fetch_max(now, Ordering::SeqCst);
+                            while !release.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        let response = simple_response("200 OK", "{}");
+                        let _ = stream.write_all(response.as_bytes());
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let lock_dir = private_dir();
+    let lock_dir = lock_dir.to_string_lossy().to_string();
+    let alpha = tempfile_dir();
+    let beta = tempfile_dir();
+    // One profile names the project by id, the other by number. Both resolve
+    // to one vault, and the lock must not use the project string.
+    gcp_config(&alpha, port, "floci-local", "gcp-id");
+    gcp_config(&beta, port, "123456789012", "gcp-number");
+
+    let alpha_dir = alpha.clone();
+    let beta_dir = beta.clone();
+    let lock_for_first = lock_dir.clone();
+    let lock_for_second = lock_dir.clone();
+    let first = thread::spawn(move || {
+        run(
+            &alpha_dir,
+            &["set", "nsvault-lock-gcp"],
+            &[("NSVAULT_LOCK_DIR", lock_for_first.as_str())],
+            Some(b"from-alpha\n"),
+        )
+    });
+    let started = std::time::Instant::now();
+    while in_flight.load(Ordering::SeqCst) == 0 {
+        if started.elapsed() > Duration::from_secs(10) {
+            release.store(true, Ordering::SeqCst);
+            stop.store(true, Ordering::SeqCst);
+            panic!("first GCP write never reached the fixture");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let second = thread::spawn(move || {
+        run(
+            &beta_dir,
+            &["set", "nsvault-lock-gcp"],
+            &[("NSVAULT_LOCK_DIR", lock_for_second.as_str())],
+            Some(b"from-beta\n"),
+        )
+    });
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        in_flight.load(Ordering::SeqCst),
+        1,
+        "GCP project number reached the emulator while the project id write was held"
+    );
+    release.store(true, Ordering::SeqCst);
+    let first = first.join().expect("first thread");
+    let second = second.join().expect("second thread");
+    stop.store(true, Ordering::SeqCst);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cloud_writes_fail_closed_when_the_lock_directory_is_not_private() {
+    let fixture = Fixture::start();
+    let lock_dir = tempfile_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("caller directory mode");
+    }
+    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
+
+    let aws = tempfile_dir();
+    aws_config(&aws, fixture.port, "", "aws", "test", "test");
+    let gcp = tempfile_dir();
+    std::fs::write(
+        gcp.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "gcp"
+[providers.gcp]
+kind = "gcp-secret-manager"
+project = "floci-local"
+endpoint = "http://127.0.0.1:{}/"
+allow_anonymous = true
+allow_http_loopback = true
+"#,
+            fixture.port
+        ),
+    )
+    .expect("write GCP config");
+    let azure = tempfile_dir();
+    std::fs::write(azure.join("token"), "floci-fake-token").expect("write Azure token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(azure.join("token"), std::fs::Permissions::from_mode(0o600))
+            .expect("Azure token mode");
+    }
+    std::fs::write(
+        azure.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "azure"
+[providers.azure]
+kind = "azure-key-vault"
+vault_url = "http://127.0.0.1:{}/devstoreaccount1-keyvault"
+token_file = "token"
+allow_http_loopback = true
+"#,
+            fixture.port
+        ),
+    )
+    .expect("write Azure config");
+
+    for (directory, command) in [
+        (&aws, "set"),
+        (&aws, "ensure"),
+        (&gcp, "set"),
+        (&azure, "set"),
+    ] {
+        let output = run(
+            directory,
+            &[command, "nsvault-lock-refused"],
+            &[("NSVAULT_LOCK_DIR", lock_dir.as_str())],
+            Some(b"must-not-land\n"),
+        );
+        assert!(!output.status.success(), "{command} must fail closed");
+        assert!(
+            stderr(&output).contains("not private"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("must-not-land"));
+    }
+    assert!(
+        fixture.requests().is_empty(),
+        "a cloud write must not contact the provider without the lock"
+    );
+}
+
+#[test]
+fn write_lock_rejects_a_relative_directory() {
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", "nsvault-relative-locks"),
+        ],
+        Some(b"must-not-land\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("absolute"), "{}", stderr(&set));
+    assert!(!stderr(&set).contains("must-not-land"));
+    assert!(fixture.requests().is_empty());
+    assert!(
+        !directory.join("nsvault-relative-locks").exists(),
+        "a relative lock path must not be created in the working directory"
+    );
+}
+
+fn private_dir() -> std::path::PathBuf {
+    let path = tempfile_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+    }
+    path
+}
+
+#[test]
+fn write_lock_refuses_a_non_private_directory_without_changing_it() {
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let lock_dir = tempfile_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("caller directory mode");
+    }
+    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+        ],
+        Some(b"must-not-land\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("not private"), "{}", stderr(&set));
+    assert!(!stderr(&set).contains("must-not-land"));
+    assert!(
+        fixture.requests().is_empty(),
+        "the provider must not be contacted before the lock is held"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&lock_dir)
+            .expect("lock directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "an existing caller-supplied lock directory must not be chmodded"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn write_lock_rejects_a_symlinked_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let target = private_dir();
+    let link = tempfile_dir().join("locks");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let link = link.to_str().expect("lock link").to_owned();
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", link.as_str()),
+        ],
+        Some(b"must-not-land\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("symbolic link"), "{}", stderr(&set));
+    assert!(!stderr(&set).contains("must-not-land"));
+    assert!(fixture.requests().is_empty());
+    let mode = std::fs::metadata(&target)
+        .expect("target metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "the symlink target must not be used or changed"
+    );
+    assert!(
+        std::fs::read_dir(&target)
+            .expect("target entries")
+            .next()
+            .is_none(),
+        "no lock file may be written through the symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_lock_rejects_a_symlinked_parent() {
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let real = private_dir();
+    let link = tempfile_dir().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let lock_dir = link.join("locks");
+    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+        ],
+        Some(b"must-not-land\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("symbolic link"), "{}", stderr(&set));
+    assert!(!stderr(&set).contains("must-not-land"));
+    assert!(fixture.requests().is_empty());
+    assert!(
+        !real.join("locks").exists(),
+        "nothing may be created through a symlinked ancestor"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_lock_creates_a_missing_private_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let lock_dir = private_dir().join("locks");
+    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+        ],
+        Some(b"new-value\n"),
+    );
+    assert!(set.status.success(), "{}", stderr(&set));
+    let mode = std::fs::metadata(&lock_dir)
+        .expect("lock directory metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "a missing lock directory is created 0700");
+    let entries: Vec<_> = std::fs::read_dir(&lock_dir)
+        .expect("lock directory entries")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one lock file for one identity");
+    assert!(
+        entries[0]
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .starts_with("write-")
+    );
+    let file_mode = std::fs::metadata(&entries[0])
+        .expect("lock file metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600, "lock files are created 0600");
+    assert!(!stderr(&set).contains("new-value"));
+}
+
 struct InfisicalFixture {
     port: u16,
     requests: Arc<Mutex<Vec<Request>>>,
@@ -1732,205 +2270,6 @@ session_env = "BW_SESSION"
     assert!(!stderr(&refused).contains("not-written"));
     let argv = std::fs::read_to_string(directory.join("argv.log")).expect("argv log");
     assert_eq!(argv.lines().count(), invoked, "refusal reached the CLI");
-}
-
-#[test]
-fn write_lock_rejects_a_relative_directory() {
-    let fixture = Fixture::start();
-    let directory = tempfile_dir();
-    vault_config(&directory, fixture.port);
-    let set = run(
-        &directory,
-        &["set", "apps/prod/db"],
-        &[
-            ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", "nsvault-relative-locks"),
-        ],
-        Some(b"must-not-land\n"),
-    );
-    assert!(!set.status.success());
-    assert!(stderr(&set).contains("absolute"), "{}", stderr(&set));
-    assert!(!stderr(&set).contains("must-not-land"));
-    assert!(fixture.requests().is_empty());
-    assert!(
-        !directory.join("nsvault-relative-locks").exists(),
-        "a relative lock path must not be created in the working directory"
-    );
-}
-
-fn private_dir() -> std::path::PathBuf {
-    let path = tempfile_dir();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .expect("private directory");
-    }
-    path
-}
-
-#[test]
-fn write_lock_refuses_a_non_private_directory_without_changing_it() {
-    let fixture = Fixture::start();
-    let directory = tempfile_dir();
-    vault_config(&directory, fixture.port);
-    let lock_dir = tempfile_dir();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755))
-            .expect("caller directory mode");
-    }
-    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
-    let set = run(
-        &directory,
-        &["set", "apps/prod/db"],
-        &[
-            ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
-        ],
-        Some(b"must-not-land\n"),
-    );
-    assert!(!set.status.success());
-    assert!(stderr(&set).contains("not private"), "{}", stderr(&set));
-    assert!(!stderr(&set).contains("must-not-land"));
-    assert!(
-        fixture.requests().is_empty(),
-        "the provider must not be contacted before the lock is held"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&lock_dir)
-            .expect("lock directory metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o755,
-            "an existing caller-supplied lock directory must not be chmodded"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn write_lock_rejects_a_symlinked_directory() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = Fixture::start();
-    let directory = tempfile_dir();
-    vault_config(&directory, fixture.port);
-    let target = private_dir();
-    let link = tempfile_dir().join("locks");
-    std::os::unix::fs::symlink(&target, &link).expect("symlink");
-    let link = link.to_str().expect("lock link").to_owned();
-    let set = run(
-        &directory,
-        &["set", "apps/prod/db"],
-        &[
-            ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", link.as_str()),
-        ],
-        Some(b"must-not-land\n"),
-    );
-    assert!(!set.status.success());
-    assert!(stderr(&set).contains("symbolic link"), "{}", stderr(&set));
-    assert!(!stderr(&set).contains("must-not-land"));
-    assert!(fixture.requests().is_empty());
-    let mode = std::fs::metadata(&target)
-        .expect("target metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(
-        mode, 0o700,
-        "the symlink target must not be used or changed"
-    );
-    assert!(
-        std::fs::read_dir(&target)
-            .expect("target entries")
-            .next()
-            .is_none(),
-        "no lock file may be written through the symlink"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn write_lock_rejects_a_symlinked_parent() {
-    let fixture = Fixture::start();
-    let directory = tempfile_dir();
-    vault_config(&directory, fixture.port);
-    let real = private_dir();
-    let link = tempfile_dir().join("link");
-    std::os::unix::fs::symlink(&real, &link).expect("symlink");
-    let lock_dir = link.join("locks");
-    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
-    let set = run(
-        &directory,
-        &["set", "apps/prod/db"],
-        &[
-            ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
-        ],
-        Some(b"must-not-land\n"),
-    );
-    assert!(!set.status.success());
-    assert!(stderr(&set).contains("symbolic link"), "{}", stderr(&set));
-    assert!(!stderr(&set).contains("must-not-land"));
-    assert!(fixture.requests().is_empty());
-    assert!(
-        !real.join("locks").exists(),
-        "nothing may be created through a symlinked ancestor"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn write_lock_creates_a_missing_private_directory() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = Fixture::start();
-    let directory = tempfile_dir();
-    vault_config(&directory, fixture.port);
-    let lock_dir = private_dir().join("locks");
-    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
-    let set = run(
-        &directory,
-        &["set", "apps/prod/db"],
-        &[
-            ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
-        ],
-        Some(b"new-value\n"),
-    );
-    assert!(set.status.success(), "{}", stderr(&set));
-    let mode = std::fs::metadata(&lock_dir)
-        .expect("lock directory metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode, 0o700, "a missing lock directory is created 0700");
-    let entries: Vec<_> = std::fs::read_dir(&lock_dir)
-        .expect("lock directory entries")
-        .map(|entry| entry.expect("entry").path())
-        .collect();
-    assert_eq!(entries.len(), 1, "one lock file for one identity");
-    assert!(
-        entries[0]
-            .file_name()
-            .expect("file name")
-            .to_string_lossy()
-            .starts_with("write-")
-    );
-    let file_mode = std::fs::metadata(&entries[0])
-        .expect("lock file metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(file_mode, 0o600, "lock files are created 0600");
-    assert!(!stderr(&set).contains("new-value"));
 }
 
 #[test]

@@ -12,8 +12,11 @@
 //! * Errors are retrieved with `nsvault_last_error`; the message is redacted
 //!   and is valid on the calling thread until the next FFI call.
 //! * `nsvault_set` and `nsvault_ensure` take the same per-machine, same-user
-//!   write lock as the CLI and the Rust API, keyed by the provider's canonical
-//!   origin and non-secret scope. A call can block behind another nsvault
+//!   write lock as the CLI and the Rust API, keyed by a provider identity
+//!   built from the canonical service endpoint or custom origin plus
+//!   non-secret scope. Recognized cloud endpoint aliases are folded onto one
+//!   conservative service or vault identity; an arbitrary custom URL alias is
+//!   not detectable. A call can block behind another nsvault
 //!   writer. A lock failure is returned as an error; there is no unlocked
 //!   write, and no timeout is imposed by this library. Writers coordinate only
 //!   when they resolve the same lock directory: the same OS user and the same

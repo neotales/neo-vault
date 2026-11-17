@@ -6,8 +6,11 @@
 //! or credential store of its own.
 //!
 //! `set` and `ensure` take the same per-machine, same-user write lock the CLI
-//! uses, keyed by the provider's canonical origin and non-secret scope. A
-//! `Client` shared across threads serializes writes for the same scope, and it
+//! uses, keyed by a provider identity built from the canonical service
+//! endpoint or custom origin plus non-secret scope. Recognized cloud endpoint
+//! aliases are folded onto one conservative service or vault identity; an
+//! arbitrary custom URL alias is not detectable. A `Client` shared across
+//! threads serializes writes for the same identity, and it
 //! serializes with other nsvault processes of the same OS user. A call can
 //! block until the other writer exits. Lock failures are returned as errors;
 //! there is no unlocked write. The lock does not cover other clients, other

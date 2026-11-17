@@ -106,7 +106,7 @@ Observed in this workspace on 2026-11-17:
 ```text
 test infisical_reads_writes_and_lists_against_the_pinned_image ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-finished in 148.99s
+finished in 44.39s
 ```
 
 The three testcontainers-managed containers were gone after the run.
@@ -164,7 +164,7 @@ Observed in this workspace on 2026-11-17, with `NSVAULT_TEST_BW` pointing at
 ```text
 test vaultwarden_reads_and_writes_through_the_cli ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-finished in 81.26s
+finished in 114.59s
 ```
 
 The testcontainers-managed container was gone after the run. The temporary
