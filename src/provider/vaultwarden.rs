@@ -1,18 +1,21 @@
 //! Vaultwarden/Bitwarden provider backed by the `bw` CLI.
 //!
-//! The adapter never logs in, unlocks, or changes CLI state; the caller
-//! supplies an unlocked session through `BW_SESSION` (or a file). Reads parse
-//! the CLI's JSON in memory. A write sends the complete item to the CLI on
-//! stdin as encoded JSON, so the value never appears in `argv`, and the CLI's
-//! echoed item is discarded rather than printed. Values never echo to an error.
+//! The adapter never logs in or unlocks; the caller supplies an unlocked
+//! session through `BW_SESSION` (or a file). Reads parse the CLI's JSON in
+//! memory and use the CLI's local copy, which can be stale until `bw sync`.
+//! A write sends the complete item to the CLI on stdin as encoded JSON, so the
+//! value never appears in `argv`, and the CLI's echoed item is discarded rather
+//! than printed. Values never echo to an error.
 //!
-//! A write is a whole-item read-modify-write through the CLI. The CLI sends
-//! `lastKnownRevisionDate` from its local copy, and both the Bitwarden server
-//! and Vaultwarden reject a stale revision, so an external client's update
-//! since that copy fails the write instead of being overwritten. That check is
-//! not coordination: the CLI's local copy can be stale until it is synced, a
-//! server may not enforce the check, the check tolerates a one-second
-//! difference, and an update accepted after this one simply wins later. This
+//! A write holds one shared lock, runs `bw sync` (failing closed), and then
+//! reads and updates the whole item. Because the sync happens under the lock,
+//! a second profile with its own CLI state sees an item created by the first
+//! instead of creating a duplicate. Concurrent external clients are not
+//! coordinated: a change before the sync is incorporated (the selected field is
+//! replaced), and a change between the sync and the edit is rejected by the
+//! server's revision check where the server enforces it. That check is not
+//! coordination: the check tolerates a one-second difference, a server may not
+//! enforce it, and an update accepted after this one simply wins later. This
 //! adapter does not claim to preserve concurrent external changes.
 
 use std::io::Write;
@@ -180,6 +183,18 @@ impl VaultwardenProvider {
         crate::provider::lock::identity("vaultwarden", "shared", &[])
     }
 
+    /// Refreshes the CLI's local copy from the server.
+    ///
+    /// Called while the write lock is held, before the existence check. A
+    /// failure is fatal: an unsynced copy can miss an item that another CLI
+    /// state already created, and treating that as absence would create a
+    /// duplicate instead of updating the existing item.
+    fn sync(&self) -> Result<()> {
+        self.run(&["sync"])
+            .map_err(|_| Error::new("Vaultwarden sync failed; the write was not attempted"))?;
+        Ok(())
+    }
+
     fn write_item(&self, id: Option<&str>, item: &Value) -> Result<()> {
         let document = serde_json::to_vec(item)
             .map_err(|_| Error::new("cannot encode the Vaultwarden item"))?;
@@ -246,12 +261,13 @@ impl Provider for VaultwardenProvider {
             })
     }
 
-    /// Writes one field by reading the item, changing that field, and sending
-    /// the whole item back. Sibling fields are preserved within this call.
-    /// Concurrent external clients are not coordinated; the server's revision
-    /// check can reject a stale write, but it is not a guarantee.
+    /// Writes one field by syncing, reading the item, changing that field, and
+    /// sending the whole item back. The lock is held across the sync and the
+    /// write, so another nsvault writer cannot change the item in between.
+    /// Sibling fields are preserved within this call. Concurrent external
+    /// clients are not coordinated; the server's revision check can reject a
+    /// change that lands after the sync, but it is not a guarantee.
     fn set(&self, raw_key: &str, value: &Secret) -> Result<()> {
-        let _write_lock = crate::provider::lock::acquire(&self.write_identity())?;
         let key = Key::parse(raw_key)?;
         if key.field() == Some("id") {
             return Err(Error::new("Vaultwarden item ids cannot be set"));
@@ -266,6 +282,8 @@ impl Provider for VaultwardenProvider {
                 "Vaultwarden values are limited to {MAX_SET_BYTES} bytes"
             )));
         }
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity())?;
+        self.sync()?;
         match self.find_item(key.path())? {
             Some(mut item) => {
                 let id = item

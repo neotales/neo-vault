@@ -137,19 +137,23 @@ the way the clients do: PBKDF2-SHA256 over the email, HKDF-Expand with `enc` and
 iterations is the minimum this Vaultwarden release accepts. The address is
 `@example.invalid` and the password is a fixed fake.
 
-The CLI's state lives in a temporary `BITWARDENCLI_APPDATA_DIR`. The test logs
-in, explicitly unlocks the vault (a login can leave the CLI locked, and a write
-needs the user key), writes the session to an owner-only file, and configures
-the adapter with a small wrapper script that sets that state directory and
-executes the pinned CLI. No process-wide environment variable is changed.
+Two independent CLI states are prepared, each with its own
+`BITWARDENCLI_APPDATA_DIR`, wrapper script, session file, and configuration.
+The second state logs in before the item exists, so its local copy is missing
+it. The first state creates `DB`; the second state then sets `DB#username`.
+Because a write syncs under the shared lock before the lookup, the second state
+sees the item and updates it instead of creating a duplicate. The run asserts
+both fields on one item, replaces the password from the first state, adds a
+custom field from the second, and checks every sibling survives. The refusal of
+`ensure` is checked too.
 
-The run covers `list`, `get`, `set` on a missing item (create), `set` on
-`#password` (replace with the sibling `#username` and a custom field still
-present), `get` for those siblings, and the refusal of `ensure`. It then
-starts a second CLI state for the same account, edits `login.password`
-externally, and asserts that the first state's next write fails instead of
-overwriting it; after `bw sync`, the adapter reads the external value back.
-This exercises the server's `lastKnownRevisionDate` check through the CLI.
+The second state then acts as an external writer: it edits `login.password`
+directly. The adapter's next write syncs, preserves that external password, and
+replaces only `notes`. Finally, the test captures the first state's item, lets
+the second state advance the revision, and replays the captured stale item
+through the CLI; the server must reject it. That checks the residual
+sync-to-edit window, not coordination. A loopback fixture with a failing `sync`
+asserts that no lookup or write is attempted and no value leaks.
 
 Run it explicitly:
 
@@ -162,9 +166,9 @@ Observed in this workspace on 2026-11-17, with `NSVAULT_TEST_BW` pointing at
 `@bitwarden/cli` 2025.6.1:
 
 ```text
-test vaultwarden_reads_and_writes_through_the_cli ... ok
+test vaultwarden_two_cli_states_preserve_fields ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-finished in 114.59s
+finished in 123.68s
 ```
 
 The testcontainers-managed container was gone after the run. The temporary

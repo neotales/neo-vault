@@ -180,17 +180,22 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   item name is created as a login. There is no `ensure`: a create-then-race
   cannot be made atomic through this CLI, and two items with the same name are
   legal in Bitwarden.
+  A write holds one shared lock, runs `bw sync` (failing closed), and only then
+  reads and updates the item. Two profiles with separate CLI state directories
+  therefore update the same item without losing a field. Reads (`get`, `ls`)
+  use the local copy and can be stale until a write or an explicit sync.
   Concurrent external clients are not coordinated. The CLI sends
-  `lastKnownRevisionDate` from its local copy, and the Bitwarden server and
+  `lastKnownRevisionDate` from the synced copy, and the Bitwarden server and
   Vaultwarden reject an update whose revision is more than one second stale
   (Bitwarden `CipherService.ValidateCipherLastKnownRevisionDate`, Vaultwarden
-  `update_cipher_from_data`). That turns a common external edit into a failed
-  write, but it is not coordination: the CLI's copy can be stale until it is
-  synced, a server may not enforce the check, the one-second window can let an
-  update through, and a later accepted write wins. This adapter does not claim
-  to preserve concurrent external changes. Writes take one conservative
-  same-user advisory lock shared by every Vaultwarden profile on this machine,
-  because the configuration has no server address and wrapper paths differ.
+  `update_cipher_from_data`). A change before the sync is incorporated (the
+  selected field is replaced) and a change between the sync and the edit is
+  rejected where the server enforces the check. That is not coordination: the
+  one-second window can let an update through, a server may not enforce the
+  check, and a later accepted write wins. This adapter does not claim to
+  preserve concurrent external changes. Writes take one conservative same-user
+  advisory lock shared by every Vaultwarden profile on this machine, because
+  the configuration has no server address and wrapper paths differ.
 - Proton writes are unsupported because the documented update command takes
   the value in `argv`.
 - GitHub repository secrets only. Organization, environment, Codespaces, and

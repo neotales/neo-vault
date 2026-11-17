@@ -2167,6 +2167,56 @@ allow_http_loopback = true
     );
 }
 
+#[test]
+fn vaultwarden_sync_failure_does_not_write() {
+    let directory = tempfile_dir();
+    let script = directory.join("bw");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{dir}/argv.log"
+case "$*" in
+  *" sync"*) exit 1 ;;
+  *"list items"*) printf '[]' ;;
+  *"create item"*|*"edit item"*) cat > /dev/null ;;
+  *) exit 2 ;;
+esac
+"#,
+            dir = directory.display()
+        ),
+    )
+    .expect("write fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "v"
+[providers.v]
+kind = "vaultwarden"
+command = "{}"
+session_env = "BW_SESSION"
+"#,
+            script.display()
+        ),
+    )
+    .expect("write config");
+
+    let set = run(
+        &directory,
+        &["set", "ITEM"],
+        &[("BW_SESSION", "test-session")],
+        Some(b"must-not-write\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("sync failed"));
+    assert!(!stderr(&set).contains("must-not-write"));
+    assert!(!stdout(&set).contains("must-not-write"));
+    let argv = std::fs::read_to_string(directory.join("argv.log")).expect("argv log");
+    assert_eq!(argv.trim(), "--nointeraction sync");
+}
+
 fn decode_recorded_item(path: &Path) -> Value {
     let encoded = std::fs::read_to_string(path).expect("recorded stdin");
     let bytes = base64::engine::general_purpose::STANDARD
@@ -2188,6 +2238,7 @@ fn vaultwarden_set_writes_through_stdin_and_keeps_sibling_fields() {
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "{dir}/argv.log"
 case "$*" in
+  *" sync"*) : ;;
   *"list items"*) cat "{dir}/items.json" ;;
   *"get item"*) cat "{dir}/item.json" ;;
   *"create item"*|*"edit item"*)
@@ -2300,6 +2351,7 @@ if mkdir "$root/held" 2>/dev/null; then
 fi
 printf '%s %s\n' "{label}" "$*" >> "$root/invocations.log"
 case "$*" in
+  *" sync"*) : ;;
   *"list items"*) printf '[]' ;;
   *"create item"*|*"edit item"*) cat > /dev/null ;;
   *) exit 2 ;;

@@ -12,11 +12,15 @@
 //! container; testcontainers removes that container on drop. It never touches
 //! another container, network, volume, or image.
 //!
-//! The last phase uses a second CLI state as an external writer: it edits the
-//! item and asserts that the first state's stale whole-item write is refused
-//! and the external value survives. That checks the server's
-//! `lastKnownRevisionDate` behavior; it is not a claim that nsvault
-//! coordinates external clients.
+//! Two independent CLI states (separate `BITWARDENCLI_APPDATA_DIR` values)
+//! exercise the shared lock and the sync-before-write behavior: the second
+//! state logs in before the item exists, the first creates it, and the second
+//! updates a sibling field. The run asserts one item with both fields, not a
+//! duplicate. It then uses the second state as an external writer and checks
+//! that a change made before a write is preserved (the adapter syncs) while a
+//! stale whole-item replay is rejected by the server's revision check. That
+//! check is not coordination; nsvault does not claim to preserve concurrent
+//! external changes.
 //!
 //! The CLI must accept a plaintext loopback server URL. Packages after
 //! `@bitwarden/cli` 2025.6.1 reject any non-HTTPS server URL before sending a
@@ -167,6 +171,145 @@ fn protected_user_key(enc_key: &[u8; 32], mac_key: &[u8; 32], user_key: &[u8; 64
     )
 }
 
+struct Profile {
+    appdata: PathBuf,
+    session: String,
+    config: PathBuf,
+}
+
+/// Prepares one independent Bitwarden CLI state (its own data directory).
+fn prepare_profile(bw: &Path, directory: &Path, name: &str, base: &str) -> Profile {
+    let appdata = directory.join(format!("state-{name}"));
+    let configured = run_bw(bw, &appdata, &["config", "server", base], None, None, None);
+    assert!(configured.status.success(), "bw config server failed");
+    let login = run_bw(
+        bw,
+        &appdata,
+        &["login", EMAIL, "--passwordenv", "BW_PASSWORD", "--raw"],
+        Some(PASSWORD),
+        None,
+        None,
+    );
+    assert!(
+        login.status.success(),
+        "bw login failed: {}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+    let login_session = String::from_utf8(login.stdout)
+        .expect("login session is UTF-8")
+        .trim()
+        .to_owned();
+    // `login` can return a session while the vault is still locked, and
+    // `unlock` can return no session when login already unlocked it. Take
+    // whichever non-empty session the CLI produced and verify it is unlocked.
+    let unlock = run_bw(
+        bw,
+        &appdata,
+        &["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
+        Some(PASSWORD),
+        None,
+        None,
+    );
+    assert!(
+        unlock.status.success(),
+        "bw unlock failed after login; the session is not usable for writes"
+    );
+    let unlock_session = String::from_utf8(unlock.stdout)
+        .expect("unlock session is UTF-8")
+        .trim()
+        .to_owned();
+    let session = if unlock_session.is_empty() {
+        login_session
+    } else {
+        unlock_session
+    };
+    assert!(
+        !session.is_empty(),
+        "bw returned no session after login or unlock"
+    );
+    let status = run_bw(bw, &appdata, &["status"], None, Some(&session), None);
+    assert!(status.status.success(), "bw status failed");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("\"status\":\"unlocked\""),
+        "bw session is not unlocked"
+    );
+
+    let session_name = format!("session-{name}");
+    let session_file = directory.join(&session_name);
+    std::fs::write(&session_file, &session).expect("write session file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&session_file, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod session");
+    }
+
+    let wrapper = directory.join(format!("bw-{name}"));
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport BITWARDENCLI_APPDATA_DIR='{}'\nexec '{}' \"$@\"\n",
+            appdata.display(),
+            bw.display()
+        ),
+    )
+    .expect("write bw wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod wrapper");
+    }
+
+    let config = directory.join(format!("config-{name}.toml"));
+    std::fs::write(
+        &config,
+        format!(
+            r#"version = 1
+provider = "vw"
+[providers.vw]
+kind = "vaultwarden"
+command = "{}"
+session_file = "{}"
+"#,
+            wrapper.display(),
+            session_name
+        ),
+    )
+    .expect("write config");
+
+    Profile {
+        appdata,
+        session,
+        config,
+    }
+}
+
+fn bw_item(bw: &Path, profile: &Profile, id_or_name: &str) -> Value {
+    let output = run_bw(
+        bw,
+        &profile.appdata,
+        &["get", "item", id_or_name],
+        None,
+        Some(&profile.session),
+        None,
+    );
+    assert!(output.status.success(), "bw get item failed");
+    serde_json::from_slice(&output.stdout).expect("item JSON")
+}
+
+fn bw_edit_item(bw: &Path, profile: &Profile, id: &str, item: &Value) -> std::process::Output {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(item.to_string());
+    run_bw(
+        bw,
+        &profile.appdata,
+        &["edit", "item", id],
+        None,
+        Some(&profile.session),
+        Some(encoded.as_bytes()),
+    )
+}
+
 fn register_account(agent: &ureq::Agent, base: &str) {
     let (status, token) = post(
         agent,
@@ -201,7 +344,7 @@ fn register_account(agent: &ureq::Agent, base: &str) {
 
 #[test]
 #[ignore = "requires Docker and a pinned bw CLI; opt in with --ignored"]
-fn vaultwarden_reads_and_writes_through_the_cli() {
+fn vaultwarden_two_cli_states_preserve_fields() {
     let bw = bw_path();
     let container = GenericImage::new("vaultwarden/server", "1.37.5")
         .with_exposed_port(80.tcp())
@@ -232,222 +375,151 @@ fn vaultwarden_reads_and_writes_through_the_cli() {
             .expect("time")
             .as_nanos()
     ));
-    let appdata = directory.join("bw-state");
-    std::fs::create_dir_all(&appdata).expect("Bitwarden state directory");
-
     register_account(&agent, &base);
-    let configured = run_bw(
-        &bw,
-        &appdata,
-        &["config", "server", &base],
-        None,
-        None,
-        None,
-    );
-    assert!(configured.status.success(), "bw config server failed");
-    let login = run_bw(
-        &bw,
-        &appdata,
-        &["login", EMAIL, "--passwordenv", "BW_PASSWORD", "--raw"],
-        Some(PASSWORD),
-        None,
-        None,
-    );
-    assert!(
-        login.status.success(),
-        "bw login failed; pin a CLI that accepts a loopback HTTP server at NSVAULT_TEST_BW"
-    );
-    // `login` can return a session while the CLI still reports the vault as
-    // locked. A write needs the user key, so ask for an explicit unlock.
-    let unlock = run_bw(
-        &bw,
-        &appdata,
-        &["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
-        Some(PASSWORD),
-        None,
-        None,
-    );
-    assert!(
-        unlock.status.success(),
-        "bw unlock failed after login; the session is not usable for writes"
-    );
-    let session = String::from_utf8(unlock.stdout).expect("session is UTF-8");
-    let session = session.trim();
-    assert!(!session.is_empty(), "bw unlock returned no session");
 
-    let session_file = directory.join("session");
-    std::fs::write(&session_file, session).expect("write session file");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&session_file, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod session");
-    }
+    // Two independent CLI states for the same account. B logs in before the
+    // item exists, so its local copy is missing it until a sync.
+    let state_a = prepare_profile(&bw, &directory, "a", &base);
+    let state_b = prepare_profile(&bw, &directory, "b", &base);
+    let client_a = Client::open(&state_a.config).expect("open the first profile");
+    let client_b = Client::open(&state_b.config).expect("open the second profile");
 
-    let wrapper = directory.join("bw");
-    std::fs::write(
-        &wrapper,
-        format!(
-            "#!/bin/sh\nexport BITWARDENCLI_APPDATA_DIR='{}'\nexec '{}' \"$@\"\n",
-            appdata.display(),
-            bw.display()
-        ),
-    )
-    .expect("write bw wrapper");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod wrapper");
-    }
-
-    let config = directory.join("config.toml");
-    std::fs::write(
-        &config,
-        format!(
-            r#"version = 1
-provider = "vw"
-[providers.vw]
-kind = "vaultwarden"
-command = "{}"
-session_file = "session"
-"#,
-            wrapper.display()
-        ),
-    )
-    .expect("write config");
-
-    let client = Client::open(&config).expect("open client");
-    client
+    client_a
         .set(Some("vw"), "DB", &Secret::new(b"initial-value".to_vec()))
-        .expect("create a login item");
-    client
+        .expect("create a login item from the first state");
+
+    // The adapter syncs under the lock, so B must see A's item and update a
+    // sibling field instead of creating a second item.
+    client_b
         .set(Some("vw"), "DB#username", &Secret::new(b"alice".to_vec()))
-        .expect("set the username");
-    client
+        .expect("update a sibling field from the second state");
+    let password = client_b
+        .get(Some("vw"), "DB#password")
+        .expect("read the password from the second state");
+    assert_eq!(password.expose(), b"initial-value");
+    let username = client_b
+        .get(Some("vw"), "DB#username")
+        .expect("read the username from the second state");
+    assert_eq!(username.expose(), b"alice");
+
+    let synced = run_bw(
+        &bw,
+        &state_b.appdata,
+        &["sync"],
+        None,
+        Some(&state_b.session),
+        None,
+    );
+    assert!(synced.status.success(), "bw sync failed");
+    let listing = run_bw(
+        &bw,
+        &state_b.appdata,
+        &["list", "items"],
+        None,
+        Some(&state_b.session),
+        None,
+    );
+    assert!(listing.status.success(), "bw list items failed");
+    let items: Vec<Value> = serde_json::from_slice(&listing.stdout).expect("item list");
+    assert_eq!(
+        items.iter().filter(|item| item["name"] == "DB").count(),
+        1,
+        "the second state created a duplicate item instead of updating the first"
+    );
+
+    client_a
         .set(
             Some("vw"),
             "DB#password",
             &Secret::new(b"replacement-value".to_vec()),
         )
-        .expect("replace the password");
-    client
-        .set(Some("vw"), "DB#api", &Secret::new(b"api-key".to_vec()))
-        .expect("add a custom field");
-
-    let password = client
+        .expect("replace the password from the first state");
+    let password = client_a
         .get(Some("vw"), "DB#password")
-        .expect("read password");
+        .expect("read the replaced password");
     assert_eq!(password.expose(), b"replacement-value");
-    let username = client
+    let username = client_a
         .get(Some("vw"), "DB#username")
-        .expect("read username");
+        .expect("read the sibling username");
     assert_eq!(username.expose(), b"alice");
-    let custom = client.get(Some("vw"), "DB#api").expect("read custom field");
+
+    client_b
+        .set(Some("vw"), "DB#api", &Secret::new(b"api-key".to_vec()))
+        .expect("add a custom field from the second state");
+    let custom = client_b
+        .get(Some("vw"), "DB#api")
+        .expect("read the custom field");
     assert_eq!(custom.expose(), b"api-key");
+    let password = client_b
+        .get(Some("vw"), "DB#password")
+        .expect("read the password after the second-state write");
+    assert_eq!(password.expose(), b"replacement-value");
 
-    let listed = client.list(Some("vw"), "").expect("list items");
-    assert!(listed.iter().any(|key| key.key == "DB"));
-
-    let ensured = client.ensure(
+    let ensured = client_a.ensure(
         Some("vw"),
         "DB",
         &Secret::new(b"must-not-be-written".to_vec()),
     );
     assert!(ensured.is_err(), "Vaultwarden ensure must stay unsupported");
 
-    // A second CLI state (another device) edits the item. The server advances
-    // the item revision, so this state's next write carries a stale
-    // `lastKnownRevisionDate` and must be refused instead of overwriting the
-    // external value.
-    let external_appdata = directory.join("bw-external");
-    let external_config = run_bw(
-        &bw,
-        &external_appdata,
-        &["config", "server", &base],
-        None,
-        None,
-        None,
-    );
-    assert!(
-        external_config.status.success(),
-        "second-device server configuration failed"
-    );
-    let external_login = run_bw(
-        &bw,
-        &external_appdata,
-        &["login", EMAIL, "--passwordenv", "BW_PASSWORD", "--raw"],
-        Some(PASSWORD),
-        None,
-        None,
-    );
-    assert!(
-        external_login.status.success(),
-        "second-device login failed"
-    );
-    let external_unlock = run_bw(
-        &bw,
-        &external_appdata,
-        &["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
-        Some(PASSWORD),
-        None,
-        None,
-    );
-    assert!(
-        external_unlock.status.success(),
-        "second-device unlock failed"
-    );
-    let external_session =
-        String::from_utf8(external_unlock.stdout).expect("external session is UTF-8");
-    let external_session = external_session.trim();
-
-    let current = run_bw(
-        &bw,
-        &external_appdata,
-        &["get", "item", "DB"],
-        None,
-        Some(external_session),
-        None,
-    );
-    assert!(
-        current.status.success(),
-        "second device could not read the item"
-    );
-    let mut item: Value = serde_json::from_slice(&current.stdout).expect("item JSON");
+    // External writer: edit through the second CLI state without the adapter.
+    let mut item = bw_item(&bw, &state_b, "DB");
     let id = item["id"].as_str().expect("item id").to_owned();
     item["login"]["password"] = Value::String("external-value".to_owned());
-    let encoded = base64::engine::general_purpose::STANDARD.encode(item.to_string());
-    let external_edit = run_bw(
-        &bw,
-        &external_appdata,
-        &["edit", "item", &id],
-        None,
-        Some(external_session),
-        Some(encoded.as_bytes()),
-    );
-    assert!(
-        external_edit.status.success(),
-        "second device could not edit the item"
-    );
+    let external = bw_edit_item(&bw, &state_b, &id, &item);
+    assert!(external.status.success(), "external edit failed");
 
-    let refused = client.set(
-        Some("vw"),
-        "DB#password",
-        &Secret::new(b"adapter-value".to_vec()),
-    );
-    let message = match refused {
-        Err(error) => error.to_string(),
-        Ok(()) => panic!("a write with a stale revision must fail"),
-    };
-    assert!(!message.contains("external-value"));
-    assert!(!message.contains("adapter-value"));
-
-    let sync = run_bw(&bw, &appdata, &["sync"], None, Some(session), None);
-    assert!(sync.status.success(), "bw sync failed");
-    let external = client
+    // The adapter syncs before writing, so it sees the external password and
+    // preserves it while replacing another field.
+    client_a
+        .set(Some("vw"), "DB#notes", &Secret::new(b"note-text".to_vec()))
+        .expect("update notes after an external edit");
+    let password = client_a
         .get(Some("vw"), "DB#password")
-        .expect("read the external value after sync");
-    assert_eq!(external.expose(), b"external-value");
+        .expect("read the external password");
+    assert_eq!(password.expose(), b"external-value");
+    let notes = client_a
+        .get(Some("vw"), "DB#notes")
+        .expect("read the notes");
+    assert_eq!(notes.expose(), b"note-text");
+
+    // Residual window: a change between the sync and the edit is rejected by
+    // the server's revision check. Capture the first state's current item,
+    // let the second state advance the revision, then replay the stale item
+    // directly through the CLI.
+    let captured = bw_item(&bw, &state_a, &id);
+    let synced = run_bw(
+        &bw,
+        &state_b.appdata,
+        &["sync"],
+        None,
+        Some(&state_b.session),
+        None,
+    );
+    assert!(synced.status.success(), "bw sync failed");
+    let mut current = bw_item(&bw, &state_b, &id);
+    current["login"]["password"] = Value::String("external-two".to_owned());
+    let external = bw_edit_item(&bw, &state_b, &id, &current);
+    assert!(external.status.success(), "second external edit failed");
+    let stale = bw_edit_item(&bw, &state_a, &id, &captured);
+    assert!(
+        !stale.status.success(),
+        "the server accepted a whole-item write with a stale revision"
+    );
+
+    let synced = run_bw(
+        &bw,
+        &state_a.appdata,
+        &["sync"],
+        None,
+        Some(&state_a.session),
+        None,
+    );
+    assert!(synced.status.success(), "bw sync failed");
+    let password = client_a
+        .get(Some("vw"), "DB#password")
+        .expect("read the external value after the stale write");
+    assert_eq!(password.expose(), b"external-two");
 
     std::fs::remove_dir_all(directory).expect("remove temp dir");
     // `container` is dropped here; testcontainers removes only this container.
