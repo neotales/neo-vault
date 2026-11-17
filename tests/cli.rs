@@ -1507,6 +1507,24 @@ allow_http_loopback = true
     .expect("write AWS config");
 }
 
+fn gcp_config(directory: &Path, port: u16, project: &str, provider_name: &str) {
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "{provider_name}"
+[providers.{provider_name}]
+kind = "gcp-secret-manager"
+project = "{project}"
+endpoint = "http://127.0.0.1:{port}"
+allow_anonymous = true
+allow_http_loopback = true
+"#
+        ),
+    )
+    .expect("write GCP config");
+}
+
 #[test]
 fn two_cloud_profiles_share_one_write_lock_across_processes() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
@@ -1604,6 +1622,104 @@ fn two_cloud_profiles_share_one_write_lock_across_processes() {
     assert!(second.status.success(), "{}", stderr(&second));
     assert!(!stderr(&first).contains("alpha-secret"));
     assert!(!stderr(&second).contains("beta-secret"));
+    assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gcp_project_id_and_number_share_one_write_lock_across_processes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("port").port();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_in_flight = Arc::clone(&in_flight);
+    let thread_max = Arc::clone(&max_in_flight);
+    let thread_release = Arc::clone(&release);
+    let thread_stop = Arc::clone(&stop);
+    thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let in_flight = Arc::clone(&thread_in_flight);
+                    let max_in_flight = Arc::clone(&thread_max);
+                    let release = Arc::clone(&thread_release);
+                    thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let Some(request) = read_request(&mut stream) else {
+                            return;
+                        };
+                        if request.method == "POST" && request.path.ends_with(":addVersion") {
+                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_in_flight.fetch_max(now, Ordering::SeqCst);
+                            while !release.load(Ordering::SeqCst) {
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        let response = simple_response("200 OK", "{}");
+                        let _ = stream.write_all(response.as_bytes());
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let lock_dir = private_dir();
+    let lock_dir = lock_dir.to_string_lossy().to_string();
+    let alpha = tempfile_dir();
+    let beta = tempfile_dir();
+    // One profile names the project by id, the other by number. Both resolve
+    // to one vault, and the lock must not use the project string.
+    gcp_config(&alpha, port, "floci-local", "gcp-id");
+    gcp_config(&beta, port, "123456789012", "gcp-number");
+
+    let alpha_dir = alpha.clone();
+    let beta_dir = beta.clone();
+    let lock_for_first = lock_dir.clone();
+    let lock_for_second = lock_dir.clone();
+    let first = thread::spawn(move || {
+        run(
+            &alpha_dir,
+            &["set", "nsvault-lock-gcp"],
+            &[("NSVAULT_LOCK_DIR", lock_for_first.as_str())],
+            Some(b"from-alpha\n"),
+        )
+    });
+    let started = std::time::Instant::now();
+    while in_flight.load(Ordering::SeqCst) == 0 {
+        if started.elapsed() > Duration::from_secs(10) {
+            release.store(true, Ordering::SeqCst);
+            stop.store(true, Ordering::SeqCst);
+            panic!("first GCP write never reached the fixture");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let second = thread::spawn(move || {
+        run(
+            &beta_dir,
+            &["set", "nsvault-lock-gcp"],
+            &[("NSVAULT_LOCK_DIR", lock_for_second.as_str())],
+            Some(b"from-beta\n"),
+        )
+    });
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        in_flight.load(Ordering::SeqCst),
+        1,
+        "GCP project number reached the emulator while the project id write was held"
+    );
+    release.store(true, Ordering::SeqCst);
+    let first = first.join().expect("first thread");
+    let second = second.join().expect("second thread");
+    stop.store(true, Ordering::SeqCst);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(second.status.success(), "{}", stderr(&second));
     assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
 }
 

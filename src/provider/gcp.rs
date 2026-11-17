@@ -131,13 +131,16 @@ impl GcpSecretManagerProvider {
         self.request("POST", &url, Some(body.as_bytes()))
     }
 
-    /// Returns the same-user write-lock identity for this endpoint and project.
+    /// Returns the same-user write-lock identity for this endpoint.
     ///
-    /// The identity excludes the token, profile name, and config path. Two
-    /// profiles for the same endpoint and project share one lock even when
-    /// they use different credentials.
+    /// A recognized Google Secret Manager hostname maps to one broad lock for
+    /// the service, so endpoint aliases share it. A custom endpoint keeps its
+    /// canonical origin. The project is deliberately not an input: a project
+    /// id and its numeric project number are two spellings of one project, and
+    /// nsvault cannot map one to the other locally. The token, profile name,
+    /// and config path are also excluded.
     fn write_identity(&self) -> Result<String> {
-        lock_identity(&self.base, &self.project)
+        lock_identity(&self.base)
     }
 }
 
@@ -279,21 +282,36 @@ impl Provider for GcpSecretManagerProvider {
     }
 }
 
-/// Builds the write-lock identity from the endpoint origin and project only.
+/// Builds the write-lock identity from a recognized Google service hostname
+/// or, for a custom endpoint, its canonical origin.
 ///
-/// [`crate::provider::lock::canonical_origin`] folds scheme and host case,
-/// default ports, and a trailing slash, so two profiles that spell one
-/// endpoint differently resolve the same lock. Project ids are lowercase by
-/// definition, so the scope is trimmed and lowercased. Credentials are not an
-/// input.
-fn lock_identity(base: &url::Url, project: &str) -> Result<String> {
+/// Every recognized Google Secret Manager hostname (`secretmanager.*.googleapis.com`,
+/// including the plain host, mTLS, and regional `rep` spellings) maps to one
+/// broad lock for the service. The project is not an input, because a project
+/// id and its project number name the same project and cannot be mapped
+/// locally. A custom endpoint (an emulator, proxy, or arbitrary DNS name)
+/// keeps its canonical origin, so two custom names for one vault are not
+/// serialized by this mechanism.
+fn lock_identity(base: &url::Url) -> Result<String> {
+    if is_google_secret_manager_host(base) {
+        return Ok(crate::provider::lock::identity(
+            LOCK_KIND,
+            "google-secret-manager",
+            &[],
+        ));
+    }
     let origin = crate::provider::lock::canonical_origin(base)?;
-    let project = project.trim().to_ascii_lowercase();
-    Ok(crate::provider::lock::identity(
-        LOCK_KIND,
-        &origin,
-        &[&project],
-    ))
+    Ok(crate::provider::lock::identity(LOCK_KIND, &origin, &[]))
+}
+
+/// Returns whether the URL host is a Google Secret Manager service endpoint.
+fn is_google_secret_manager_host(base: &url::Url) -> bool {
+    let Some(host) = base.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (host.starts_with("secretmanager.") || host.starts_with("secretmanager-fips."))
+        && host.ends_with(".googleapis.com")
 }
 
 /// Maps a response status to a fixed message without echoing response fields.
@@ -431,26 +449,38 @@ mod tests {
     }
 
     #[test]
-    fn write_identity_normalizes_the_endpoint_and_project() {
-        let plain = url::Url::parse("http://127.0.0.1:4588").expect("url");
-        let trailing = url::Url::parse("HTTP://127.0.0.1:4588/").expect("url");
+    fn write_identity_maps_recognized_gcp_endpoints_to_one_service_lock() {
+        let plain = url::Url::parse("https://secretmanager.googleapis.com").expect("plain");
+        let mtls = url::Url::parse("https://secretmanager.mtls.googleapis.com").expect("mtls");
+        let regional = url::Url::parse("https://secretmanager.us-central1.rep.googleapis.com")
+            .expect("regional");
         assert_eq!(
-            lock_identity(&plain, "floci-local").expect("plain"),
-            lock_identity(&trailing, " FLOCI-LOCAL ").expect("trailing")
+            lock_identity(&plain).expect("plain"),
+            lock_identity(&mtls).expect("mtls")
+        );
+        assert_eq!(
+            lock_identity(&plain).expect("plain"),
+            lock_identity(&regional).expect("regional")
         );
     }
 
     #[test]
-    fn write_identity_separates_projects_and_endpoints() {
+    fn write_identity_keeps_custom_gcp_endpoints_apart() {
         let endpoint = url::Url::parse("http://127.0.0.1:4588").expect("url");
-        let other_endpoint = url::Url::parse("http://127.0.0.1:4589").expect("url");
-        assert_ne!(
-            lock_identity(&endpoint, "floci-local").expect("first"),
-            lock_identity(&endpoint, "floci-other").expect("second project")
+        let trailing = url::Url::parse("HTTP://127.0.0.1:4588/").expect("url");
+        let other = url::Url::parse("http://127.0.0.1:4589").expect("url");
+        assert_eq!(
+            lock_identity(&endpoint).expect("endpoint"),
+            lock_identity(&trailing).expect("trailing")
         );
         assert_ne!(
-            lock_identity(&endpoint, "floci-local").expect("first"),
-            lock_identity(&other_endpoint, "floci-local").expect("second endpoint")
+            lock_identity(&endpoint).expect("endpoint"),
+            lock_identity(&other).expect("other endpoint")
+        );
+        let google = url::Url::parse("https://secretmanager.googleapis.com").expect("google");
+        assert_ne!(
+            lock_identity(&endpoint).expect("endpoint"),
+            lock_identity(&google).expect("google")
         );
     }
 }

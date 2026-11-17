@@ -130,10 +130,11 @@ impl AzureKeyVaultProvider {
 
     /// Returns the same-user write-lock identity for this vault URL.
     ///
-    /// The canonical origin already contains the vault path, which identifies
-    /// the vault. The API version, token, profile name, and config path are not
-    /// part of it, so two profiles for the same vault share one lock even when
-    /// they use different credentials or API versions.
+    /// A recognized Azure Key Vault hostname maps to one lock per vault name,
+    /// so the public, sovereign, and private-link suffixes for one vault share
+    /// it. A custom endpoint (the emulator or an arbitrary proxy) keeps its
+    /// canonical origin, including the vault path. The API version, token,
+    /// profile name, and config path are not part of it.
     fn write_identity(&self) -> Result<String> {
         lock_identity(&self.base)
     }
@@ -250,15 +251,51 @@ impl Provider for AzureKeyVaultProvider {
     }
 }
 
-/// Builds the write-lock identity from the canonical vault URL only.
+/// Builds the write-lock identity from a recognized vault hostname or, for a
+/// custom endpoint, its canonical origin.
 ///
-/// [`crate::provider::lock::canonical_origin`] keeps the vault path, so
-/// `https://example.vault.azure.net/` and `https://example.vault.azure.net`
-/// resolve the same lock while two vault names stay distinct. The API version
-/// and credentials are not an input.
+/// Recognized public, sovereign, and private-link Key Vault suffixes map to
+/// one lock per vault name, so aliases for one vault share it. The same name
+/// in two clouds also shares it, which over-serializes and is safe. A custom
+/// endpoint keeps its canonical origin, including the vault path; two custom
+/// names for one vault are not serialized by this mechanism.
 fn lock_identity(base: &url::Url) -> Result<String> {
+    if let Some(vault) = recognized_vault_name(base) {
+        return Ok(crate::provider::lock::identity(
+            LOCK_KIND,
+            "azure",
+            &[&vault],
+        ));
+    }
     let origin = crate::provider::lock::canonical_origin(base)?;
     Ok(crate::provider::lock::identity(LOCK_KIND, &origin, &[]))
+}
+
+/// Extracts the vault name from a recognized Azure Key Vault hostname.
+fn recognized_vault_name(base: &url::Url) -> Option<String> {
+    if base.scheme() != "https" || base.port().is_some() {
+        return None;
+    }
+    let host = base.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let (name, suffix) = host.split_once('.')?;
+    if name.is_empty() {
+        return None;
+    }
+    if matches!(
+        suffix,
+        "vault.azure.net"
+            | "vault.azure.cn"
+            | "vault.usgovcloudapi.net"
+            | "vault.microsoftazure.de"
+            | "privatelink.vaultcore.azure.net"
+            | "privatelink.vaultcore.azure.cn"
+            | "privatelink.vaultcore.usgovcloudapi.net"
+            | "privatelink.vaultcore.microsoftazure.de"
+    ) {
+        Some(name.to_owned())
+    } else {
+        None
+    }
 }
 
 fn item_name(id: &str) -> Option<String> {
@@ -345,6 +382,23 @@ mod tests {
         assert_eq!(
             lock_identity(&plain).expect("plain"),
             lock_identity(&trailing).expect("trailing")
+        );
+    }
+
+    #[test]
+    fn write_identity_maps_recognized_vault_aliases_to_one_lock() {
+        let public = url::Url::parse("https://example.vault.azure.net").expect("public");
+        let private =
+            url::Url::parse("https://example.privatelink.vaultcore.azure.net").expect("private");
+        let sovereign =
+            url::Url::parse("https://example.vault.usgovcloudapi.net").expect("sovereign");
+        assert_eq!(
+            lock_identity(&public).expect("public"),
+            lock_identity(&private).expect("private")
+        );
+        assert_eq!(
+            lock_identity(&public).expect("public"),
+            lock_identity(&sovereign).expect("sovereign")
         );
     }
 

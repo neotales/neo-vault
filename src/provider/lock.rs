@@ -7,8 +7,11 @@
 //!
 //! # Scope
 //!
-//! The lock is per OS user and per provider identity (canonical origin plus
-//! non-secret scope). Every nsvault write on this machine uses it: the CLI, the
+//! The lock is per OS user and per provider identity. That identity is a
+//! canonical service endpoint or custom origin plus non-secret scope;
+//! recognized cloud endpoint aliases are folded onto one conservative service
+//! or vault identity, while an arbitrary custom URL alias is not detectable.
+//! Every nsvault write on this machine uses it: the CLI, the
 //! [`crate::Client`] API, and the C ABI. It serializes those writers only. It
 //! does not stop the Vault CLI, a provider UI, another host, or a different OS
 //! user; provider CAS remains the control for those writers.

@@ -305,15 +305,37 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   request, so there is no write to lock. The lock identity is a hash of the
   canonical address plus non-secret scope (Vault/OpenBao: mount and namespace,
   shared across those two kind labels; Infisical: project, environment, and
-  folder; GitHub: owner and repository; AWS: region; GCP: project; Azure: the
-  vault path is part of the canonical address and there is no further scope).
-  Profile names, config file paths, and every credential value are excluded:
-  two profiles for one endpoint and scope share a lock even when they use
-  different tokens or access keys. That can over-serialize distinct AWS
-  accounts behind one endpoint, which is safe; it never under-serializes one
-  vault. The endpoint is normalized for scheme and host case, default ports,
-  and a trailing slash, so `https://Host:443/path/` and `https://host/path`
-  match. `localhost` and `127.0.0.1` do not. The lock file lives under
+  folder; GitHub: owner and repository). For the clouds it is deliberately
+  conservative:
+  - AWS recognizes `secretsmanager.{region}` and
+    `secretsmanager-fips.{region}` on `amazonaws.com`, `amazonaws.com.cn`,
+    and `api.aws` and maps those spellings to one lock per region, so
+    standard, FIPS, and dual-stack endpoints for the same regional vault
+    serialize. A custom endpoint keeps its canonical origin plus region.
+  - GCP recognizes `secretmanager.*.googleapis.com` and maps those spellings
+    to one lock for the service. The project is not part of the identity,
+    because a project id and its numeric project number name the same project
+    and cannot be mapped locally; this over-serializes every GCP project using
+    the service. A custom endpoint keeps its canonical origin.
+  - Azure recognizes public, sovereign, and private-link Key Vault suffixes
+    and maps them to one lock per vault name. A custom endpoint keeps its
+    canonical origin, including the emulator's vault path.
+  Profile names, config file paths, and every credential value are excluded.
+  Two profiles for one endpoint and scope share a lock even when they use
+  different tokens or access keys. The resulting over-serialization of AWS
+  accounts in one region, GCP projects on one service, or same-named Azure
+  vaults in different clouds is safe; it never under-serializes a recognized
+  alias. The canonical origin is normalized for scheme and host case, default
+  ports, and a trailing slash, so `https://Host:443/path/` and
+  `https://host/path` match. `localhost` and `127.0.0.1` do not.
+  **Bound on custom aliases:** an arbitrary URL alias that is not one of the
+  recognized provider host patterns — a CNAME, a reverse proxy, custom private
+  DNS, or a private endpoint whose name does not match the recognized suffix —
+  is treated as a distinct custom endpoint. Two profiles that reach one vault
+  through different unrecognized names are not serialized by this lock.
+  Cooperating nsvault writers must use the provider's recognized endpoint or
+  the same custom endpoint spelling.
+  The lock file lives under
   `$XDG_STATE_HOME/nsvault/locks` or `~/.local/state/nsvault/locks`. A missing
   directory is created `0700`; lock files are created `0600` and must be
   regular, single-link, owner-only files. `NSVAULT_LOCK_DIR` overrides the
