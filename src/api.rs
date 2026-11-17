@@ -17,9 +17,18 @@
 //! same OS user and the same `NSVAULT_LOCK_DIR` value, or the same
 //! `XDG_STATE_HOME`/`HOME` when it is unset. Two processes with different
 //! values use different lock files even for one provider identity and are not
-//! serialized by this mechanism. The directory is created `0700` if missing and
-//! must not be a symlink, be group/other-accessible, or sit under a parent that
-//! other users can modify.
+//! serialized by this mechanism. Every component of the lock path must not be a
+//! symbolic link. The directory is created `0700` if missing, must be owned by
+//! this user and inaccessible to group and others, and may sit only under
+//! parents that are not writable by other users unless the writable parent is
+//! sticky and owned by root or this user.
+//!
+//! The lock is advisory and cooperative. While a write may be in progress,
+//! callers must not remove, rename, or replace the lock directory or its
+//! `write-*.lock` files: a new inode or directory is a different lock. A
+//! hostile same-user process (or root) can break cooperation this way. The
+//! lock is not a security boundary against that process; it prevents
+//! unintentional overlap between cooperating nsvault writers.
 
 use std::path::Path;
 

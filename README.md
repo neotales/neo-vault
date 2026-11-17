@@ -272,20 +272,28 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   directory is created `0700`; lock files are created `0600` and must be
   regular, single-link, owner-only files. `NSVAULT_LOCK_DIR` overrides the
   directory. The path is resolved one component at a time and the verified
-  directory handle is retained, so the lock file is opened relative to it;
-  every parent must not be writable by other users (a sticky directory such as
-  `/tmp` is allowed). An existing directory is never chmodded: it must already
-  be owned by this user and inaccessible to group and others, and the
-  directory itself must not be a symbolic link. Creation respects the process
-  umask: a directory that does not end up exactly owner-only is an error, not
-  something that is chmodded. Writers coordinate only when they resolve the
-  same lock directory: the same OS user and the same `NSVAULT_LOCK_DIR`, or the
-  same `XDG_STATE_HOME`/`HOME` when it is unset. Acquisition fails closed, with
-  no unlocked fallback and no timeout, and a lock failure is an error instead
-  of a write. The kernel releases the lock when the process exits, including a
-  crash. This does not stop the Vault CLI, another host, or another OS user.
-  Provider CAS is still required for those writers. Linux `flock` is what this
-  workspace can exercise; Windows and macOS are not.
+  directory handle is retained, so the lock file is opened relative to it; no
+  component of the path may be a symbolic link. On a system with a symlinked
+  home or state directory, set `NSVAULT_LOCK_DIR` to a real, non-symlink path.
+  Every parent must not be writable by other users. A writable sticky parent
+  is accepted only when it is owned by root or this user: the owner of a sticky
+  directory can rename any entry in it. An existing directory is never
+  chmodded: it must already be owned by this user and inaccessible to group
+  and others. Creation respects
+  the process umask: a directory that does not end up exactly owner-only is an
+  error, not something that is chmodded. Writers coordinate only when they
+  resolve the same lock directory: the same OS user and the same
+  `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME` when it is unset.
+  Acquisition fails closed, with no unlocked fallback and no timeout, and a
+  lock failure is an error instead of a write. The lock is advisory: while a
+  write may be in progress, do not remove, rename, or replace the lock
+  directory or its `write-*.lock` files. A new inode or directory is a
+  different lock, so a hostile same-user process (or root) can break
+  cooperation; the lock is not a boundary against it. The kernel releases the
+  lock when the process exits, including a crash. This does not stop the Vault
+  CLI, another host, or another OS user. Provider CAS is still required for
+  those writers. Linux `flock` is what this workspace can exercise; Windows and
+  macOS are not.
 - `Secret` has no `Display`; `Debug` prints `Secret([REDACTED])`.
 - The C ABI zeroes output buffers on free.
 

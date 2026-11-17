@@ -18,6 +18,10 @@
 //!   write, and no timeout is imposed by this library. Writers coordinate only
 //!   when they resolve the same lock directory: the same OS user and the same
 //!   `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME` when it is unset.
+//!   No component of that path may be a symbolic link. The lock is advisory:
+//!   do not remove, rename, or replace the lock directory or its lock files
+//!   while a write may be in progress. A hostile same-user process or root can
+//!   break cooperation that way; the lock is not a boundary against them.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int};

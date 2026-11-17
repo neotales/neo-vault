@@ -22,7 +22,13 @@
  *     lock does not exclude writers that are not nsvault, another host, or
  *     another OS user. Coordination requires the same lock directory on every
  *     writer: the same NSVAULT_LOCK_DIR, or the same XDG_STATE_HOME/HOME when
- *     it is unset. Different values are different locks.
+ *     it is unset. Different values are different locks, and no component of
+ *     that path may be a symbolic link.
+ *   - The lock is advisory. Do not remove, rename, or replace the lock
+ *     directory or its lock files while a write may be in progress: a new
+ *     inode or directory is a different lock. A hostile same-user process or
+ *     root can break cooperation that way; this lock is not a boundary
+ *     against them.
  *
  * Status: 0 = success, 1 = error (or, for nsvault_last_error, 1 = message).
  * Build:  cargo build --release --lib

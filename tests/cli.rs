@@ -1557,6 +1557,36 @@ fn write_lock_rejects_a_symlinked_directory() {
 
 #[cfg(unix)]
 #[test]
+fn write_lock_rejects_a_symlinked_parent() {
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let real = private_dir();
+    let link = tempfile_dir().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let lock_dir = link.join("locks");
+    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+        ],
+        Some(b"must-not-land\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("symbolic link"), "{}", stderr(&set));
+    assert!(!stderr(&set).contains("must-not-land"));
+    assert!(fixture.requests().is_empty());
+    assert!(
+        !real.join("locks").exists(),
+        "nothing may be created through a symlinked ancestor"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn write_lock_creates_a_missing_private_directory() {
     use std::os::unix::fs::PermissionsExt;
 
