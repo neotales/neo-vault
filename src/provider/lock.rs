@@ -1,9 +1,11 @@
-//! Same-user advisory lock for nsvault writes on this machine.
+//! Same-user advisory lock for nsvault writes on this machine, plus a
+//! verified private directory for provider state that must not live in a
+//! shared or attacker-controlled location.
 //!
-//! `set` and `ensure` hold this lock for the whole call, including the
-//! existence check. The kernel releases an exclusive `flock` when the process
-//! exits, including a crash or `SIGKILL`. The lock file is left in place; it
-//! does not have to be deleted to recover.
+//! The write lock is held by `set` and `ensure` for the whole call, including
+//! the existence check. The kernel releases an exclusive `flock` when the
+//! process exits, including a crash or `SIGKILL`. The lock file is left in
+//! place; it does not have to be deleted to recover.
 //!
 //! # Scope
 //!
@@ -23,13 +25,13 @@
 //!
 //! # Filesystem safety
 //!
-//! The lock directory is opened one component at a time with `openat` and
-//! `O_NOFOLLOW`, so no component of the path may be a symbolic link. Every
-//! ancestor must be owned by root or this user, because a directory's owner can
-//! rename its entries even without write permission. A directory writable by
-//! group or others must also be sticky. The path must be absolute; a relative
-//! `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected rather than resolved from
-//! an unchecked working directory. The verified directory descriptor is
+//! The lock directory and the private session directory are opened one
+//! component at a time with `openat` and `O_NOFOLLOW`, so no component of the
+//! path may be a symbolic link. Every ancestor must be owned by root or this
+//! user, because a directory's owner can rename its entries even without write
+//! permission. A directory writable by group or others must also be sticky.
+//! The path must be absolute; a relative path is rejected rather than resolved
+//! from an unchecked working directory. The verified directory descriptor is
 //! retained.
 //! The lock file is then created with `openat` relative to that descriptor, so
 //! a path lookup cannot redirect the write after validation. A missing
@@ -39,16 +41,23 @@
 //! leaves a directory that is not exactly owner-only, acquisition fails instead
 //! of repairing it with a chmod.
 //!
+//! A private directory is created as a unique `0700` child of a verified
+//! parent with `mkdirat`, then opened with `openat` and checked for ownership
+//! and mode. Removal re-checks the directory entry against the retained
+//! descriptor, so a renamed or replaced entry is refused rather than removed.
+//! A failed removal prints a warning; the private directory is best-effort
+//! cleanup, not a transaction.
+//!
 //! # Cooperative boundary
 //!
 //! The lock is advisory and cooperative. It does not defend against a process
 //! of this same OS user (or root) that removes, renames, or replaces the lock
-//! file or the lock directory while a write is running: a different inode or
-//! directory is a different lock. Every writer must leave the lock directory
-//! and its `write-*.lock` files in place while any write may be in flight.
-//! Same-user processes can already read this user's secrets and memory, so the
-//! lock is not a security boundary against them; it prevents unintentional
-//! overlap between cooperating nsvault processes.
+//! file, the lock directory, or a private directory while it is in use: a
+//! different inode or directory is a different object. Every writer must leave
+//! the lock directory and its `write-*.lock` files in place while any write may
+//! be in flight. Same-user processes can already read this user's secrets and
+//! memory, so these are not security boundaries against them; they prevent
+//! unintentional overlap and other-user tampering.
 //!
 //! # Failure behavior
 //!
@@ -67,6 +76,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -76,6 +87,235 @@ use crate::error::{Error, Result};
 #[derive(Debug)]
 pub struct WriteGuard {
     file: File,
+}
+
+/// Serializes private-directory names within this process. The process id
+/// separates processes; `mkdirat` handles a collision after pid reuse.
+#[cfg(unix)]
+static PRIVATE_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A unique `0700` directory created under a verified parent.
+///
+/// The parent is resolved from `/` with `openat` and `O_NOFOLLOW`. Every
+/// ancestor must be owned by root or this user, and a directory writable by
+/// group or others must be sticky. The child is created with `mkdirat` and
+/// opened again with `O_NOFOLLOW`; its owner and mode are checked on the
+/// retained descriptor.
+///
+/// Removal re-checks that the directory entry still names the opened inode.
+/// A renamed or replaced entry is refused and left in place, and dropping the
+/// value prints a redacted warning if removal fails. Same-user processes can
+/// still race removal, but they can already read this user's state.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct PrivateDirectory {
+    parent: OwnedFd,
+    name: CString,
+    path: PathBuf,
+    child: OwnedFd,
+    removed: AtomicBool,
+}
+
+#[cfg(unix)]
+impl PrivateDirectory {
+    /// Returns the path to pass to a child process.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Removes the directory tree after confirming that the entry still names
+    /// the opened directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error when the entry changed, is gone, or cannot be
+    /// removed.
+    pub(crate) fn remove(&self) -> Result<()> {
+        if self.removed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let expected = fd_stat(&self.child)
+            .map_err(|_| Error::new("could not inspect the private directory"))?;
+        let current = fstatat_nofollow(&self.parent, &self.name)
+            .map_err(|_| Error::new("could not verify the private directory before removal"))?;
+        if current.st_dev != expected.st_dev
+            || current.st_ino != expected.st_ino
+            || current.st_mode & libc::S_IFMT != libc::S_IFDIR
+        {
+            return Err(Error::new("the private directory changed before removal"));
+        }
+        std::fs::remove_dir_all(&self.path)
+            .map_err(|_| Error::new("could not remove the private directory"))?;
+        self.removed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PrivateDirectory {
+    fn drop(&mut self) {
+        if self.remove().is_err() {
+            eprintln!("nsvault: warning: could not remove the isolated session directory");
+        }
+    }
+}
+
+/// Creates a unique private directory under `parent`.
+///
+/// # Errors
+///
+/// Returns an error when `parent` is not absolute, any component is a symbolic
+/// link or not a directory, an ancestor is owned by another user or is
+/// modifiable by others without the sticky bit, the directory cannot be
+/// created, or the new directory is not owner-only.
+#[cfg(unix)]
+pub(crate) fn create_private_directory(parent: &Path, prefix: &str) -> Result<PrivateDirectory> {
+    if prefix.is_empty()
+        || prefix.contains('/')
+        || prefix.contains('\\')
+        || prefix == "."
+        || prefix == ".."
+    {
+        return Err(Error::new("private directory prefix is not a plain name"));
+    }
+    let names = private_components(parent)?;
+    let mut parent_fd =
+        open_anchor().map_err(|_| Error::new("could not open the private directory parent"))?;
+    for name in &names {
+        let next = open_at(&parent_fd, name, false).map_err(|_| {
+            Error::new(
+                "private directory parent must not contain a symbolic link or a non-directory",
+            )
+        })?;
+        inspect_ancestor(&next)
+            .map_err(|_| Error::new("private directory parent is not trusted"))?;
+        parent_fd = next;
+    }
+
+    for _ in 0..32 {
+        let serial = PRIVATE_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name_text = format!("{prefix}-{}-{serial}", std::process::id());
+        let name = CString::new(name_text.as_str())
+            .map_err(|_| Error::new("private directory prefix is not a plain name"))?;
+        // SAFETY: `parent_fd` is live, `name` is NUL-terminated, and 0700 is a
+        // valid mode. `mkdirat` does not follow a symbolic link in the parent.
+        let raw = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), 0o700) };
+        if raw != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(Error::new("could not create the private directory"));
+        }
+
+        let child = match open_at(&parent_fd, &name, false) {
+            Ok(child) => child,
+            Err(_) => {
+                remove_private_entry(&parent_fd, &name);
+                return Err(Error::new("could not open the private directory"));
+            }
+        };
+        if inspect_private_directory(&child).is_err() {
+            remove_private_entry(&parent_fd, &name);
+            return Err(Error::new("the private directory is not owner-only"));
+        }
+        return Ok(PrivateDirectory {
+            parent: parent_fd,
+            name,
+            path: parent.join(name_text),
+            child,
+            removed: AtomicBool::new(false),
+        });
+    }
+    Err(Error::new("could not create the private directory"))
+}
+
+/// Splits a private-directory parent into component names. `..` is refused
+/// rather than resolved, so the walk never leaves the anchor.
+#[cfg(unix)]
+fn private_components(path: &Path) -> Result<Vec<CString>> {
+    if !path.is_absolute() {
+        return Err(Error::new("private directory parent must be absolute"));
+    }
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => names
+                .push(CString::new(name.as_bytes()).map_err(|_| {
+                    Error::new("private directory parent has an invalid component")
+                })?),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(Error::new(
+                    "private directory parent must not contain '..' or a prefix",
+                ));
+            }
+        }
+    }
+    if names.is_empty() {
+        return Err(Error::new(
+            "private directory parent is not a usable directory",
+        ));
+    }
+    Ok(names)
+}
+
+/// Checks the directory this process just created. Creation respects the umask
+/// and is never repaired with a chmod.
+#[cfg(unix)]
+fn inspect_private_directory(fd: &OwnedFd) -> Result<()> {
+    let stat = fd_stat(fd).map_err(|_| Error::new("could not inspect the private directory"))?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(Error::new("the private directory is not a directory"));
+    }
+    if stat.st_uid != effective_uid() {
+        return Err(Error::new(
+            "the private directory is not owned by this user",
+        ));
+    }
+    let mode = stat.st_mode & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::new("the private directory is not private"));
+    }
+    if mode & 0o700 != 0o700 {
+        return Err(Error::new(
+            "the private directory is not accessible by this user",
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort removal for an entry this process just created and then could
+/// not validate. A failure leaves the entry for the system to clean.
+#[cfg(unix)]
+fn remove_private_entry(parent: &OwnedFd, name: &CString) {
+    // SAFETY: `parent` is live and `name` is NUL-terminated. The directory is
+    // expected to be empty because it was just created. A failure is ignored on
+    // this error path; the caller is already failing closed.
+    unsafe {
+        libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+    }
+}
+
+/// Reads a directory entry without following a symbolic link.
+#[cfg(unix)]
+fn fstatat_nofollow(parent: &OwnedFd, name: &CString) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `parent` is live, `name` is NUL-terminated, and `stat` points to
+    // writable memory that `fstatat` initializes on success.
+    let raw = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if raw != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstatat` succeeded and initialized the struct.
+    Ok(unsafe { stat.assume_init() })
 }
 
 /// Canonical server identity, with no userinfo, query, or fragment.
@@ -597,8 +837,8 @@ mod tests {
 
     #[cfg(unix)]
     use super::{
-        LockDirectory, ancestor_is_trusted, directory_components, file_name, inspect_ancestor,
-        inspect_lock_file,
+        LockDirectory, ancestor_is_trusted, create_private_directory, directory_components,
+        file_name, inspect_ancestor, inspect_lock_file,
     };
 
     #[cfg(unix)]
@@ -653,6 +893,101 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_is_owner_only_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = scratch_dir("private-dir");
+        let directory = create_private_directory(&parent, "session").expect("private directory");
+        let path = directory.path().to_path_buf();
+        let mode = std::fs::metadata(&path)
+            .expect("private directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "the private directory must be 0700");
+        directory.remove().expect("remove private directory");
+        assert!(!path.exists(), "the private directory must be removed");
+        drop(directory);
+        std::fs::remove_dir_all(parent).expect("cleanup parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_parent_must_be_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = scratch_dir("private-untrusted");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod parent");
+        let error = create_private_directory(&parent, "session")
+            .expect_err("must reject a writable non-sticky parent");
+        assert!(
+            error.message().contains("not trusted"),
+            "{}",
+            error.message()
+        );
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod parent back");
+        std::fs::remove_dir_all(parent).expect("cleanup parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_parent_symlink_is_rejected() {
+        let base = scratch_dir("private-symlink");
+        let real = base.join("real");
+        std::fs::create_dir(&real).expect("real directory");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let error =
+            create_private_directory(&link, "session").expect_err("must reject a symlinked parent");
+        assert!(
+            error.message().contains("symbolic link"),
+            "{}",
+            error.message()
+        );
+        assert!(
+            std::fs::read_dir(&real)
+                .expect("read real directory")
+                .next()
+                .is_none(),
+            "nothing may be created through the symlink"
+        );
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_parent_must_be_absolute() {
+        let error = create_private_directory(std::path::Path::new("relative"), "session")
+            .expect_err("must reject a relative parent");
+        assert!(error.message().contains("absolute"), "{}", error.message());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_cleanup_refuses_a_replaced_path() {
+        let parent = scratch_dir("private-replaced");
+        let directory = create_private_directory(&parent, "session").expect("private directory");
+        let path = directory.path().to_path_buf();
+        let moved = parent.join("moved");
+        std::fs::rename(&path, &moved).expect("rename private directory");
+        std::fs::create_dir(&path).expect("replacement directory");
+        let error = directory
+            .remove()
+            .expect_err("must refuse to remove a replaced path");
+        assert!(error.message().contains("changed"), "{}", error.message());
+        assert!(path.exists(), "the replacement must not be removed");
+        assert!(moved.exists(), "the original must not be removed");
+        std::fs::remove_dir(&path).expect("remove replacement");
+        std::fs::rename(&moved, &path).expect("restore private directory");
+        directory.remove().expect("remove original");
+        drop(directory);
+        std::fs::remove_dir_all(parent).expect("cleanup parent");
     }
 
     #[cfg(unix)]

@@ -204,13 +204,18 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   serializing an `ItemSummary` without content. The adapter keeps only titles
   and never returns item content, but the CLI process did fetch it.
 - A configured Proton token runs in a private per-process session directory
-  with the filesystem key provider, so it cannot reuse or overwrite the default
-  `pass-cli` session. After login the adapter requires `info --output json` to
-  identify a personal access token; a user session is rejected. Without a
-  token, the existing `pass-cli` session is used unchanged. This is based on
-  the pinned 2.7.1 source, not a live service. The isolated directory is
-  removed on normal exit; a killed process can leave it for the system to
-  clean.
+  under a verified temporary parent with the filesystem key provider, so it
+  cannot reuse or overwrite the default `pass-cli` session. The parent walk
+  rejects symlinks, foreign owners, and writable non-sticky directories. After
+  login the adapter requires `info --output json` to identify a personal access
+  token; a user session is rejected. `list` and `get` on one provider instance
+  are serialized. Without a token, the existing `pass-cli` session is used
+  unchanged. The directory is removed on drop; if removal fails, a warning is
+  printed and the directory is left for the system to clean, and a killed
+  process cannot run cleanup. Token mode fails closed on platforms without the
+  hardened directory walk, or when the temporary path is not a trusted,
+  symlink-free location. This is based on the pinned 2.7.1 source, not a live
+  service.
 - GitHub repository secrets only. Organization, environment, Codespaces, and
   Dependabot scopes are future work. `ensure` is unsupported: the secrets API
   has one PUT that creates or updates, and a check-then-PUT race would

@@ -15,16 +15,23 @@
 //! token is passed to the child through its environment only.
 //!
 //! When a token is configured, each provider instance uses a private
-//! per-process `PROTON_PASS_SESSION_DIR` and the filesystem key provider. It
-//! therefore cannot reuse or modify the user's default session, and a login is
-//! guaranteed to use the configured token. After login, `info --output json`
-//! must report a personal access token; a user session is rejected. Without a
-//! token, the existing `pass-cli` session is used unchanged.
+//! per-process `PROTON_PASS_SESSION_DIR` under a verified temporary parent and
+//! the filesystem key provider. It therefore cannot reuse or modify the user's
+//! default session, and a login is guaranteed to use the configured token.
+//! After login, `info --output json` must report a personal access token; a
+//! user session is rejected. Without a token, the existing `pass-cli` session
+//! is used unchanged.
+//!
+//! All `list` and `get` calls on one provider instance hold a mutex for the
+//! whole check, login, and item operation, so two threads cannot share one
+//! CLI session. The private directory is removed on drop; a removal failure
+//! prints a redacted warning and leaves it for the system to clean. Token
+//! mode fails closed on platforms without the hardened directory walk, or when
+//! the temporary path is not a trusted, symlink-free location.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::Deserialize;
 
@@ -33,6 +40,12 @@ use crate::error::{Error, Result, unsupported};
 use crate::key::Key;
 use crate::provider::{Capabilities, ListedKey, Provider, command_available};
 use crate::secret::Secret;
+
+/// Redacted error when the operation mutex is poisoned.
+const OPERATION_POISONED: &str = "Proton Pass provider is unavailable after an internal panic";
+
+/// Redacted failure message for session-directory setup.
+const SESSION_DIR_ERROR: &str = "could not create an isolated pass-cli session directory";
 
 /// Read-only Proton Pass provider.
 #[derive(Debug)]
@@ -43,55 +56,50 @@ pub struct ProtonProvider {
     token: Option<Secret>,
     reason: Option<String>,
     session_dir: OnceLock<SessionDir>,
+    operation: Mutex<()>,
 }
 
 /// A private per-process directory for one isolated `pass-cli` session.
+#[cfg(unix)]
 #[derive(Debug)]
 struct SessionDir {
-    path: PathBuf,
+    directory: super::lock::PrivateDirectory,
 }
 
-/// Redacted failure message for session-directory setup.
-const SESSION_DIR_ERROR: &str = "could not create an isolated pass-cli session directory";
-
+#[cfg(unix)]
 impl SessionDir {
     fn create() -> Result<Self> {
-        let base = std::env::temp_dir();
+        let parent = std::env::temp_dir();
         // `pass-cli` reads this override with `std::env::var`, which rejects
         // non-Unicode values and would silently fall back to the default
         // session. Fail closed instead.
-        if base.to_str().is_none() {
+        if parent.to_str().is_none() {
             return Err(Error::new(SESSION_DIR_ERROR));
         }
-        let process = std::process::id();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        for attempt in 0..32 {
-            let path = base.join(format!("nsvault-proton-{process}-{nanos}-{attempt}"));
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => break,
-            }
-        }
-        Err(Error::new(SESSION_DIR_ERROR))
+        Ok(Self {
+            directory: super::lock::create_private_directory(&parent, "nsvault-proton")?,
+        })
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.directory.path()
     }
 }
 
-impl Drop for SessionDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+#[cfg(not(unix))]
+#[derive(Debug)]
+struct SessionDir;
+
+#[cfg(not(unix))]
+impl SessionDir {
+    fn create() -> Result<Self> {
+        Err(Error::new(
+            "isolated pass-cli sessions are not implemented on this platform",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        Path::new("")
     }
 }
 
@@ -123,7 +131,14 @@ impl ProtonProvider {
             token,
             reason: config.reason.clone(),
             session_dir: OnceLock::new(),
+            operation: Mutex::new(()),
         })
+    }
+
+    fn lock_operation(&self) -> Result<MutexGuard<'_, ()>> {
+        self.operation
+            .lock()
+            .map_err(|_| Error::new(OPERATION_POISONED))
     }
 
     fn command(&self, arguments: &[&str]) -> Result<Command> {
@@ -280,6 +295,7 @@ impl Provider for ProtonProvider {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>> {
+        let _operation = self.lock_operation()?;
         let mut keys = Vec::new();
         for item in self.items()? {
             if !item.title.is_empty() && (prefix.is_empty() || item.title.starts_with(prefix)) {
@@ -290,6 +306,7 @@ impl Provider for ProtonProvider {
     }
 
     fn get(&self, raw_key: &str) -> Result<Secret> {
+        let _operation = self.lock_operation()?;
         let key = Key::parse(raw_key)?;
         let title = key.path();
         let field = key.field().unwrap_or("password");
@@ -322,8 +339,9 @@ fn trim_one_newline(mut bytes: Vec<u8>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionDir, trim_one_newline};
+    use super::{ProtonProvider, SessionDir, trim_one_newline};
 
+    #[cfg(unix)]
     #[test]
     fn session_directory_is_removed_on_drop() {
         let directory = SessionDir::create().expect("session directory");
@@ -344,6 +362,103 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_gets_share_one_serialized_session() {
+        use crate::config::ProtonConfig;
+        use crate::provider::Provider;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let directory = std::env::temp_dir().join(format!(
+            "nsvault-proton-threads-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("test directory");
+        let script = directory.join("pass-cli");
+        let trace = directory.join("trace");
+        let invocation_lock = directory.join("invocation-lock");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+lock='{lock}'
+trace='{trace}'
+if ! mkdir "$lock" 2>/dev/null; then
+  printf 'overlap\n' >> "$trace"
+  exit 90
+fi
+trap 'rmdir "$lock"' EXIT
+sleep 0.1
+case "$*" in
+  "info --output json")
+    if [ -f "${{PROTON_PASS_SESSION_DIR:-/nonexistent}}/.session/session.json" ]; then
+      printf '%s\n' '{{"personal_access_token_name":"fixture-pat"}}'
+      exit 0
+    fi
+    exit 1
+    ;;
+  "login")
+    mkdir -p "${{PROTON_PASS_SESSION_DIR}}/.session" || exit 4
+    : > "${{PROTON_PASS_SESSION_DIR}}/.session/session.json" || exit 4
+    exit 0
+    ;;
+  *"item list"*)
+    printf '%s' '{{"items":[{{"id":"i","title":"DB","share_id":"s"}}]}}'
+    ;;
+  *"item view"*) printf '%s\n' 'pw' ;;
+  *) exit 2 ;;
+esac
+"#,
+                lock = invocation_lock.display(),
+                trace = trace.display()
+            ),
+        )
+        .expect("write fixture");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod script");
+        let token = directory.join("token");
+        std::fs::write(&token, b"not-a-real-token").expect("write token");
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod token");
+        let config = ProtonConfig {
+            command: script.display().to_string(),
+            vault: Some("Work".to_owned()),
+            token_env: None,
+            token_file: Some(std::path::PathBuf::from("token")),
+            reason: None,
+        };
+        let provider = ProtonProvider::new("p", &config, &directory).expect("provider");
+        let barrier = Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                provider.get("DB#password")
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                provider.get("DB#password")
+            });
+            (
+                first.join().expect("first thread"),
+                second.join().expect("second thread"),
+            )
+        });
+        assert_eq!(first.expect("first get").expose(), b"pw".as_slice());
+        assert_eq!(second.expect("second get").expose(), b"pw".as_slice());
+        let trace = std::fs::read_to_string(&trace).unwrap_or_default();
+        assert!(
+            !trace.contains("overlap"),
+            "concurrent pass-cli invocations overlapped"
+        );
+        drop(provider);
+        std::fs::remove_dir_all(directory).expect("cleanup test directory");
     }
 
     #[test]
