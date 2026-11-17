@@ -17,11 +17,13 @@
 //! same OS user and the same `NSVAULT_LOCK_DIR` value, or the same
 //! `XDG_STATE_HOME`/`HOME` when it is unset. Two processes with different
 //! values use different lock files even for one provider identity and are not
-//! serialized by this mechanism. Every component of the lock path must not be a
-//! symbolic link. The directory is created `0700` if missing, must be owned by
-//! this user and inaccessible to group and others, and may sit only under
-//! parents that are not writable by other users unless the writable parent is
-//! sticky and owned by root or this user.
+//! serialized by this mechanism. The lock path must be absolute; a relative
+//! `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected. No component of the path
+//! may be a symbolic link. The directory is created `0700` if missing and must
+//! be owned by this user and inaccessible to group and others. Every ancestor
+//! must be owned by root or this user, because an owner can rename entries even
+//! without write permission; an ancestor writable by group or others must also
+//! be sticky.
 //!
 //! The lock is advisory and cooperative. While a write may be in progress,
 //! callers must not remove, rename, or replace the lock directory or its

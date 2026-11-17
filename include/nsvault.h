@@ -23,7 +23,11 @@
  *     another OS user. Coordination requires the same lock directory on every
  *     writer: the same NSVAULT_LOCK_DIR, or the same XDG_STATE_HOME/HOME when
  *     it is unset. Different values are different locks, and no component of
- *     that path may be a symbolic link.
+ *     that path may be a symbolic link. The path must be absolute; a relative
+ *     NSVAULT_LOCK_DIR or XDG_STATE_HOME is rejected. Every ancestor must be
+ *     owned by root or this user (an owner can rename entries even without
+ *     write permission), and an ancestor writable by group or others must also
+ *     be sticky.
  *   - The lock is advisory. Do not remove, rename, or replace the lock
  *     directory or its lock files while a write may be in progress: a new
  *     inode or directory is a different lock. A hostile same-user process or

@@ -273,17 +273,18 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   regular, single-link, owner-only files. `NSVAULT_LOCK_DIR` overrides the
   directory. The path is resolved one component at a time and the verified
   directory handle is retained, so the lock file is opened relative to it; no
-  component of the path may be a symbolic link. On a system with a symlinked
-  home or state directory, set `NSVAULT_LOCK_DIR` to a real, non-symlink path.
-  Every parent must not be writable by other users. A writable sticky parent
-  is accepted only when it is owned by root or this user: the owner of a sticky
-  directory can rename any entry in it. An existing directory is never
+  component of the path may be a symbolic link. The path must be absolute; a
+  relative `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected. On a system with
+  a symlinked home or state directory, set `NSVAULT_LOCK_DIR` to a real,
+  non-symlink absolute path. Every parent must be owned by root or this user:
+  an owner can rename entries even without write permission. A parent writable
+  by group or others must also be sticky. An existing directory is never
   chmodded: it must already be owned by this user and inaccessible to group
-  and others. Creation respects
-  the process umask: a directory that does not end up exactly owner-only is an
-  error, not something that is chmodded. Writers coordinate only when they
-  resolve the same lock directory: the same OS user and the same
-  `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME` when it is unset.
+  and others. Creation respects the process umask: a directory that does not
+  end up exactly owner-only is an error, not something that is chmodded.
+  Writers coordinate only when they resolve the same lock directory: the same
+  OS user and the same `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME`
+  when it is unset.
   Acquisition fails closed, with no unlocked fallback and no timeout, and a
   lock failure is an error instead of a write. The lock is advisory: while a
   write may be in progress, do not remove, rename, or replace the lock

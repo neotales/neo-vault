@@ -21,11 +21,13 @@
 //! # Filesystem safety
 //!
 //! The lock directory is opened one component at a time with `openat` and
-//! `O_NOFOLLOW`, so no component of the path may be a symbolic link. Each
-//! component is checked for group/other write access; a writable directory is
-//! allowed only when it is sticky and owned by root or this user (the owner of
-//! a sticky directory can rename any entry in it, so a third UID's sticky
-//! directory is not trusted). The verified directory descriptor is retained.
+//! `O_NOFOLLOW`, so no component of the path may be a symbolic link. Every
+//! ancestor must be owned by root or this user, because a directory's owner can
+//! rename its entries even without write permission. A directory writable by
+//! group or others must also be sticky. The path must be absolute; a relative
+//! `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected rather than resolved from
+//! an unchecked working directory. The verified directory descriptor is
+//! retained.
 //! The lock file is then created with `openat` relative to that descriptor, so
 //! a path lookup cannot redirect the write after validation. A missing
 //! directory is created with `mkdirat` relative to its verified parent. No
@@ -168,27 +170,43 @@ fn acquire_unix(identity: &str) -> Result<WriteGuard> {
 /// Returns the lock directory and whether its missing parents may be created.
 ///
 /// Only the default location may create parents. An explicitly configured
-/// `NSVAULT_LOCK_DIR` must have an existing parent; its parent chain is not
-/// created, so a stale or mistyped path fails instead of creating directories.
+/// `NSVAULT_LOCK_DIR` must be absolute and have an existing parent; its parent
+/// chain is not created, so a stale or mistyped path fails instead of creating
+/// directories. Relative paths are rejected: a walk from the working directory
+/// could not validate the directories above it.
 fn lock_spec() -> Result<(PathBuf, bool)> {
     if let Some(dir) = std::env::var_os("NSVAULT_LOCK_DIR") {
         if dir.is_empty() {
             return Err(Error::new("NSVAULT_LOCK_DIR is empty"));
         }
-        return Ok((PathBuf::from(dir), false));
+        let path = PathBuf::from(dir);
+        if !path.is_absolute() {
+            return Err(Error::new("NSVAULT_LOCK_DIR must be an absolute path"));
+        }
+        return Ok((path, false));
     }
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
+    let state = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(Error::new("XDG_STATE_HOME must be an absolute path"));
+            }
+            path
+        }
+        None => {
+            let home = std::env::var_os("HOME")
                 .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".local/state"))
-        });
-    let Some(state) = state else {
-        return Err(Error::new(
-            "cannot place the provider write lock: HOME and XDG_STATE_HOME are unset",
-        ));
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    Error::new(
+                        "cannot place the provider write lock: HOME and XDG_STATE_HOME are unset",
+                    )
+                })?;
+            if !home.is_absolute() {
+                return Err(Error::new("HOME must be an absolute path"));
+            }
+            home.join(".local/state")
+        }
     };
     Ok((state.join("nsvault/locks"), true))
 }
@@ -210,11 +228,15 @@ impl LockDirectory {
     /// Resolves `dir` one component at a time and retains the verified
     /// descriptor. Missing components are created only when
     /// `allow_create_ancestors` is set (the default state location); otherwise
-    /// only the final component may be created.
+    /// only the final component may be created. The path must be absolute so
+    /// the walk starts at `/` and every ancestor is validated.
     fn open(dir: &Path, allow_create_ancestors: bool) -> Result<Self> {
+        if !dir.is_absolute() {
+            return Err(Error::new("provider write lock path must be absolute"));
+        }
         let names = directory_components(dir)?;
         Ok(Self {
-            fd: resolve(&names, dir.is_absolute(), allow_create_ancestors)?,
+            fd: resolve(&names, allow_create_ancestors)?,
         })
     }
 
@@ -249,17 +271,15 @@ fn directory_components(path: &Path) -> Result<Vec<CString>> {
     Ok(names)
 }
 
-/// Walks `names` from a trusted anchor, opening one descriptor per component
-/// and retaining it for the next lookup. Each intermediate directory must not
-/// be modifiable by other users (a sticky directory is allowed). A missing
-/// component is created with `mkdirat` only when allowed; its mode is then
-/// validated, never repaired with a chmod.
+/// Walks `names` from `/`, opening one descriptor per component and retaining
+/// it for the next lookup. Every ancestor must be owned by root or this user
+/// (its owner can rename entries otherwise), and a directory writable by group
+/// or others must also be sticky. A missing component is created with
+/// `mkdirat` only when allowed; its mode is then validated, never repaired with
+/// a chmod.
 #[cfg(unix)]
-fn resolve(names: &[CString], absolute: bool, allow_create_ancestors: bool) -> Result<OwnedFd> {
-    let mut fd = open_anchor(absolute)?;
-    if !absolute {
-        inspect_ancestor(&fd)?;
-    }
+fn resolve(names: &[CString], allow_create_ancestors: bool) -> Result<OwnedFd> {
+    let mut fd = open_anchor()?;
     let total = names.len();
     for (index, name) in names.iter().enumerate() {
         let last = index + 1 == total;
@@ -282,16 +302,15 @@ fn resolve(names: &[CString], absolute: bool, allow_create_ancestors: bool) -> R
     Ok(fd)
 }
 
-/// Opens the anchor for an absolute or relative path. For an absolute path the
-/// anchor is `/`; for a relative path it is the process working directory.
+/// Opens `/` as the anchor. The lock path must be absolute, so every ancestor
+/// is validated from the root rather than from an unchecked working directory.
 #[cfg(unix)]
-fn open_anchor(absolute: bool) -> Result<OwnedFd> {
-    let path: &std::ffi::CStr = if absolute { c"/" } else { c"." };
-    // SAFETY: `path` is a valid NUL-terminated string and no memory owned by
+fn open_anchor() -> Result<OwnedFd> {
+    // SAFETY: `c"/"` is a valid NUL-terminated string and no memory owned by
     // the caller is retained.
     let raw = unsafe {
         libc::open(
-            path.as_ptr(),
+            c"/".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
@@ -371,22 +390,24 @@ fn fd_stat(fd: &OwnedFd) -> io::Result<libc::stat> {
     Ok(unsafe { stat.assume_init() })
 }
 
-/// Whether a directory mode is safe to traverse as an ancestor.
+/// Whether a directory is safe to traverse as an ancestor.
 ///
-/// A directory writable by group or others is only acceptable when it is sticky
-/// and owned by root or this user. The owner of a sticky directory can rename
-/// any entry in it, so a third UID's sticky directory is not trusted. Root is
-/// trusted because it can already replace or read anything on the machine.
+/// The owner of a directory can rename or remove its entries even when the
+/// directory is not writable by anyone else, so every ancestor must be owned by
+/// root or this user. Root is trusted because it can already replace or read
+/// anything on the machine. A directory writable by group or others must also
+/// be sticky, so those users cannot rename entries they do not own.
 #[cfg(unix)]
-fn ancestor_mode_is_trusted(mode: libc::mode_t, uid: libc::uid_t, effective: libc::uid_t) -> bool {
-    if mode & 0o022 == 0 {
-        return true;
+fn ancestor_is_trusted(mode: libc::mode_t, uid: libc::uid_t, effective: libc::uid_t) -> bool {
+    if uid != 0 && uid != effective {
+        return false;
     }
-    mode & 0o1000 != 0 && (uid == 0 || uid == effective)
+    mode & 0o022 == 0 || mode & 0o1000 != 0
 }
 
-/// A parent directory that other users can modify, or a sticky parent owned by
-/// a third user, could have its entries renamed or replaced during resolution.
+/// A parent owned by a third user, or one that other users can modify without
+/// the sticky bit, could have its entries renamed or replaced during
+/// resolution.
 #[cfg(unix)]
 fn inspect_ancestor(fd: &OwnedFd) -> Result<()> {
     let stat =
@@ -395,12 +416,12 @@ fn inspect_ancestor(fd: &OwnedFd) -> Result<()> {
         return Err(Error::new("provider write lock path is not a directory"));
     }
     let mode = stat.st_mode & 0o7777;
-    if ancestor_mode_is_trusted(mode, stat.st_uid, effective_uid()) {
+    if ancestor_is_trusted(mode, stat.st_uid, effective_uid()) {
         return Ok(());
     }
-    if mode & 0o1000 != 0 {
+    if stat.st_uid != 0 && stat.st_uid != effective_uid() {
         return Err(Error::new(
-            "provider write lock path has a sticky parent owned by another user",
+            "provider write lock path has a parent owned by another user",
         ));
     }
     Err(Error::new(
@@ -573,7 +594,7 @@ mod tests {
 
     #[cfg(unix)]
     use super::{
-        LockDirectory, ancestor_mode_is_trusted, directory_components, file_name, inspect_ancestor,
+        LockDirectory, ancestor_is_trusted, directory_components, file_name, inspect_ancestor,
         inspect_lock_file,
     };
 
@@ -760,20 +781,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ancestor_modes_are_trusted_only_for_root_or_this_user() {
-        // Not writable by group/others.
-        assert!(ancestor_mode_is_trusted(0o0755, 1234, 1000));
-        assert!(ancestor_mode_is_trusted(0o0700, 1000, 1000));
+    fn ancestor_owners_are_trusted_only_for_root_or_this_user() {
+        // Not writable by group/others, but the owner can still replace
+        // entries, so a foreign owner is not trusted.
+        assert!(!ancestor_is_trusted(0o0755, 1234, 1000));
+        assert!(ancestor_is_trusted(0o0755, 0, 1000));
+        assert!(ancestor_is_trusted(0o0755, 1000, 1000));
         // Sticky writable and owned by root or this user.
-        assert!(ancestor_mode_is_trusted(0o1777, 0, 1000));
-        assert!(ancestor_mode_is_trusted(0o1777, 1000, 1000));
+        assert!(ancestor_is_trusted(0o1777, 0, 1000));
+        assert!(ancestor_is_trusted(0o1777, 1000, 1000));
         // Sticky writable but owned by a third user: that owner can rename any
         // entry, so it is not trusted. Only the decision function is tested
         // here; this workspace cannot chown to a foreign UID.
-        assert!(!ancestor_mode_is_trusted(0o1777, 1234, 1000));
+        assert!(!ancestor_is_trusted(0o1777, 1234, 1000));
         // Writable without the sticky bit is never trusted.
-        assert!(!ancestor_mode_is_trusted(0o0777, 0, 1000));
-        assert!(!ancestor_mode_is_trusted(0o0770, 1000, 1000));
+        assert!(!ancestor_is_trusted(0o0777, 0, 1000));
+        assert!(!ancestor_is_trusted(0o0770, 1000, 1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_lock_path_is_rejected() {
+        let error = LockDirectory::open(std::path::Path::new("locks"), false)
+            .expect_err("must reject a relative path");
+        assert!(error.message().contains("absolute"), "{}", error.message());
     }
 
     #[cfg(unix)]

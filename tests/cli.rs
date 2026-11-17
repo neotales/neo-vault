@@ -1457,6 +1457,30 @@ fn two_profiles_do_not_overlap_writes_to_the_same_vault() {
     assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn write_lock_rejects_a_relative_directory() {
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", "nsvault-relative-locks"),
+        ],
+        Some(b"must-not-land\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("absolute"), "{}", stderr(&set));
+    assert!(!stderr(&set).contains("must-not-land"));
+    assert!(fixture.requests().is_empty());
+    assert!(
+        !directory.join("nsvault-relative-locks").exists(),
+        "a relative lock path must not be created in the working directory"
+    );
+}
+
 fn private_dir() -> std::path::PathBuf {
     let path = tempfile_dir();
     #[cfg(unix)]

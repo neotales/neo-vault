@@ -18,7 +18,11 @@
 //!   write, and no timeout is imposed by this library. Writers coordinate only
 //!   when they resolve the same lock directory: the same OS user and the same
 //!   `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME` when it is unset.
-//!   No component of that path may be a symbolic link. The lock is advisory:
+//!   No component of that path may be a symbolic link. The lock path must be
+//!   absolute; a relative `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected.
+//!   Every ancestor must be owned by root or this user (an owner can rename
+//!   entries even without write permission), and an ancestor writable by group
+//!   or others must also be sticky. The lock is advisory:
 //!   do not remove, rename, or replace the lock directory or its lock files
 //!   while a write may be in progress. A hostile same-user process or root can
 //!   break cooperation that way; the lock is not a boundary against them.
