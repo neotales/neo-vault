@@ -28,6 +28,9 @@ const MAX_PAGES: usize = 100;
 /// Maximum keys returned by one listing.
 const MAX_LISTED: usize = 10_000;
 
+/// Product family used in the same-user write-lock identity.
+const LOCK_KIND: &str = "azure-key-vault";
+
 /// Azure Key Vault secrets provider.
 #[derive(Debug)]
 pub struct AzureKeyVaultProvider {
@@ -123,6 +126,16 @@ impl AzureKeyVaultProvider {
         let mut url = self.secrets_url()?;
         url.query_pairs_mut().append_pair("$skiptoken", &skiptoken);
         Ok(url)
+    }
+
+    /// Returns the same-user write-lock identity for this vault URL.
+    ///
+    /// The canonical origin already contains the vault path, which identifies
+    /// the vault. The API version, token, profile name, and config path are not
+    /// part of it, so two profiles for the same vault share one lock even when
+    /// they use different credentials or API versions.
+    fn write_identity(&self) -> Result<String> {
+        lock_identity(&self.base)
     }
 }
 
@@ -227,6 +240,7 @@ impl Provider for AzureKeyVaultProvider {
         }
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("Azure Key Vault values must be UTF-8 text"))?;
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let body = json!({ "value": text }).to_string();
         let response = self.request("PUT", &self.secret_url(key.path())?, Some(body.as_bytes()))?;
         if matches!(response.status, 200 | 201) {
@@ -234,6 +248,17 @@ impl Provider for AzureKeyVaultProvider {
         }
         Err(self.status_error(&response, key.path()))
     }
+}
+
+/// Builds the write-lock identity from the canonical vault URL only.
+///
+/// [`crate::provider::lock::canonical_origin`] keeps the vault path, so
+/// `https://example.vault.azure.net/` and `https://example.vault.azure.net`
+/// resolve the same lock while two vault names stay distinct. The API version
+/// and credentials are not an input.
+fn lock_identity(base: &url::Url) -> Result<String> {
+    let origin = crate::provider::lock::canonical_origin(base)?;
+    Ok(crate::provider::lock::identity(LOCK_KIND, &origin, &[]))
 }
 
 fn item_name(id: &str) -> Option<String> {
@@ -266,7 +291,7 @@ fn valid_secret_name(name: &str) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{AzureKeyVaultProvider, item_name, valid_secret_name};
+    use super::{AzureKeyVaultProvider, item_name, lock_identity, valid_secret_name};
     use crate::config::AzureKeyVaultConfig;
 
     fn config(vault_url: &str) -> AzureKeyVaultConfig {
@@ -309,5 +334,35 @@ mod tests {
         assert!(valid_secret_name("app-db"));
         assert!(!valid_secret_name("app/db"));
         assert!(!valid_secret_name(""));
+    }
+
+    #[test]
+    fn write_identity_normalizes_the_vault_url() {
+        let plain =
+            url::Url::parse("http://127.0.0.1:4577/devstoreaccount1-keyvault").expect("url");
+        let trailing =
+            url::Url::parse("HTTP://127.0.0.1:4577/devstoreaccount1-keyvault/").expect("url");
+        assert_eq!(
+            lock_identity(&plain).expect("plain"),
+            lock_identity(&trailing).expect("trailing")
+        );
+    }
+
+    #[test]
+    fn write_identity_separates_vaults_and_endpoints() {
+        let vault = url::Url::parse("https://example.vault.azure.net").expect("vault");
+        let other_vault = url::Url::parse("https://other.vault.azure.net").expect("other vault");
+        assert_ne!(
+            lock_identity(&vault).expect("first"),
+            lock_identity(&other_vault).expect("second vault")
+        );
+        let emulator =
+            url::Url::parse("http://127.0.0.1:4577/account-one-keyvault").expect("emulator");
+        let other_emulator =
+            url::Url::parse("http://127.0.0.1:4577/account-two-keyvault").expect("other");
+        assert_ne!(
+            lock_identity(&emulator).expect("first emulator"),
+            lock_identity(&other_emulator).expect("second emulator")
+        );
     }
 }

@@ -32,6 +32,9 @@ const SERVICE: &str = "secretsmanager";
 /// The JSON 1.1 content type used by Secrets Manager.
 const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 
+/// Product family used in the same-user write-lock identity.
+const LOCK_KIND: &str = "aws-secrets-manager";
+
 /// Maximum pages followed for one listing.
 const MAX_PAGES: usize = 100;
 
@@ -220,6 +223,17 @@ impl AwsSecretsManagerProvider {
             }),
         )
     }
+
+    /// Returns the same-user write-lock identity for this endpoint and region.
+    ///
+    /// The identity deliberately excludes the access key, secret key, session
+    /// token, profile name, and config path. Two profiles for the same
+    /// endpoint and region therefore share one lock even when they use
+    /// different credentials; that over-serializes distinct AWS accounts and
+    /// never under-serializes a vault.
+    fn write_identity(&self) -> Result<String> {
+        lock_identity(&self.base, &self.region)
+    }
 }
 
 impl Provider for AwsSecretsManagerProvider {
@@ -314,6 +328,7 @@ impl Provider for AwsSecretsManagerProvider {
         }
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("AWS Secrets Manager values must be UTF-8 text"))?;
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         // One token per logical request. The Put token is reused when a
         // concurrent creator makes the first Put miss and we retry after the
         // create conflict; AWS treats that retry as the same request.
@@ -356,6 +371,7 @@ impl Provider for AwsSecretsManagerProvider {
         }
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("AWS Secrets Manager values must be UTF-8 text"))?;
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let token = client_request_token()?;
         let response = self.create_secret(key.path(), text, &token)?;
         match response.status {
@@ -366,6 +382,22 @@ impl Provider for AwsSecretsManagerProvider {
             _ => Err(aws_status_error(&response, key.path())),
         }
     }
+}
+
+/// Builds the write-lock identity from the endpoint origin and region only.
+///
+/// [`crate::provider::lock::canonical_origin`] folds scheme and host case,
+/// default ports, and a trailing slash, so two profiles that spell one
+/// endpoint differently resolve the same lock. The region is trimmed and
+/// lowercased for the same reason. Credentials are not an input.
+fn lock_identity(base: &url::Url, region: &str) -> Result<String> {
+    let origin = crate::provider::lock::canonical_origin(base)?;
+    let region = region.trim().to_ascii_lowercase();
+    Ok(crate::provider::lock::identity(
+        LOCK_KIND,
+        &origin,
+        &[&region],
+    ))
 }
 
 /// Maps a response status to a fixed message without echoing response fields.
@@ -643,7 +675,7 @@ mod tests {
 
     use super::{
         AwsSecretsManagerProvider, SigningRequest, amz_date, authorization, aws_status_error,
-        client_request_token, valid_secret_name,
+        client_request_token, lock_identity, valid_secret_name,
     };
     use crate::config::AwsSecretsManagerConfig;
     use crate::provider::HttpResponse;
@@ -787,5 +819,29 @@ mod tests {
         assert!(valid_secret_name("db@example.com"));
         assert!(!valid_secret_name("db password"));
         assert!(!valid_secret_name(""));
+    }
+
+    #[test]
+    fn write_identity_normalizes_the_endpoint_and_region() {
+        let plain = url::Url::parse("http://127.0.0.1:4566").expect("url");
+        let trailing = url::Url::parse("HTTP://127.0.0.1:4566/").expect("url");
+        assert_eq!(
+            lock_identity(&plain, "us-east-1").expect("plain"),
+            lock_identity(&trailing, " US-EAST-1 ").expect("trailing")
+        );
+    }
+
+    #[test]
+    fn write_identity_separates_regions_and_endpoints() {
+        let endpoint = url::Url::parse("http://127.0.0.1:4566").expect("url");
+        let other_endpoint = url::Url::parse("http://127.0.0.1:4567").expect("url");
+        assert_ne!(
+            lock_identity(&endpoint, "us-east-1").expect("first"),
+            lock_identity(&endpoint, "us-west-2").expect("second region")
+        );
+        assert_ne!(
+            lock_identity(&endpoint, "us-east-1").expect("first"),
+            lock_identity(&other_endpoint, "us-east-1").expect("second endpoint")
+        );
     }
 }

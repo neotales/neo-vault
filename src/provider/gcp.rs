@@ -24,6 +24,9 @@ const MAX_PAGES: usize = 100;
 /// Maximum keys returned by one listing.
 const MAX_LISTED: usize = 10_000;
 
+/// Product family used in the same-user write-lock identity.
+const LOCK_KIND: &str = "gcp-secret-manager";
+
 /// Google Cloud Secret Manager provider.
 #[derive(Debug)]
 pub struct GcpSecretManagerProvider {
@@ -126,6 +129,15 @@ impl GcpSecretManagerProvider {
         url.query_pairs_mut().append_pair("secretId", name);
         let body = json!({ "replication": { "automatic": {} } }).to_string();
         self.request("POST", &url, Some(body.as_bytes()))
+    }
+
+    /// Returns the same-user write-lock identity for this endpoint and project.
+    ///
+    /// The identity excludes the token, profile name, and config path. Two
+    /// profiles for the same endpoint and project share one lock even when
+    /// they use different credentials.
+    fn write_identity(&self) -> Result<String> {
+        lock_identity(&self.base, &self.project)
     }
 }
 
@@ -247,6 +259,7 @@ impl Provider for GcpSecretManagerProvider {
                 "GCP secret names must contain only letters, digits, '-' and '_'",
             ));
         }
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let response = self.add_version(key.path(), value.expose())?;
         if matches!(response.status, 200 | 201) {
             return Ok(());
@@ -264,6 +277,23 @@ impl Provider for GcpSecretManagerProvider {
         }
         Err(gcp_status_error(&response, key.path()))
     }
+}
+
+/// Builds the write-lock identity from the endpoint origin and project only.
+///
+/// [`crate::provider::lock::canonical_origin`] folds scheme and host case,
+/// default ports, and a trailing slash, so two profiles that spell one
+/// endpoint differently resolve the same lock. Project ids are lowercase by
+/// definition, so the scope is trimmed and lowercased. Credentials are not an
+/// input.
+fn lock_identity(base: &url::Url, project: &str) -> Result<String> {
+    let origin = crate::provider::lock::canonical_origin(base)?;
+    let project = project.trim().to_ascii_lowercase();
+    Ok(crate::provider::lock::identity(
+        LOCK_KIND,
+        &origin,
+        &[&project],
+    ))
 }
 
 /// Maps a response status to a fixed message without echoing response fields.
@@ -310,7 +340,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        GcpSecretManagerProvider, gcp_status_error, secret_name_from_resource, valid_secret_name,
+        GcpSecretManagerProvider, gcp_status_error, lock_identity, secret_name_from_resource,
+        valid_secret_name,
     };
     use crate::config::GcpSecretManagerConfig;
     use crate::provider::{HttpResponse, Provider};
@@ -397,5 +428,29 @@ mod tests {
         let error = gcp_status_error(&response, "app-db");
         assert!(!error.message().contains("INJECTED"));
         assert!(error.message().contains("HTTP 400") || error.message().contains("rejected"));
+    }
+
+    #[test]
+    fn write_identity_normalizes_the_endpoint_and_project() {
+        let plain = url::Url::parse("http://127.0.0.1:4588").expect("url");
+        let trailing = url::Url::parse("HTTP://127.0.0.1:4588/").expect("url");
+        assert_eq!(
+            lock_identity(&plain, "floci-local").expect("plain"),
+            lock_identity(&trailing, " FLOCI-LOCAL ").expect("trailing")
+        );
+    }
+
+    #[test]
+    fn write_identity_separates_projects_and_endpoints() {
+        let endpoint = url::Url::parse("http://127.0.0.1:4588").expect("url");
+        let other_endpoint = url::Url::parse("http://127.0.0.1:4589").expect("url");
+        assert_ne!(
+            lock_identity(&endpoint, "floci-local").expect("first"),
+            lock_identity(&endpoint, "floci-other").expect("second project")
+        );
+        assert_ne!(
+            lock_identity(&endpoint, "floci-local").expect("first"),
+            lock_identity(&other_endpoint, "floci-local").expect("second endpoint")
+        );
     }
 }

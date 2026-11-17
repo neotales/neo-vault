@@ -298,16 +298,22 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   rule, cloud project/region/API-version fields, and the GCP anonymous
   restriction. Calling a constructor directly does not bypass the configuration
   checks.
-- Vault/OpenBao `set`/`ensure`, GitHub `set`, and Infisical `set` take a
-  same-user advisory file lock on this machine before they contact the
-  provider. The CLI, the Rust `Client`, and the C ABI share the mechanism. The
-  cloud adapters do not take it; they rely on their provider's own
-  create/version semantics instead. The lock identity is a hash of the canonical address plus
-  non-secret scope (Vault/OpenBao: mount and namespace, shared across those two
-  kind labels; Infisical: project, environment, and folder; GitHub: owner and
-  repository). Profile names and config file paths are not part of it.
-  `https://Host:443/path/` and `https://host/path` match. `localhost` and
-  `127.0.0.1` do not. The lock file lives under
+- Vault/OpenBao `set`/`ensure`, GitHub `set`, Infisical `set`, and cloud
+  `set` (AWS `ensure` too) take a same-user advisory file lock on this machine
+  before they contact the provider. The CLI, the Rust `Client`, and the C ABI
+  share the mechanism. GCP and Azure `ensure` remain unsupported and send no
+  request, so there is no write to lock. The lock identity is a hash of the
+  canonical address plus non-secret scope (Vault/OpenBao: mount and namespace,
+  shared across those two kind labels; Infisical: project, environment, and
+  folder; GitHub: owner and repository; AWS: region; GCP: project; Azure: the
+  vault path is part of the canonical address and there is no further scope).
+  Profile names, config file paths, and every credential value are excluded:
+  two profiles for one endpoint and scope share a lock even when they use
+  different tokens or access keys. That can over-serialize distinct AWS
+  accounts behind one endpoint, which is safe; it never under-serializes one
+  vault. The endpoint is normalized for scheme and host case, default ports,
+  and a trailing slash, so `https://Host:443/path/` and `https://host/path`
+  match. `localhost` and `127.0.0.1` do not. The lock file lives under
   `$XDG_STATE_HOME/nsvault/locks` or `~/.local/state/nsvault/locks`. A missing
   directory is created `0700`; lock files are created `0600` and must be
   regular, single-link, owner-only files. `NSVAULT_LOCK_DIR` overrides the
