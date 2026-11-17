@@ -102,10 +102,10 @@ Auth, network, and other ambiguous errors are failures, not absence. A
 provider without a race-safe create path — Infisical, GitHub, and every
 read-only kind in this build — exits with an unsupported error and contacts no
 provider. There is no `remove` command.
-`search` and `ls` are name operations. Vault, Infisical, KeePass, Proton, and
-GitHub listings are metadata-only. The Vaultwarden CLI has no metadata-only list
-command, so its adapter fetches full items and keeps only names; see the
-limitation below.
+`search` and `ls` are name operations. Vault, Infisical, KeePass, and GitHub
+listings are metadata-only. The Vaultwarden CLI has no metadata-only list
+command, and the Proton Pass CLI fetches full items even when it prints a
+summary; those adapters keep only names. See the limitations below.
 
 `exec` maps each key's basename to an environment variable, upper-cased and
 sanitized (`apps/prod/db` becomes `DB`; `db#password` becomes `DB_PASSWORD`).
@@ -131,7 +131,7 @@ history still sees exported values, so autoload is a deliberate trade.
 | `keepass` | yes | no | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
 | `infisical` | yes | yes | no | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` is disabled because the Create endpoint's duplicate behavior is unproven. | Fixture-tested for list/get/set and for the `ensure` refusal, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis; no production server |
 | `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
-| `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
+| `proton` | yes | no | no | official `pass-cli`, existing session or PAT; a configured PAT uses a private per-process session directory | Fake `pass-cli` fixture; not installed here |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
 | `aws-secrets-manager` | yes | yes | yes | Secrets Manager JSON 1.1 API with local SigV4 signing | Opt-in Floci test against `floci/floci:2.5.0`; signer unit-tested against AWS's published SigV4 vectors; no AWS account |
 | `gcp-secret-manager` | yes | yes | **no** | Secret Manager v1 REST API | Opt-in Floci test against `floci/floci-gcp:0.13.0`; no GCP project. Ensure is refused because create and add-version are separate, non-atomic calls. |
@@ -197,7 +197,20 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   advisory lock shared by every Vaultwarden profile on this machine, because
   the configuration has no server address and wrapper paths differ.
 - Proton writes are unsupported because the documented update command takes
-  the value in `argv`.
+  the value in `argv`. `ensure` is unsupported because the CLI has no atomic
+  create-if-absent operation.
+- Proton listings are not a metadata-only fetch. In `pass-cli` 2.7.1,
+  `item list --output json` downloads and decrypts every `Item` before
+  serializing an `ItemSummary` without content. The adapter keeps only titles
+  and never returns item content, but the CLI process did fetch it.
+- A configured Proton token runs in a private per-process session directory
+  with the filesystem key provider, so it cannot reuse or overwrite the default
+  `pass-cli` session. After login the adapter requires `info --output json` to
+  identify a personal access token; a user session is rejected. Without a
+  token, the existing `pass-cli` session is used unchanged. This is based on
+  the pinned 2.7.1 source, not a live service. The isolated directory is
+  removed on normal exit; a killed process can leave it for the system to
+  clean.
 - GitHub repository secrets only. Organization, environment, Codespaces, and
   Dependabot scopes are future work. `ensure` is unsupported: the secrets API
   has one PUT that creates or updates, and a check-then-PUT race would
