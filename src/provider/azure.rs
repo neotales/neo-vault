@@ -28,6 +28,9 @@ const MAX_PAGES: usize = 100;
 /// Maximum keys returned by one listing.
 const MAX_LISTED: usize = 10_000;
 
+/// Product family used in the same-user write-lock identity.
+const LOCK_KIND: &str = "azure-key-vault";
+
 /// Azure Key Vault secrets provider.
 #[derive(Debug)]
 pub struct AzureKeyVaultProvider {
@@ -123,6 +126,17 @@ impl AzureKeyVaultProvider {
         let mut url = self.secrets_url()?;
         url.query_pairs_mut().append_pair("$skiptoken", &skiptoken);
         Ok(url)
+    }
+
+    /// Returns the same-user write-lock identity for this vault URL.
+    ///
+    /// A recognized Azure Key Vault hostname maps to one lock per vault name,
+    /// so the public, sovereign, and private-link suffixes for one vault share
+    /// it. A custom endpoint (the emulator or an arbitrary proxy) keeps its
+    /// canonical origin, including the vault path. The API version, token,
+    /// profile name, and config path are not part of it.
+    fn write_identity(&self) -> Result<String> {
+        lock_identity(&self.base)
     }
 }
 
@@ -227,12 +241,60 @@ impl Provider for AzureKeyVaultProvider {
         }
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("Azure Key Vault values must be UTF-8 text"))?;
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let body = json!({ "value": text }).to_string();
         let response = self.request("PUT", &self.secret_url(key.path())?, Some(body.as_bytes()))?;
         if matches!(response.status, 200 | 201) {
             return Ok(());
         }
         Err(self.status_error(&response, key.path()))
+    }
+}
+
+/// Builds the write-lock identity from a recognized vault hostname or, for a
+/// custom endpoint, its canonical origin.
+///
+/// Recognized public, sovereign, and private-link Key Vault suffixes map to
+/// one lock per vault name, so aliases for one vault share it. The same name
+/// in two clouds also shares it, which over-serializes and is safe. A custom
+/// endpoint keeps its canonical origin, including the vault path; two custom
+/// names for one vault are not serialized by this mechanism.
+fn lock_identity(base: &url::Url) -> Result<String> {
+    if let Some(vault) = recognized_vault_name(base) {
+        return Ok(crate::provider::lock::identity(
+            LOCK_KIND,
+            "azure",
+            &[&vault],
+        ));
+    }
+    let origin = crate::provider::lock::canonical_origin(base)?;
+    Ok(crate::provider::lock::identity(LOCK_KIND, &origin, &[]))
+}
+
+/// Extracts the vault name from a recognized Azure Key Vault hostname.
+fn recognized_vault_name(base: &url::Url) -> Option<String> {
+    if base.scheme() != "https" || base.port().is_some() {
+        return None;
+    }
+    let host = base.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let (name, suffix) = host.split_once('.')?;
+    if name.is_empty() {
+        return None;
+    }
+    if matches!(
+        suffix,
+        "vault.azure.net"
+            | "vault.azure.cn"
+            | "vault.usgovcloudapi.net"
+            | "vault.microsoftazure.de"
+            | "privatelink.vaultcore.azure.net"
+            | "privatelink.vaultcore.azure.cn"
+            | "privatelink.vaultcore.usgovcloudapi.net"
+            | "privatelink.vaultcore.microsoftazure.de"
+    ) {
+        Some(name.to_owned())
+    } else {
+        None
     }
 }
 
@@ -266,7 +328,7 @@ fn valid_secret_name(name: &str) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{AzureKeyVaultProvider, item_name, valid_secret_name};
+    use super::{AzureKeyVaultProvider, item_name, lock_identity, valid_secret_name};
     use crate::config::AzureKeyVaultConfig;
 
     fn config(vault_url: &str) -> AzureKeyVaultConfig {
@@ -309,5 +371,52 @@ mod tests {
         assert!(valid_secret_name("app-db"));
         assert!(!valid_secret_name("app/db"));
         assert!(!valid_secret_name(""));
+    }
+
+    #[test]
+    fn write_identity_normalizes_the_vault_url() {
+        let plain =
+            url::Url::parse("http://127.0.0.1:4577/devstoreaccount1-keyvault").expect("url");
+        let trailing =
+            url::Url::parse("HTTP://127.0.0.1:4577/devstoreaccount1-keyvault/").expect("url");
+        assert_eq!(
+            lock_identity(&plain).expect("plain"),
+            lock_identity(&trailing).expect("trailing")
+        );
+    }
+
+    #[test]
+    fn write_identity_maps_recognized_vault_aliases_to_one_lock() {
+        let public = url::Url::parse("https://example.vault.azure.net").expect("public");
+        let private =
+            url::Url::parse("https://example.privatelink.vaultcore.azure.net").expect("private");
+        let sovereign =
+            url::Url::parse("https://example.vault.usgovcloudapi.net").expect("sovereign");
+        assert_eq!(
+            lock_identity(&public).expect("public"),
+            lock_identity(&private).expect("private")
+        );
+        assert_eq!(
+            lock_identity(&public).expect("public"),
+            lock_identity(&sovereign).expect("sovereign")
+        );
+    }
+
+    #[test]
+    fn write_identity_separates_vaults_and_endpoints() {
+        let vault = url::Url::parse("https://example.vault.azure.net").expect("vault");
+        let other_vault = url::Url::parse("https://other.vault.azure.net").expect("other vault");
+        assert_ne!(
+            lock_identity(&vault).expect("first"),
+            lock_identity(&other_vault).expect("second vault")
+        );
+        let emulator =
+            url::Url::parse("http://127.0.0.1:4577/account-one-keyvault").expect("emulator");
+        let other_emulator =
+            url::Url::parse("http://127.0.0.1:4577/account-two-keyvault").expect("other");
+        assert_ne!(
+            lock_identity(&emulator).expect("first emulator"),
+            lock_identity(&other_emulator).expect("second emulator")
+        );
     }
 }

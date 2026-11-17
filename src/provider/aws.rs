@@ -32,6 +32,9 @@ const SERVICE: &str = "secretsmanager";
 /// The JSON 1.1 content type used by Secrets Manager.
 const CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 
+/// Product family used in the same-user write-lock identity.
+const LOCK_KIND: &str = "aws-secrets-manager";
+
 /// Maximum pages followed for one listing.
 const MAX_PAGES: usize = 100;
 
@@ -220,6 +223,21 @@ impl AwsSecretsManagerProvider {
             }),
         )
     }
+
+    /// Returns the same-user write-lock identity for this endpoint and region.
+    ///
+    /// A recognized AWS Secrets Manager hostname maps to one lock per region,
+    /// so the standard, FIPS, dual-stack, and China spellings of one regional
+    /// service share a lock. An unrecognized custom endpoint keeps its
+    /// canonical origin, because nsvault cannot tell whether two custom names
+    /// reach the same vault. The identity deliberately excludes the access
+    /// key, secret key, session token, profile name, and config path. Two
+    /// profiles for the same endpoint and region therefore share one lock even
+    /// when they use different credentials; that over-serializes distinct AWS
+    /// accounts and never under-serializes a recognized vault.
+    fn write_identity(&self) -> Result<String> {
+        lock_identity(&self.base, &self.region)
+    }
 }
 
 impl Provider for AwsSecretsManagerProvider {
@@ -314,6 +332,7 @@ impl Provider for AwsSecretsManagerProvider {
         }
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("AWS Secrets Manager values must be UTF-8 text"))?;
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         // One token per logical request. The Put token is reused when a
         // concurrent creator makes the first Put miss and we retry after the
         // create conflict; AWS treats that retry as the same request.
@@ -356,6 +375,7 @@ impl Provider for AwsSecretsManagerProvider {
         }
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("AWS Secrets Manager values must be UTF-8 text"))?;
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let token = client_request_token()?;
         let response = self.create_secret(key.path(), text, &token)?;
         match response.status {
@@ -365,6 +385,61 @@ impl Provider for AwsSecretsManagerProvider {
             }
             _ => Err(aws_status_error(&response, key.path())),
         }
+    }
+}
+
+/// Builds the write-lock identity from a recognized AWS service hostname or,
+/// for a custom endpoint, its canonical origin plus region.
+///
+/// Recognized hostnames are `secretsmanager.{region}` or
+/// `secretsmanager-fips.{region}` followed by `amazonaws.com`,
+/// `amazonaws.com.cn`, or `api.aws`. They map to one lock per
+/// host region, ignoring the configured region and every spelling difference,
+/// because the standard, FIPS, and dual-stack endpoints are one regional
+/// vault. An arbitrary custom hostname (CNAME, reverse proxy, private DNS) is
+/// not recognizable and keeps its canonical origin, so two custom names for
+/// one vault are not serialized by this mechanism.
+fn lock_identity(base: &url::Url, region: &str) -> Result<String> {
+    if let Some(service_region) = recognized_service_region(base) {
+        return Ok(crate::provider::lock::identity(
+            LOCK_KIND,
+            "aws",
+            &[&service_region],
+        ));
+    }
+    let origin = crate::provider::lock::canonical_origin(base)?;
+    let region = region.trim().to_ascii_lowercase();
+    Ok(crate::provider::lock::identity(
+        LOCK_KIND,
+        &origin,
+        &[&region],
+    ))
+}
+
+/// Extracts the region from a recognized AWS Secrets Manager hostname.
+///
+/// A port, a non-HTTPS scheme, a path, or an unrecognized suffix makes the
+/// endpoint custom rather than a known AWS service alias.
+fn recognized_service_region(base: &url::Url) -> Option<String> {
+    if base.scheme() != "https" || base.port().is_some() {
+        return None;
+    }
+    if !matches!(base.path(), "" | "/") {
+        return None;
+    }
+    let host = base.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let (label, rest) = host.split_once('.')?;
+    if !matches!(label, "secretsmanager" | "secretsmanager-fips") {
+        return None;
+    }
+    let (region, suffix) = rest.split_once('.')?;
+    if !crate::config::valid_aws_region(region) {
+        return None;
+    }
+    if matches!(suffix, "amazonaws.com" | "amazonaws.com.cn" | "api.aws") {
+        Some(region.to_owned())
+    } else {
+        None
     }
 }
 
@@ -643,7 +718,7 @@ mod tests {
 
     use super::{
         AwsSecretsManagerProvider, SigningRequest, amz_date, authorization, aws_status_error,
-        client_request_token, valid_secret_name,
+        client_request_token, lock_identity, valid_secret_name,
     };
     use crate::config::AwsSecretsManagerConfig;
     use crate::provider::HttpResponse;
@@ -787,5 +862,64 @@ mod tests {
         assert!(valid_secret_name("db@example.com"));
         assert!(!valid_secret_name("db password"));
         assert!(!valid_secret_name(""));
+    }
+
+    #[test]
+    fn write_identity_maps_recognized_aws_endpoints_to_one_regional_lock() {
+        let standard =
+            url::Url::parse("https://secretsmanager.us-east-1.amazonaws.com").expect("standard");
+        let fips =
+            url::Url::parse("https://secretsmanager-fips.us-east-1.amazonaws.com").expect("fips");
+        let dual = url::Url::parse("https://secretsmanager.us-east-1.api.aws").expect("dual");
+        let china =
+            url::Url::parse("https://secretsmanager.cn-north-1.amazonaws.com.cn").expect("china");
+        assert_eq!(
+            lock_identity(&standard, "us-east-1").expect("standard"),
+            lock_identity(&fips, "us-east-1").expect("fips")
+        );
+        assert_eq!(
+            lock_identity(&standard, "us-east-1").expect("standard"),
+            lock_identity(&dual, "us-west-2").expect("dual")
+        );
+        assert_ne!(
+            lock_identity(&standard, "us-east-1").expect("standard"),
+            lock_identity(&china, "us-east-1").expect("china")
+        );
+    }
+
+    #[test]
+    fn write_identity_keeps_custom_aws_endpoints_apart() {
+        let standard =
+            url::Url::parse("https://secretsmanager.us-east-1.amazonaws.com").expect("standard");
+        let custom = url::Url::parse("https://proxy.example.test/secrets").expect("custom");
+        assert_ne!(
+            lock_identity(&standard, "us-east-1").expect("standard"),
+            lock_identity(&custom, "us-east-1").expect("custom")
+        );
+        let custom_trailing =
+            url::Url::parse("HTTPS://proxy.example.test/secrets/").expect("custom trailing");
+        assert_eq!(
+            lock_identity(&custom, "us-east-1").expect("custom"),
+            lock_identity(&custom_trailing, " US-EAST-1 ").expect("custom trailing")
+        );
+        let other_custom = url::Url::parse("https://other.example.test/secrets").expect("other");
+        assert_ne!(
+            lock_identity(&custom, "us-east-1").expect("custom"),
+            lock_identity(&other_custom, "us-east-1").expect("other custom")
+        );
+    }
+
+    #[test]
+    fn write_identity_separates_regions_and_endpoints() {
+        let endpoint = url::Url::parse("http://127.0.0.1:4566").expect("url");
+        let other_endpoint = url::Url::parse("http://127.0.0.1:4567").expect("url");
+        assert_ne!(
+            lock_identity(&endpoint, "us-east-1").expect("first"),
+            lock_identity(&endpoint, "us-west-2").expect("second region")
+        );
+        assert_ne!(
+            lock_identity(&endpoint, "us-east-1").expect("first"),
+            lock_identity(&other_endpoint, "us-east-1").expect("second endpoint")
+        );
     }
 }

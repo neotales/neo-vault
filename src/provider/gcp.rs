@@ -24,6 +24,9 @@ const MAX_PAGES: usize = 100;
 /// Maximum keys returned by one listing.
 const MAX_LISTED: usize = 10_000;
 
+/// Product family used in the same-user write-lock identity.
+const LOCK_KIND: &str = "gcp-secret-manager";
+
 /// Google Cloud Secret Manager provider.
 #[derive(Debug)]
 pub struct GcpSecretManagerProvider {
@@ -126,6 +129,18 @@ impl GcpSecretManagerProvider {
         url.query_pairs_mut().append_pair("secretId", name);
         let body = json!({ "replication": { "automatic": {} } }).to_string();
         self.request("POST", &url, Some(body.as_bytes()))
+    }
+
+    /// Returns the same-user write-lock identity for this endpoint.
+    ///
+    /// A recognized Google Secret Manager hostname maps to one broad lock for
+    /// the service, so endpoint aliases share it. A custom endpoint keeps its
+    /// canonical origin. The project is deliberately not an input: a project
+    /// id and its numeric project number are two spellings of one project, and
+    /// nsvault cannot map one to the other locally. The token, profile name,
+    /// and config path are also excluded.
+    fn write_identity(&self) -> Result<String> {
+        lock_identity(&self.base)
     }
 }
 
@@ -247,6 +262,7 @@ impl Provider for GcpSecretManagerProvider {
                 "GCP secret names must contain only letters, digits, '-' and '_'",
             ));
         }
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let response = self.add_version(key.path(), value.expose())?;
         if matches!(response.status, 200 | 201) {
             return Ok(());
@@ -264,6 +280,38 @@ impl Provider for GcpSecretManagerProvider {
         }
         Err(gcp_status_error(&response, key.path()))
     }
+}
+
+/// Builds the write-lock identity from a recognized Google service hostname
+/// or, for a custom endpoint, its canonical origin.
+///
+/// Every recognized Google Secret Manager hostname (`secretmanager.*.googleapis.com`,
+/// including the plain host, mTLS, and regional `rep` spellings) maps to one
+/// broad lock for the service. The project is not an input, because a project
+/// id and its project number name the same project and cannot be mapped
+/// locally. A custom endpoint (an emulator, proxy, or arbitrary DNS name)
+/// keeps its canonical origin, so two custom names for one vault are not
+/// serialized by this mechanism.
+fn lock_identity(base: &url::Url) -> Result<String> {
+    if is_google_secret_manager_host(base) {
+        return Ok(crate::provider::lock::identity(
+            LOCK_KIND,
+            "google-secret-manager",
+            &[],
+        ));
+    }
+    let origin = crate::provider::lock::canonical_origin(base)?;
+    Ok(crate::provider::lock::identity(LOCK_KIND, &origin, &[]))
+}
+
+/// Returns whether the URL host is a Google Secret Manager service endpoint.
+fn is_google_secret_manager_host(base: &url::Url) -> bool {
+    let Some(host) = base.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (host.starts_with("secretmanager.") || host.starts_with("secretmanager-fips."))
+        && host.ends_with(".googleapis.com")
 }
 
 /// Maps a response status to a fixed message without echoing response fields.
@@ -310,7 +358,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        GcpSecretManagerProvider, gcp_status_error, secret_name_from_resource, valid_secret_name,
+        GcpSecretManagerProvider, gcp_status_error, lock_identity, secret_name_from_resource,
+        valid_secret_name,
     };
     use crate::config::GcpSecretManagerConfig;
     use crate::provider::{HttpResponse, Provider};
@@ -397,5 +446,41 @@ mod tests {
         let error = gcp_status_error(&response, "app-db");
         assert!(!error.message().contains("INJECTED"));
         assert!(error.message().contains("HTTP 400") || error.message().contains("rejected"));
+    }
+
+    #[test]
+    fn write_identity_maps_recognized_gcp_endpoints_to_one_service_lock() {
+        let plain = url::Url::parse("https://secretmanager.googleapis.com").expect("plain");
+        let mtls = url::Url::parse("https://secretmanager.mtls.googleapis.com").expect("mtls");
+        let regional = url::Url::parse("https://secretmanager.us-central1.rep.googleapis.com")
+            .expect("regional");
+        assert_eq!(
+            lock_identity(&plain).expect("plain"),
+            lock_identity(&mtls).expect("mtls")
+        );
+        assert_eq!(
+            lock_identity(&plain).expect("plain"),
+            lock_identity(&regional).expect("regional")
+        );
+    }
+
+    #[test]
+    fn write_identity_keeps_custom_gcp_endpoints_apart() {
+        let endpoint = url::Url::parse("http://127.0.0.1:4588").expect("url");
+        let trailing = url::Url::parse("HTTP://127.0.0.1:4588/").expect("url");
+        let other = url::Url::parse("http://127.0.0.1:4589").expect("url");
+        assert_eq!(
+            lock_identity(&endpoint).expect("endpoint"),
+            lock_identity(&trailing).expect("trailing")
+        );
+        assert_ne!(
+            lock_identity(&endpoint).expect("endpoint"),
+            lock_identity(&other).expect("other endpoint")
+        );
+        let google = url::Url::parse("https://secretmanager.googleapis.com").expect("google");
+        assert_ne!(
+            lock_identity(&endpoint).expect("endpoint"),
+            lock_identity(&google).expect("google")
+        );
     }
 }
