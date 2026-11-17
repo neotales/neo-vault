@@ -11,6 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use crypto_box::aead::rand_core::{OsRng, RngCore};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -198,17 +199,25 @@ impl AwsSecretsManagerProvider {
         ))
     }
 
-    fn create_secret(&self, name: &str, text: &str) -> Result<HttpResponse> {
+    fn create_secret(&self, name: &str, text: &str, token: &str) -> Result<HttpResponse> {
         self.request(
             "CreateSecret",
-            &json!({ "Name": name, "SecretString": text }),
+            &json!({
+                "Name": name,
+                "SecretString": text,
+                "ClientRequestToken": token
+            }),
         )
     }
 
-    fn put_secret_value(&self, name: &str, text: &str) -> Result<HttpResponse> {
+    fn put_secret_value(&self, name: &str, text: &str, token: &str) -> Result<HttpResponse> {
         self.request(
             "PutSecretValue",
-            &json!({ "SecretId": name, "SecretString": text }),
+            &json!({
+                "SecretId": name,
+                "SecretString": text,
+                "ClientRequestToken": token
+            }),
         )
     }
 }
@@ -305,21 +314,26 @@ impl Provider for AwsSecretsManagerProvider {
         }
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("AWS Secrets Manager values must be UTF-8 text"))?;
-        let response = self.put_secret_value(key.path(), text)?;
+        // One token per logical request. The Put token is reused when a
+        // concurrent creator makes the first Put miss and we retry after the
+        // create conflict; AWS treats that retry as the same request.
+        let put_token = client_request_token()?;
+        let create_token = client_request_token()?;
+        let response = self.put_secret_value(key.path(), text, &put_token)?;
         if response.status == 200 {
             return Ok(());
         }
         if response.status == 400
             && aws_error_type(&response).as_deref() == Some("ResourceNotFoundException")
         {
-            let created = self.create_secret(key.path(), text)?;
+            let created = self.create_secret(key.path(), text, &create_token)?;
             if created.status == 200 {
                 return Ok(());
             }
             if created.status == 400
                 && aws_error_type(&created).as_deref() == Some("ResourceExistsException")
             {
-                let retried = self.put_secret_value(key.path(), text)?;
+                let retried = self.put_secret_value(key.path(), text, &put_token)?;
                 if retried.status == 200 {
                     return Ok(());
                 }
@@ -342,7 +356,8 @@ impl Provider for AwsSecretsManagerProvider {
         }
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("AWS Secrets Manager values must be UTF-8 text"))?;
-        let response = self.create_secret(key.path(), text)?;
+        let token = client_request_token()?;
+        let response = self.create_secret(key.path(), text, &token)?;
         match response.status {
             200 => Ok(EnsureStatus::Created),
             400 if aws_error_type(&response).as_deref() == Some("ResourceExistsException") => {
@@ -374,6 +389,18 @@ fn aws_status_error(response: &HttpResponse, key: &str) -> Error {
             "AWS Secrets Manager returned HTTP {status} for {key:?}"
         )),
     }
+}
+
+/// Generates a fresh AWS `ClientRequestToken`.
+///
+/// AWS accepts 1-64 characters from `[A-Za-z0-9_-]`. Thirty-two random bytes
+/// rendered as lowercase hex are 64 characters and come from the OS CSPRNG.
+fn client_request_token() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut bytes)
+        .map_err(|_| Error::new("cannot generate an AWS client request token"))?;
+    Ok(hex(&bytes))
 }
 
 fn optional_credential(environment: Option<&str>, file: Option<&Path>) -> Result<Option<Secret>> {
@@ -616,7 +643,7 @@ mod tests {
 
     use super::{
         AwsSecretsManagerProvider, SigningRequest, amz_date, authorization, aws_status_error,
-        valid_secret_name,
+        client_request_token, valid_secret_name,
     };
     use crate::config::AwsSecretsManagerConfig;
     use crate::provider::HttpResponse;
@@ -701,6 +728,15 @@ mod tests {
         );
         let url = url::Url::parse("http://[::1]:4566/").expect("url");
         assert_eq!(super::host_header(&url).expect("host"), "[::1]:4566");
+    }
+
+    #[test]
+    fn client_request_tokens_are_fresh_and_well_formed() {
+        let first = client_request_token().expect("token");
+        let second = client_request_token().expect("token");
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 
     #[test]

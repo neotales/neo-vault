@@ -328,6 +328,16 @@ needed. Vaultwarden and Infisical container tests are deferred with concrete
 prerequisites in [`docs/testcontainers.md`](docs/testcontainers.md); no test is
 claimed for them. Container tests do not run in the default gate.
 
+The AWS JSON request contract has a separate loopback fixture test:
+
+```sh
+cargo test --test aws_contract
+```
+
+It records `CreateSecret` and `PutSecretValue` bodies and asserts every write
+carries a valid CSPRNG `ClientRequestToken`; the Put retry after a create
+conflict must reuse the same token.
+
 ## Floci / cloud emulation
 
 The AWS Secrets Manager, GCP Secret Manager, and Azure Key Vault adapters are
@@ -416,7 +426,8 @@ Observed:
 ```text
 cargo fmt --check                         clean
 cargo clippy --all-targets -- -D warnings clean
-cargo test                                53 lib + 16 CLI + 3 FFI passed;
+cargo test                                54 lib + 1 AWS contract + 16 CLI
+                                          + 3 FFI passed;
                                           0 failed; 3 cloud + 1 Vault
                                           container tests ignored
 cargo build --release --lib               succeeded

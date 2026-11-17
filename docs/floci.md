@@ -108,6 +108,11 @@ What the test covers:
   version, metadata-only `list`, `nextLink` pagination across 27 secrets, and
   refusal of `ensure`.
 
+A separate loopback fixture test (`tests/aws_contract.rs`) records the
+`CreateSecret` and `PutSecretValue` JSON bodies. It asserts that every write
+carries a valid `ClientRequestToken` and that the Put retry after a create
+conflict reuses the same logical request token.
+
 The AWS signer is also unit-tested against AWS's published SigV4 vectors:
 `get-vanilla` and `post-vanilla-query` from the AWS SigV4 test suite. Those
 tests assert the full `Authorization` header, including the known signatures
