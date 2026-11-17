@@ -40,6 +40,35 @@ finished in 44.41s
 The testcontainers-managed container was gone after the run. The pulled image
 remains locally; removing it is a separate, explicit decision.
 
+## Cloud providers: implemented and exercised with Floci
+
+`tests/container_cloud.rs` starts one pinned Floci release image per test:
+
+- AWS: `floci/floci:2.5.0` on port 4566
+- GCP: `floci/floci-gcp:0.13.0` on port 4588
+- Azure: `floci/floci-az:0.17.0` on port 4577, with Azure Functions disabled and
+  no Docker socket
+
+Each test maps the port to a random loopback host port, uses only temporary
+owner-only credential files with obviously fake values, and lets testcontainers
+remove its own container. The full evidence, image digests, and limits are in
+[`floci.md`](floci.md).
+
+```sh
+cargo test --test container_cloud -- --ignored --nocapture
+```
+
+Observed in this workspace on 2026-11-17:
+
+```text
+running 3 tests
+test gcp_secret_manager_round_trips_through_floci ... ok
+test azure_key_vault_round_trips_through_floci ... ok
+test aws_secrets_manager_round_trips_through_floci ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
 ## Vaultwarden: deferred, concrete prerequisites
 
 Not implemented in this increment. The adapter invokes the Bitwarden CLI; the
@@ -83,6 +112,8 @@ would not prove the adapter works.
 
 ## What is not claimed
 
-No Vaultwarden or Infisical container test ran. The only container test that
-ran is Vault, and its evidence is above. CI does not run container tests by
-default; they are explicit opt-in commands.
+No Vaultwarden or Infisical container test ran. The container tests that ran
+are Vault and the three Floci cloud adapters; their evidence is above. Floci
+does not validate AWS SigV4 signatures, and passing these tests is not
+production verification against AWS, GCP, or Azure. CI does not run container
+tests by default; they are explicit opt-in commands.

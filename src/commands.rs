@@ -396,6 +396,9 @@ fn describe(profile: &ProviderConfig) -> (&'static str, bool, bool, bool, bool) 
             command_available(&config.command),
         ),
         ProviderConfig::Github(_) => ("github", false, true, false, true),
+        ProviderConfig::AwsSecretsManager(_) => ("aws-secrets-manager", true, true, true, true),
+        ProviderConfig::GcpSecretManager(_) => ("gcp-secret-manager", true, true, false, true),
+        ProviderConfig::AzureKeyVault(_) => ("azure-key-vault", true, true, false, true),
     }
 }
 
