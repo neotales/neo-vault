@@ -128,7 +128,7 @@ history still sees exported values, so autoload is a deliberate trade.
 | --- | --- | --- | --- | --- | --- |
 | `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
 | `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
-| `keepass` | yes | no | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
+| `keepass` | yes | yes | yes | `keepassxc-cli`; `edit -p`/`add -p` read the database password and the value from stdin, never `argv` | Fake-CLI fixture in the suite plus an opt-in generated local KDBX test (`cargo test --test keepass_kdbx -- --ignored`) with `keepassxc-cli` 2.7.12; no production vault |
 | `infisical` | yes | yes | no | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` is disabled because the Create endpoint's duplicate behavior is unproven. | Fixture-tested for list/get/set and for the `ensure` refusal, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis; no production server |
 | `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
@@ -142,7 +142,8 @@ Key grammar:
 - Vault/OpenBao: `path/to/secret` or `path/to/secret#field`. Without a field,
   a `value` field wins, otherwise a single-field secret is accepted.
 - KeePass: `Group/Entry` returns the `Password` attribute;
-  `Group/Entry#UserName` or another attribute selects one.
+  `Group/Entry#UserName` or another attribute selects one. Writes accept no
+  field or `Password` only; every other attribute is read-only.
 - Infisical: `SECRET_NAME`; fields are not part of the API.
 - Vaultwarden: item name or UUID, optionally `#password`, `#username`,
   `#notes`, `#name`, `#id`, or a custom field name. Names must be unique;
@@ -167,8 +168,31 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   not exposed. Vault/OpenBao tokens are static for the process lifetime.
 - Infisical lists one folder (`recursive = false`) and does not paginate; the
   v4 endpoint is unpaginated by design.
-- KeePass is read-only. Database passwords and key files are the caller's
-  responsibility; the password is written to `keepassxc-cli` stdin.
+- KeePass writes one entry's `Password` field. `#UserName`, `#URL`, `#Notes`,
+  custom attributes, tags, and attachments are read-only because `edit` takes
+  those values in `argv`; this adapter never puts a value there. A write
+  requires `password_env`, `password_file`, or a key-file-only database: the
+  database password and the value share the child's stdin, so an interactive
+  database prompt cannot be combined with them. A value must be UTF-8 without
+  a newline or NUL and is capped at 1 MiB; the stdin line ending means a value
+  cannot end in a newline.
+  An existing entry is updated with `edit -p`, which changes only the password
+  and preserves the other fields. A missing entry is created with `add -p` only
+  when its parent group already exists; missing groups are not created. `set`
+  and `ensure` hold one same-user advisory lock keyed by the canonical database
+  path, so cooperating nsvault processes (including the Rust `Client` and the C
+  ABI) serialize their read-modify-write. `keepassxc-cli` has no conditional
+  write and does not honor that lock: the KeePassXC GUI, another tool, another
+  host, or a different OS user can change the KDBX between our read and save
+  and lose the other change. `ensure` re-lists under the lock and uses `add`;
+  the tested 2.7.12 `add` refuses an existing path, so a write that appears
+  during a race is
+  reported `present` rather than overwritten, but the CLI can still lose a
+  concurrent external change to another field. The duplicate refusal is
+  observed, not documented: a `keepassxc-cli` that upserts would defeat it.
+  An existing entry is present even when its password is empty: `ensure` never
+  fills or replaces an existing field. Database passwords and key files remain the caller's
+  responsibility; both are written to `keepassxc-cli` stdin, never `argv`.
 - Vaultwarden never logs in or unlocks; the session must already be unlocked when
   the adapter runs. `bw list items` returns full items, which this adapter
   parses and discards except for names. A write reads the whole item, changes
@@ -324,14 +348,17 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   restriction. Calling a constructor directly does not bypass the configuration
   checks.
 - Vault/OpenBao `set`/`ensure`, GitHub `set`, Infisical `set`, Vaultwarden
-  `set`, and cloud `set` (AWS `ensure` too) take a same-user advisory file lock on this machine
-  before they contact the provider. The CLI, the Rust `Client`, and the C ABI
+  `set`, KeePass `set`/`ensure`, and cloud `set` (AWS `ensure` too) take a
+  same-user advisory file lock on this machine before they contact the
+  provider. The CLI, the Rust `Client`, and the C ABI
   share the mechanism. GCP and Azure `ensure` remain unsupported and send no
   request, so there is no write to lock. The lock identity is a hash of the
   canonical address plus non-secret scope (Vault/OpenBao: mount and namespace,
   shared across those two kind labels; Infisical: project, environment, and
   folder; GitHub: owner and repository; Vaultwarden: one shared identity for
-  every profile on this machine, because wrapper paths differ). For the clouds it is deliberately
+  every profile on this machine, because wrapper paths differ; KeePass: the
+  canonical database path, so relative paths and symbolic links to one file
+  share a lock). For the clouds it is deliberately
   conservative:
   - AWS recognizes `secretsmanager.{region}` and
     `secretsmanager-fips.{region}` on `amazonaws.com`, `amazonaws.com.cn`,
@@ -524,25 +551,26 @@ Observed:
 ```text
 cargo fmt --check                         clean
 cargo clippy --all-targets -- -D warnings clean
-cargo test                                71 lib + 1 AWS contract + 26 CLI
-                                          + 3 FFI passed;
-                                          0 failed; 3 cloud + 1 Vault
-                                          container tests ignored
+cargo test                                90 lib + 1 AWS contract + 36 CLI
+                                          + 4 FFI passed;
+                                          0 failed; 7 ignored (3 cloud
+                                          emulator, Vault, Infisical,
+                                          Vaultwarden, KeePass)
 cargo build --release --lib               succeeded
 C ABI smoke                               exit 0, "redacted error received
                                           (34 bytes)"
 ```
 
-The opt-in Vault and cloud emulator tests also passed:
+The opt-in KeePass test against a real generated KDBX also passed:
 
 ```sh
-cargo test --test container_vault -- --ignored --nocapture
+cargo test --test keepass_kdbx -- --ignored --nocapture
 # 1 passed; 0 failed
-
-cargo test --test container_cloud -- --ignored --nocapture
-# 3 passed; 0 failed
 ```
 
-The C ABI binary was written under a private cache directory because `/tmp` on
-this machine was at a per-process disk quota; the compile and link command was
-otherwise the documented one. No claim here covers a live cloud service.
+The container and Floci emulator tests were not rerun in this worktree; their
+earlier evidence is in [`docs/testcontainers.md`](docs/testcontainers.md) and
+[`docs/floci.md`](docs/floci.md). The C ABI binary was written under a private
+cache directory and `TMPDIR` was set there because `/tmp` on this machine was
+at a per-process disk quota; the compile and link command was otherwise the
+documented one. No claim here covers a live KeePass, Vault, or cloud service.
