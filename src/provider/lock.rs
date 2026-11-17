@@ -2,8 +2,8 @@
 //! verified private directory for provider state that must not live in a
 //! shared or attacker-controlled location.
 //!
-//! The write lock is held by `set` and `ensure` for the whole call, including
-//! the existence check. The kernel releases an exclusive `flock` when the
+//! `set` and `ensure` hold this lock for the whole call, including the
+//! provider read or create. The kernel releases an exclusive `flock` when the
 //! process exits, including a crash or `SIGKILL`. The lock file is left in
 //! place; it does not have to be deleted to recover.
 //!

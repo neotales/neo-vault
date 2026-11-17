@@ -10,7 +10,7 @@ No adapter in this repository has been verified against a live production servic
 | `vault` | yes | yes | yes | Fixture plus opt-in container test. Ensure uses metadata, subkeys, and CAS. |
 | `openbao` | yes | yes | yes | Same adapter as `vault`. Not exercised as its own server. |
 | `keepass` | yes | no | no | Fake CLI fixture. Writes are refused. |
-| `infisical` | yes | yes | no | List, get, and set are fixture-shaped in the library. `set` is a GET-then-POST/PATCH write. `ensure` is refused: the Create endpoint's duplicate behavior is unproven, so no check-then-create is attempted. |
+| `infisical` | yes | yes | yes | List, get, set, and ensure are fixture-shaped in the library, with an opt-in container run against `infisical/infisical:v0.167.11`. `set` is a GET-then-POST/PATCH write. `ensure` sends only Create (`POST`); the server's partial unique index rejects a duplicate with `400`, which is reported present. The `200` Create body must be the documented secret object and identify the requested key, project, environment, and shared type before the adapter reports created. |
 | `vaultwarden` | yes | yes | no | Fake `bw` fixture plus an opt-in container test against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1. Writes sync the CLI state and send the encoded item on stdin; the server revision check covers the sync-to-edit window. `bw list items` returns full items; the adapter keeps names. |
 | `proton` | yes | no | no | Fake `pass-cli` fixture. A write would put the value in `argv`, so it is refused. A configured PAT uses a private per-process session directory. |
 | `github` | no | yes | no | Sealed-box unit test only. The API never returns a value. Ensure is refused because PUT would overwrite. |

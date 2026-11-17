@@ -380,7 +380,7 @@ fn describe(profile: &ProviderConfig) -> (&'static str, bool, bool, bool, bool) 
             false,
             command_available(&config.command),
         ),
-        ProviderConfig::Infisical(_) => ("infisical", true, true, false, true),
+        ProviderConfig::Infisical(_) => ("infisical", true, true, true, true),
         ProviderConfig::Vaultwarden(config) => (
             "vaultwarden",
             true,

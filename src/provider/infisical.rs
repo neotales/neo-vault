@@ -6,9 +6,13 @@
 //! never prints a response body in an error.
 //!
 //! `set` is a GET-then-POST/PATCH write under the same-user write lock.
-//! `ensure` is disabled: the v4 Create endpoint's behavior for a duplicate
-//! name has not been verified against a live server, and an unproven
-//! check-then-create would risk replacing another writer's value.
+//! `ensure` sends only the v4 Create request. The pinned v0.167.11 server
+//! enforces a partial unique index on (`key`, `folderId`) for shared secrets,
+//! so a duplicate create is rejected rather than treated as an update. A
+//! duplicate `400` is recognized by the exact server message and reported as
+//! present; any other status, including the generic `500` a concurrent create
+//! can receive when it loses that unique-index race, is an error and not
+//! absence.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -19,7 +23,9 @@ use serde_json::json;
 use crate::config::InfisicalConfig;
 use crate::error::{Error, Result};
 use crate::key::Key;
-use crate::provider::{Capabilities, HttpClient, ListedKey, Provider, endpoint};
+use crate::provider::{
+    Capabilities, EnsureStatus, HttpClient, HttpResponse, ListedKey, Provider, endpoint,
+};
 use crate::secret::Secret;
 
 /// Infisical provider.
@@ -168,6 +174,18 @@ impl InfisicalProvider {
         }
     }
 
+    fn write_body(&self, value: &str) -> String {
+        json!({
+            "projectId": &self.project_id,
+            "environment": &self.environment,
+            "secretPath": &self.path,
+            "secretValue": value,
+            "type": "shared",
+            "skipMultilineEncoding": true,
+        })
+        .to_string()
+    }
+
     fn write_identity(&self) -> Result<String> {
         let origin = crate::provider::lock::canonical_origin(&self.base)?;
         Ok(crate::provider::lock::identity(
@@ -192,10 +210,9 @@ impl Provider for InfisicalProvider {
             read: true,
             write: true,
             list: true,
-            // Disabled until the v4 Create endpoint is proven to reject a
-            // duplicate rather than upsert it. Without that proof a lost
-            // check-then-create race could replace another writer's value.
-            ensure: false,
+            // The v4 Create request is an atomic insert guarded by the
+            // server's partial unique index; it never updates an existing row.
+            ensure: true,
         }
     }
 
@@ -300,15 +317,7 @@ impl Provider for InfisicalProvider {
             .map_err(|_| Error::new("Infisical values must be UTF-8 text"))?;
         let authorization = self.authorization()?;
         let url = self.secret_url(key.path())?;
-        let body = json!({
-            "projectId": &self.project_id,
-            "environment": &self.environment,
-            "secretPath": &self.path,
-            "secretValue": value,
-            "type": "shared",
-            "skipMultilineEncoding": true,
-        })
-        .to_string();
+        let body = self.write_body(value);
         let existing = self.client.request(
             "GET",
             &url,
@@ -332,6 +341,130 @@ impl Provider for InfisicalProvider {
         )?;
         self.map_status(response.status, key.path())
     }
+
+    fn ensure(&self, raw_key: &str, value: &Secret) -> Result<EnsureStatus> {
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
+        let key = Key::parse(raw_key)?;
+        if key.field().is_some() {
+            return Err(Error::new(
+                "Infisical keys do not have fields; use the secret name directly",
+            ));
+        }
+        let value = std::str::from_utf8(value.expose())
+            .map_err(|_| Error::new("Infisical values must be UTF-8 text"))?;
+        let authorization = self.authorization()?;
+        let url = self.secret_url(key.path())?;
+        let body = self.write_body(value);
+        let response = self.client.request(
+            "POST",
+            &url,
+            Some(("Authorization", &authorization)),
+            &[],
+            "application/json",
+            Some(body.as_bytes()),
+        )?;
+        match response.status {
+            200 | 201 => {
+                let CreateResponse { secret, approval } = HttpClient::json(&response)?;
+                match (secret, approval) {
+                    (Some(secret), None)
+                        if created_secret_matches(
+                            &secret,
+                            key.path(),
+                            &self.project_id,
+                            &self.environment,
+                        ) =>
+                    {
+                        Ok(EnsureStatus::Created)
+                    }
+                    (Some(_), None) => Err(Error::new(format!(
+                        "Infisical Create response did not identify {:?}",
+                        key.path()
+                    ))),
+                    (None, Some(_)) => Err(Error::new(format!(
+                        "Infisical did not confirm creating {:?}; an approval may be required",
+                        key.path()
+                    ))),
+                    _ => Err(Error::new(format!(
+                        "Infisical returned an unexpected Create response for {:?}",
+                        key.path()
+                    ))),
+                }
+            }
+            400 if is_duplicate_create(&response, key.path(), &self.path, &self.environment) => {
+                Ok(EnsureStatus::Present)
+            }
+            status => {
+                self.map_status(status, key.path())?;
+                Err(Error::new(format!(
+                    "Infisical returned HTTP {status} for {:?}",
+                    key.path()
+                )))
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateResponse {
+    #[serde(default)]
+    secret: Option<CreatedSecret>,
+    #[serde(default)]
+    approval: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CreatedSecret {
+    id: String,
+    #[serde(rename = "_id")]
+    document_id: String,
+    workspace: String,
+    environment: String,
+    version: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "secretKey")]
+    key: String,
+    #[serde(rename = "secretValue")]
+    _value: String,
+    #[serde(rename = "secretComment")]
+    _comment: String,
+    #[serde(rename = "createdAt")]
+    _created_at: String,
+    #[serde(rename = "updatedAt")]
+    _updated_at: String,
+}
+
+fn created_secret_matches(
+    secret: &CreatedSecret,
+    key: &str,
+    project_id: &str,
+    environment: &str,
+) -> bool {
+    !secret.id.is_empty()
+        && !secret.document_id.is_empty()
+        && secret.version >= 1
+        && secret.kind == "shared"
+        && secret.key == key
+        && secret.workspace == project_id
+        && secret.environment == environment
+}
+
+fn is_duplicate_create(response: &HttpResponse, key: &str, path: &str, environment: &str) -> bool {
+    if response.status != 400 {
+        return false;
+    }
+    #[derive(Deserialize)]
+    struct ApiError {
+        #[serde(default)]
+        message: Option<String>,
+    }
+    let Ok(error) = HttpClient::json::<ApiError>(response) else {
+        return false;
+    };
+    let expected =
+        format!("Secret '{key}' already exists in path '{path}' of environment '{environment}'");
+    error.message.as_deref() == Some(expected.as_str())
 }
 
 fn normalize_path(path: &str) -> String {
@@ -346,7 +479,10 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_path;
+    use super::{
+        CreateResponse, CreatedSecret, HttpResponse, created_secret_matches, is_duplicate_create,
+        normalize_path,
+    };
 
     #[test]
     fn normalizes_folder_paths() {
@@ -354,5 +490,110 @@ mod tests {
         assert_eq!(normalize_path("/"), "/");
         assert_eq!(normalize_path("apps/"), "/apps");
         assert_eq!(normalize_path("/apps/"), "/apps");
+    }
+
+    #[test]
+    fn recognizes_only_the_exact_duplicate_create_error() {
+        let body = br#"{"message":"Secret 'DB' already exists in path '/apps' of environment 'dev'","error":"BadRequest"}"#;
+        let response = HttpResponse {
+            status: 400,
+            body: body.to_vec(),
+        };
+        assert!(is_duplicate_create(&response, "DB", "/apps", "dev"));
+        assert!(!is_duplicate_create(&response, "DB", "/other", "dev"));
+        assert!(!is_duplicate_create(&response, "DB", "/apps", "prod"));
+
+        let ambiguous = HttpResponse {
+            status: 500,
+            body: body.to_vec(),
+        };
+        assert!(!is_duplicate_create(&ambiguous, "DB", "/apps", "dev"));
+
+        let validation = HttpResponse {
+            status: 400,
+            body: br#"{"message":"Secret name is invalid","error":"BadRequest"}"#.to_vec(),
+        };
+        assert!(!is_duplicate_create(&validation, "DB", "/apps", "dev"));
+
+        let malformed = HttpResponse {
+            status: 400,
+            body: b"not json".to_vec(),
+        };
+        assert!(!is_duplicate_create(&malformed, "DB", "/apps", "dev"));
+    }
+
+    fn created_secret() -> CreatedSecret {
+        CreatedSecret {
+            id: "secret-id".to_owned(),
+            document_id: "secret-id".to_owned(),
+            workspace: "project-id".to_owned(),
+            environment: "dev".to_owned(),
+            version: 1,
+            kind: "shared".to_owned(),
+            key: "DB".to_owned(),
+            _value: "value".to_owned(),
+            _comment: String::new(),
+            _created_at: "2026-11-17T00:00:00.000Z".to_owned(),
+            _updated_at: "2026-11-17T00:00:00.000Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn create_response_must_identify_the_requested_secret() {
+        let secret = created_secret();
+        assert!(created_secret_matches(&secret, "DB", "project-id", "dev"));
+
+        let mut mismatched = created_secret();
+        mismatched.key = "OTHER".to_owned();
+        assert!(!created_secret_matches(
+            &mismatched,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+
+        let mut wrong_project = created_secret();
+        wrong_project.workspace = "other-project".to_owned();
+        assert!(!created_secret_matches(
+            &wrong_project,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+
+        let mut wrong_environment = created_secret();
+        wrong_environment.environment = "prod".to_owned();
+        assert!(!created_secret_matches(
+            &wrong_environment,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+
+        let mut wrong_kind = created_secret();
+        wrong_kind.kind = "personal".to_owned();
+        assert!(!created_secret_matches(
+            &wrong_kind,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+
+        let mut empty_id = created_secret();
+        empty_id.id.clear();
+        assert!(!created_secret_matches(
+            &empty_id,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+    }
+
+    #[test]
+    fn create_response_rejects_non_object_and_empty_secret_values() {
+        assert!(serde_json::from_str::<CreateResponse>(r#"{"secret":false}"#).is_err());
+        assert!(serde_json::from_str::<CreateResponse>(r#"{"secret":{}}"#).is_err());
+        assert!(serde_json::from_str::<CreateResponse>(r#"{"secret":"value"}"#).is_err());
+        assert!(serde_json::from_str::<CreateResponse>(r#"{"secret":null,"approval":{}}"#).is_ok());
     }
 }
