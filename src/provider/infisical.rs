@@ -365,19 +365,30 @@ impl Provider for InfisicalProvider {
         )?;
         match response.status {
             200 | 201 => {
-                #[derive(Deserialize)]
-                struct CreateResponse {
-                    #[serde(default)]
-                    secret: Option<serde_json::Value>,
-                }
-                let created: CreateResponse = HttpClient::json(&response)?;
-                if created.secret.is_some() {
-                    Ok(EnsureStatus::Created)
-                } else {
-                    Err(Error::new(format!(
+                let CreateResponse { secret, approval } = HttpClient::json(&response)?;
+                match (secret, approval) {
+                    (Some(secret), None)
+                        if created_secret_matches(
+                            &secret,
+                            key.path(),
+                            &self.project_id,
+                            &self.environment,
+                        ) =>
+                    {
+                        Ok(EnsureStatus::Created)
+                    }
+                    (Some(_), None) => Err(Error::new(format!(
+                        "Infisical Create response did not identify {:?}",
+                        key.path()
+                    ))),
+                    (None, Some(_)) => Err(Error::new(format!(
                         "Infisical did not confirm creating {:?}; an approval may be required",
                         key.path()
-                    )))
+                    ))),
+                    _ => Err(Error::new(format!(
+                        "Infisical returned an unexpected Create response for {:?}",
+                        key.path()
+                    ))),
                 }
             }
             400 if is_duplicate_create(&response, key.path(), &self.path, &self.environment) => {
@@ -392,6 +403,51 @@ impl Provider for InfisicalProvider {
             }
         }
     }
+}
+
+#[derive(Deserialize)]
+struct CreateResponse {
+    #[serde(default)]
+    secret: Option<CreatedSecret>,
+    #[serde(default)]
+    approval: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CreatedSecret {
+    id: String,
+    #[serde(rename = "_id")]
+    document_id: String,
+    workspace: String,
+    environment: String,
+    version: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "secretKey")]
+    key: String,
+    #[serde(rename = "secretValue")]
+    _value: String,
+    #[serde(rename = "secretComment")]
+    _comment: String,
+    #[serde(rename = "createdAt")]
+    _created_at: String,
+    #[serde(rename = "updatedAt")]
+    _updated_at: String,
+}
+
+fn created_secret_matches(
+    secret: &CreatedSecret,
+    key: &str,
+    project_id: &str,
+    environment: &str,
+) -> bool {
+    !secret.id.is_empty()
+        && !secret.document_id.is_empty()
+        && secret.version >= 1
+        && secret.kind == "shared"
+        && secret.key == key
+        && secret.workspace == project_id
+        && secret.environment == environment
 }
 
 fn is_duplicate_create(response: &HttpResponse, key: &str, path: &str, environment: &str) -> bool {
@@ -423,7 +479,10 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpResponse, is_duplicate_create, normalize_path};
+    use super::{
+        CreateResponse, CreatedSecret, HttpResponse, created_secret_matches, is_duplicate_create,
+        normalize_path,
+    };
 
     #[test]
     fn normalizes_folder_paths() {
@@ -461,5 +520,80 @@ mod tests {
             body: b"not json".to_vec(),
         };
         assert!(!is_duplicate_create(&malformed, "DB", "/apps", "dev"));
+    }
+
+    fn created_secret() -> CreatedSecret {
+        CreatedSecret {
+            id: "secret-id".to_owned(),
+            document_id: "secret-id".to_owned(),
+            workspace: "project-id".to_owned(),
+            environment: "dev".to_owned(),
+            version: 1,
+            kind: "shared".to_owned(),
+            key: "DB".to_owned(),
+            _value: "value".to_owned(),
+            _comment: String::new(),
+            _created_at: "2026-11-17T00:00:00.000Z".to_owned(),
+            _updated_at: "2026-11-17T00:00:00.000Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn create_response_must_identify_the_requested_secret() {
+        let secret = created_secret();
+        assert!(created_secret_matches(&secret, "DB", "project-id", "dev"));
+
+        let mut mismatched = created_secret();
+        mismatched.key = "OTHER".to_owned();
+        assert!(!created_secret_matches(
+            &mismatched,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+
+        let mut wrong_project = created_secret();
+        wrong_project.workspace = "other-project".to_owned();
+        assert!(!created_secret_matches(
+            &wrong_project,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+
+        let mut wrong_environment = created_secret();
+        wrong_environment.environment = "prod".to_owned();
+        assert!(!created_secret_matches(
+            &wrong_environment,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+
+        let mut wrong_kind = created_secret();
+        wrong_kind.kind = "personal".to_owned();
+        assert!(!created_secret_matches(
+            &wrong_kind,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+
+        let mut empty_id = created_secret();
+        empty_id.id.clear();
+        assert!(!created_secret_matches(
+            &empty_id,
+            "DB",
+            "project-id",
+            "dev"
+        ));
+    }
+
+    #[test]
+    fn create_response_rejects_non_object_and_empty_secret_values() {
+        assert!(serde_json::from_str::<CreateResponse>(r#"{"secret":false}"#).is_err());
+        assert!(serde_json::from_str::<CreateResponse>(r#"{"secret":{}}"#).is_err());
+        assert!(serde_json::from_str::<CreateResponse>(r#"{"secret":"value"}"#).is_err());
+        assert!(serde_json::from_str::<CreateResponse>(r#"{"secret":null,"approval":{}}"#).is_ok());
     }
 }

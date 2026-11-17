@@ -246,8 +246,10 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   duplicate is HTTP `400` with the documented "already exists" message and is
   reported `present`. A create that loses a concurrent insert race is an error
   (observed as HTTP `500`), never a silent update or a `present` result. A
-  `200` response carrying only an approval request is also an error, not
-  `created`. `set` is unchanged: it reads the name and then sends Update
+  `200` response must be the documented secret object and identify the
+  requested key, project, environment, and shared type; an approval-only,
+  malformed, empty, or mismatched body is a redacted error, not `created`.
+  `set` is unchanged: it reads the name and then sends Update
   (`PATCH`) or Create (`POST`) under the same-user write lock.
 - There is no remove, delete, or destroy operation.
 - There is no backup import or export. See the roadmap. No age identity,

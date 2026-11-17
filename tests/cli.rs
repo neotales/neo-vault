@@ -1391,6 +1391,25 @@ fn infisical_ensure_uses_create_and_reports_a_duplicate_as_present() {
     );
     assert!(!stdout(&approval).contains("created"));
     assert!(!stdout(&approval).contains("must-not-land"));
+
+    for key in ["MALFORMED", "EMPTY", "MISMATCH"] {
+        let rejected = run(
+            &directory,
+            &["ensure", "--json", key],
+            &environment,
+            Some(b"must-not-land\n"),
+        );
+        assert!(!rejected.status.success(), "{key} must fail");
+        assert!(!stdout(&rejected).contains("created"), "{key}");
+        assert!(!stdout(&rejected).contains("present"), "{key}");
+        assert!(!stdout(&rejected).contains("must-not-land"), "{key}");
+        assert!(!stderr(&rejected).contains("must-not-land"), "{key}");
+        assert!(
+            !stderr(&rejected).contains("OTHER"),
+            "{key} leaked a response field"
+        );
+        assert!(!stderr(&rejected).is_empty(), "{key} must report an error");
+    }
 }
 
 fn make_executable(path: &Path) {
@@ -2107,6 +2126,28 @@ impl Drop for InfisicalFixture {
     }
 }
 
+fn infisical_created_response(key: &str) -> String {
+    simple_response(
+        "200 OK",
+        &json!({
+            "secret": {
+                "id": "secret-id",
+                "_id": "secret-id",
+                "workspace": "test-project",
+                "environment": "dev",
+                "version": 1,
+                "type": "shared",
+                "secretKey": key,
+                "secretValue": "written",
+                "secretComment": "",
+                "createdAt": "2026-11-17T00:00:00.000Z",
+                "updatedAt": "2026-11-17T00:00:00.000Z",
+            }
+        })
+        .to_string(),
+    )
+}
+
 fn infisical_response(request: &Request) -> String {
     let path = request.path.split('?').next().unwrap_or_default();
     match (request.method.as_str(), path) {
@@ -2130,7 +2171,13 @@ fn infisical_response(request: &Request) -> String {
             "200 OK",
             r#"{"approval":{"id":"approval-id","slug":"approval-slug"}}"#,
         ),
-        ("POST" | "PATCH", _) => simple_response("200 OK", r#"{"secret":{"secretKey":"written"}}"#),
+        ("POST", "/api/v4/secrets/MALFORMED") => simple_response("200 OK", r#"{"secret":false}"#),
+        ("POST", "/api/v4/secrets/EMPTY") => simple_response("200 OK", r#"{"secret":{}}"#),
+        ("POST", "/api/v4/secrets/MISMATCH") => infisical_created_response("OTHER"),
+        ("POST", path) if path.starts_with("/api/v4/secrets/") => {
+            infisical_created_response(path.trim_start_matches("/api/v4/secrets/"))
+        }
+        ("PATCH", _) => simple_response("200 OK", r#"{"secret":{"secretKey":"written"}}"#),
         _ => simple_response("405 Method Not Allowed", "{}"),
     }
 }

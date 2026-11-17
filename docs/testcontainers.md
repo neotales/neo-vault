@@ -102,8 +102,9 @@ be the one read back, and the list must contain one row for that name. The
 pinned source for tag v0.167.11 (commit `37b7556`) defines the partial unique
 index `uq_secrets_v2_key_folder_id_shared` on (`key`, `folderId`) where
 `type = 'shared'`; the concurrent run confirms a losing insert is rejected
-instead of replacing the winning row. A loopback fixture also checks that a
-`200` approval request is an error rather than a reported create.
+instead of replacing the winning row. A loopback fixture also checks that
+approval, malformed, empty, and mismatched `200` Create bodies are errors
+rather than reported creates.
 
 Run it explicitly:
 
@@ -114,10 +115,10 @@ cargo test --test container_infisical -- --ignored --nocapture
 Observed in this workspace on 2026-11-17:
 
 ```text
-concurrent Create statuses: [(0, 500), (1, 500), (2, 200), (3, 500), (4, 500), (5, 500), (6, 500), (7, 500)]
+concurrent Create statuses: [(0, 200), (1, 500), (2, 500), (3, 500), (4, 500), (5, 500), (6, 500), (7, 500)]
 test infisical_reads_writes_and_lists_against_the_pinned_image ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-finished in 146.28s
+finished in 67.72s
 ```
 
 The three testcontainers-managed containers were gone after the run.
