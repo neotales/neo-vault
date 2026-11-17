@@ -132,7 +132,7 @@ history still sees exported values, so autoload is a deliberate trade.
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
 | `aws-secrets-manager` | yes | yes | yes | Secrets Manager JSON 1.1 API with local SigV4 signing | Opt-in Floci test against `floci/floci:2.5.0`; signer unit-tested against AWS's published SigV4 vectors; no AWS account |
-| `gcp-secret-manager` | yes | yes | yes | Secret Manager v1 REST API | Opt-in Floci test against `floci/floci-gcp:0.13.0`; no GCP project |
+| `gcp-secret-manager` | yes | yes | **no** | Secret Manager v1 REST API | Opt-in Floci test against `floci/floci-gcp:0.13.0`; no GCP project. Ensure is refused because create and add-version are separate, non-atomic calls. |
 | `azure-key-vault` | yes | yes | no | Key Vault secrets REST API `7.4` | Opt-in Floci test against `floci/floci-az:0.17.0`; no Azure account. Ensure is unsupported because Key Vault has no conditional create. |
 
 Key grammar:
@@ -187,7 +187,9 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   Credentials, service-account JWT exchange, impersonation, or refresh, so a
   long-running process fails when the token expires. `allow_anonymous` exists
   only for a loopback emulator and is refused for any non-loopback endpoint.
-  No GCP project was used.
+  No GCP project was used. `ensure` is refused: Secret Manager has no atomic
+  create-with-version call. A create followed by a failed add-version can leave
+  an empty secret, and a retry would then report Present.
 - Azure authentication is a static bearer token from a named environment
   variable or owner-only file. There is no Microsoft Entra ID
   client-credential flow, managed identity, challenge-based auth, or refresh.
@@ -276,6 +278,10 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
 - `search` is a name operation. It does not call a value endpoint.
 - Redirects are disabled for provider HTTP requests, so an authorization header
   is not forwarded to a second origin.
+- Provider constructors revalidate the endpoint scheme, the loopback-only HTTP
+  rule, cloud project/region/API-version fields, and the GCP anonymous
+  restriction. Calling a constructor directly does not bypass the configuration
+  checks.
 - Vault/OpenBao and GitHub `set`/`ensure` take a same-user advisory file lock
   on this machine before they contact the provider. Infisical and the cloud
   adapters rely on their provider's own create/version semantics instead. The
@@ -342,8 +348,8 @@ docker run -d --rm --name nsvault-floci-az \
   floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
 ```
 
-The opt-in test and a manual CLI run covered list, get, set, ensure (AWS and
-GCP), Azure's refused ensure, and search. Exact commands, outputs, and
+The opt-in test and a manual CLI run covered list, get, set, ensure (AWS),
+GCP's and Azure's refused ensure, and search. Exact commands, outputs, and
 limitations are in [`docs/floci.md`](docs/floci.md). No global Docker cleanup
 was performed. These tests do not make the adapters "production verified": the
 emulator does not validate AWS SigV4 signatures, and it does not prove real
@@ -410,7 +416,7 @@ Observed:
 ```text
 cargo fmt --check                         clean
 cargo clippy --all-targets -- -D warnings clean
-cargo test                                46 lib + 16 CLI + 3 FFI passed;
+cargo test                                53 lib + 16 CLI + 3 FFI passed;
                                           0 failed; 3 cloud + 1 Vault
                                           container tests ignored
 cargo build --release --lib               succeeded

@@ -57,6 +57,13 @@ impl AwsSecretsManagerProvider {
     /// Returns an error for an invalid endpoint or region, or when a named
     /// credential cannot be read.
     pub fn new(name: &str, config: &AwsSecretsManagerConfig, root: &Path) -> Result<Self> {
+        if !crate::config::valid_aws_region(&config.region) {
+            return Err(Error::new("AWS region is invalid"));
+        }
+        if let Some(endpoint) = &config.endpoint {
+            crate::config::validate_http_base(endpoint, config.allow_http_loopback)
+                .map_err(|error| Error::new(format!("AWS endpoint: {}", error.message())))?;
+        }
         let base = match &config.endpoint {
             Some(endpoint) => url::Url::parse(endpoint)
                 .map_err(|_| Error::new("AWS endpoint is not a valid URL"))?,
@@ -159,31 +166,6 @@ impl AwsSecretsManagerProvider {
         )
     }
 
-    fn status_error(&self, response: &HttpResponse, key: &str) -> Error {
-        match response.status {
-            400 => match aws_error_type(response).as_deref() {
-                Some("ResourceNotFoundException") => {
-                    Error::new(format!("AWS Secrets Manager has no secret {key:?}"))
-                }
-                Some("ResourceExistsException") => {
-                    Error::new(format!("AWS Secrets Manager already has a secret {key:?}"))
-                }
-                Some("AccessDeniedException") => {
-                    Error::new(format!("AWS Secrets Manager denied access to {key:?}"))
-                }
-                Some(kind) => {
-                    Error::new(format!("AWS Secrets Manager returned {kind} for {key:?}"))
-                }
-                None => Error::new(format!("AWS Secrets Manager returned HTTP 400 for {key:?}")),
-            },
-            401 | 403 => Error::new(format!("AWS Secrets Manager denied access to {key:?}")),
-            404 => Error::new(format!("AWS Secrets Manager has no secret {key:?}")),
-            status => Error::new(format!(
-                "AWS Secrets Manager returned HTTP {status} for {key:?}"
-            )),
-        }
-    }
-
     fn list_page(&self, next_token: Option<&str>) -> Result<(Vec<String>, Option<String>)> {
         let mut body = json!({ "MaxResults": 100 });
         if let Some(token) = next_token {
@@ -191,7 +173,7 @@ impl AwsSecretsManagerProvider {
         }
         let response = self.request("ListSecrets", &body)?;
         if response.status != 200 {
-            return Err(self.status_error(&response, "secret list"));
+            return Err(aws_status_error(&response, "secret list"));
         }
         #[derive(Deserialize)]
         struct Envelope {
@@ -286,7 +268,7 @@ impl Provider for AwsSecretsManagerProvider {
         }
         let response = self.request("GetSecretValue", &json!({ "SecretId": key.path() }))?;
         if response.status != 200 {
-            return Err(self.status_error(&response, key.path()));
+            return Err(aws_status_error(&response, key.path()));
         }
         #[derive(Deserialize)]
         struct Envelope {
@@ -341,11 +323,11 @@ impl Provider for AwsSecretsManagerProvider {
                 if retried.status == 200 {
                     return Ok(());
                 }
-                return Err(self.status_error(&retried, key.path()));
+                return Err(aws_status_error(&retried, key.path()));
             }
-            return Err(self.status_error(&created, key.path()));
+            return Err(aws_status_error(&created, key.path()));
         }
-        Err(self.status_error(&response, key.path()))
+        Err(aws_status_error(&response, key.path()))
     }
 
     fn ensure(&self, raw_key: &str, value: &Secret) -> Result<EnsureStatus> {
@@ -366,8 +348,31 @@ impl Provider for AwsSecretsManagerProvider {
             400 if aws_error_type(&response).as_deref() == Some("ResourceExistsException") => {
                 Ok(EnsureStatus::Present)
             }
-            _ => Err(self.status_error(&response, key.path())),
+            _ => Err(aws_status_error(&response, key.path())),
         }
+    }
+}
+
+/// Maps a response status to a fixed message without echoing response fields.
+fn aws_status_error(response: &HttpResponse, key: &str) -> Error {
+    match response.status {
+        400 => match aws_error_type(response).as_deref() {
+            Some("ResourceNotFoundException") => {
+                Error::new(format!("AWS Secrets Manager has no secret {key:?}"))
+            }
+            Some("ResourceExistsException") => {
+                Error::new(format!("AWS Secrets Manager already has a secret {key:?}"))
+            }
+            Some("AccessDeniedException") => {
+                Error::new(format!("AWS Secrets Manager denied access to {key:?}"))
+            }
+            _ => Error::new(format!("AWS Secrets Manager returned HTTP 400 for {key:?}")),
+        },
+        401 | 403 => Error::new(format!("AWS Secrets Manager denied access to {key:?}")),
+        404 => Error::new(format!("AWS Secrets Manager has no secret {key:?}")),
+        status => Error::new(format!(
+            "AWS Secrets Manager returned HTTP {status} for {key:?}"
+        )),
     }
 }
 
@@ -606,8 +611,15 @@ fn push_encoded(byte: u8, output: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SigningRequest, amz_date, authorization, valid_secret_name};
+    use std::path::Path;
     use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{
+        AwsSecretsManagerProvider, SigningRequest, amz_date, authorization, aws_status_error,
+        valid_secret_name,
+    };
+    use crate::config::AwsSecretsManagerConfig;
+    use crate::provider::HttpResponse;
 
     #[test]
     fn formats_the_sigv4_date_in_utc() {
@@ -689,6 +701,48 @@ mod tests {
         );
         let url = url::Url::parse("http://[::1]:4566/").expect("url");
         assert_eq!(super::host_header(&url).expect("host"), "[::1]:4566");
+    }
+
+    #[test]
+    fn constructor_revalidates_endpoint_security() {
+        let config = AwsSecretsManagerConfig {
+            region: "us-east-1".to_owned(),
+            endpoint: Some("http://secrets.example".to_owned()),
+            access_key_env: None,
+            access_key_file: None,
+            secret_key_env: None,
+            secret_key_file: None,
+            session_token_env: None,
+            session_token_file: None,
+            allow_http_loopback: false,
+        };
+        let error = AwsSecretsManagerProvider::new("aws", &config, Path::new("."))
+            .expect_err("plaintext endpoint must be refused");
+        assert!(error.message().contains("endpoint"));
+
+        let config = AwsSecretsManagerConfig {
+            region: "us/east/1".to_owned(),
+            endpoint: None,
+            access_key_env: None,
+            access_key_file: None,
+            secret_key_env: None,
+            secret_key_file: None,
+            session_token_env: None,
+            session_token_file: None,
+            allow_http_loopback: false,
+        };
+        assert!(AwsSecretsManagerProvider::new("aws", &config, Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn error_messages_do_not_echo_response_fields() {
+        let response = HttpResponse {
+            status: 400,
+            body: br#"{"__type":"InjectedException","message":"INJECTED_MESSAGE"}"#.to_vec(),
+        };
+        let error = aws_status_error(&response, "app-db");
+        assert!(!error.message().contains("INJECTED"));
+        assert!(error.message().contains("HTTP 400"));
     }
 
     #[test]

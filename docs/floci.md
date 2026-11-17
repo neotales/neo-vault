@@ -101,7 +101,9 @@ What the test covers:
   metadata-only `list`, and `ensure` create then present without overwrite.
 - GCP: `set` on a missing name (AddVersion 404, CreateSecret, AddVersion),
   `get` of the latest version, a second `set` that adds a version, metadata-only
-  `list`, and `ensure` create then present without overwrite.
+  `list`, and refusal of `ensure` without creating a secret. Listing accepts
+  both `projects/{project-id}/secrets/{id}` and
+  `projects/{project-number}/secrets/{id}` resource names.
 - Azure: `set`, `get` of the latest version, a second `set` that creates a new
   version, metadata-only `list`, `nextLink` pagination across 27 secrets, and
   refusal of `ensure`.
@@ -126,8 +128,8 @@ AWS:   set ok; get byte-identical; ls and search returned cli-fixture-aws;
        ensure -> {"status":"created"} then {"status":"present"};
        second ensure left first-value unchanged.
 GCP:   set ok; get byte-identical; ls and search returned cli-fixture-gcp;
-       ensure -> {"status":"created"} then {"status":"present"};
-       second ensure left first-value unchanged.
+       ensure exited 1 with "gcp does not support ensure in this build";
+       the value was not written and was not echoed.
 Azure: set ok; get byte-identical; ls and search returned cli-fixture-az;
        ensure exited 1 with "azure does not support ensure in this build";
        the value was not written and was not echoed.
@@ -137,6 +139,7 @@ Azure: set ok; get byte-identical; ls and search returned cli-fixture-az;
 
 ```text
 aws	aws-secrets-manager	read=true	write=true	ensure=true
+gcp	gcp-secret-manager	read=true	write=true	ensure=false
 ```
 
 No secret value appeared in an `nsvault` command argument or in error output.
@@ -151,12 +154,12 @@ printed to the session log.
   the unit vectors validate the signature.
 - GCP: static OAuth 2.0 access token, no ADC, service-account JWT exchange, or
   refresh. Anonymous access is an explicit loopback-emulator switch and is
-  refused for non-loopback endpoints.
+  refused for non-loopback endpoints. `ensure` is refused because create and
+  add-version are separate, non-atomic calls.
 - Azure: static bearer token, no Entra ID client-credential flow, managed
   identity, or refresh. `ensure` is refused because Key Vault has no
   conditional create and a read-then-PUT would race. Only the latest version is
   read.
 - None of the three adapters supports fields (`#field`), delete, rotation,
   binary values other than AWS `SecretBinary` reads, or multiple versions by
-  id. GCP `ensure` is create-then-add-version; if the create succeeds and the
-  version add fails, the call reports an error rather than claiming success.
+  id. GCP `ensure` is not implemented; use `set` to write a version.

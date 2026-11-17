@@ -195,24 +195,21 @@ allow_http_loopback = true
         second.expose()
     );
 
-    let ensured = client
-        .ensure(Some("gcp"), "nsvault-ensure-gcp", &first)
-        .expect("GCP ensure create");
-    assert_eq!(ensured, EnsureStatus::Created);
-    let present = client
-        .ensure(
-            Some("gcp"),
-            "nsvault-ensure-gcp",
-            &Secret::new(b"must-not-win".to_vec()),
-        )
-        .expect("GCP ensure present");
-    assert_eq!(present, EnsureStatus::Present);
-    assert_eq!(
+    let ensure = client.ensure(
+        Some("gcp"),
+        "nsvault-ensure-gcp",
+        &Secret::new(b"must-not-land".to_vec()),
+    );
+    assert!(
+        ensure.is_err(),
+        "GCP must not claim a race-safe create-if-absent path"
+    );
+    assert!(
         client
-            .get(Some("gcp"), "nsvault-ensure-gcp")
-            .expect("GCP ensured get")
-            .expose(),
-        first.expose()
+            .list(Some("gcp"), "nsvault-ensure-gcp")
+            .expect("GCP list after refused ensure")
+            .is_empty(),
+        "refused GCP ensure must not create a secret"
     );
 
     let listed = client

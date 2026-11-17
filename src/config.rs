@@ -608,7 +608,7 @@ fn validate_provider(name: &str, provider: &ProviderConfig) -> Result<()> {
     Ok(())
 }
 
-fn valid_aws_region(value: &str) -> bool {
+pub(crate) fn valid_aws_region(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -616,7 +616,7 @@ fn valid_aws_region(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn valid_gcp_project(value: &str) -> bool {
+pub(crate) fn valid_gcp_project(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -624,7 +624,7 @@ fn valid_gcp_project(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn valid_api_version(value: &str) -> bool {
+pub(crate) fn valid_api_version(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 20
         && value
@@ -672,7 +672,7 @@ fn validate_namespace(value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn validate_http_base(value: &str, allow_loopback: bool) -> Result<()> {
+pub(crate) fn validate_http_base(value: &str, allow_loopback: bool) -> Result<()> {
     let url = url::Url::parse(value).map_err(|_| Error::new("invalid URL"))?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(Error::new("URL must not contain credentials"));

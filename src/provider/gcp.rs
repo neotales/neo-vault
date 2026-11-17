@@ -15,9 +15,7 @@ use serde_json::json;
 use crate::config::GcpSecretManagerConfig;
 use crate::error::{Error, Result};
 use crate::key::Key;
-use crate::provider::{
-    Capabilities, EnsureStatus, HttpClient, HttpResponse, ListedKey, Provider, endpoint,
-};
+use crate::provider::{Capabilities, HttpClient, HttpResponse, ListedKey, Provider, endpoint};
 use crate::secret::Secret;
 
 /// Maximum pages followed for one listing.
@@ -44,8 +42,18 @@ impl GcpSecretManagerProvider {
     /// Returns an error for an invalid endpoint or project, or when a token is
     /// required but not configured.
     pub fn new(name: &str, config: &GcpSecretManagerConfig, root: &Path) -> Result<Self> {
+        crate::config::validate_http_base(&config.endpoint, config.allow_http_loopback)
+            .map_err(|error| Error::new(format!("GCP endpoint: {}", error.message())))?;
+        if !crate::config::valid_gcp_project(&config.project) {
+            return Err(Error::new("GCP project is invalid"));
+        }
         let base = url::Url::parse(&config.endpoint)
             .map_err(|_| Error::new("GCP endpoint is not a valid URL"))?;
+        if config.allow_anonymous && !crate::config::is_loopback_url(&base) {
+            return Err(Error::new(
+                "GCP allow_anonymous is accepted only for a loopback endpoint",
+            ));
+        }
         let token = match (&config.token_env, &config.token_file) {
             (Some(variable), _) if std::env::var_os(variable).is_some() => {
                 Some(crate::provider::credential_from_env(variable)?)
@@ -81,21 +89,6 @@ impl GcpSecretManagerProvider {
             None => self
                 .client
                 .request(method, url, None, &[], "application/json", body),
-        }
-    }
-
-    fn status_error(&self, response: &HttpResponse, key: &str) -> Error {
-        match response.status {
-            400 => match gcp_error_status(response).as_deref() {
-                Some(kind) => Error::new(format!("GCP Secret Manager returned {kind} for {key:?}")),
-                None => Error::new(format!("GCP Secret Manager returned HTTP 400 for {key:?}")),
-            },
-            401 | 403 => Error::new(format!("GCP Secret Manager denied access to {key:?}")),
-            404 => Error::new(format!("GCP Secret Manager has no secret {key:?}")),
-            409 => Error::new(format!("GCP Secret Manager already has a secret {key:?}")),
-            status => Error::new(format!(
-                "GCP Secret Manager returned HTTP {status} for {key:?}"
-            )),
         }
     }
 
@@ -150,7 +143,11 @@ impl Provider for GcpSecretManagerProvider {
             read: true,
             write: true,
             list: true,
-            ensure: true,
+            // Secret Manager has no create-with-version call. A create that
+            // succeeds followed by a failed add-version would leave an empty
+            // secret; a retry would then report Present. Do not advertise a
+            // create-if-absent path that is not atomic.
+            ensure: false,
         }
     }
 
@@ -165,7 +162,7 @@ impl Provider for GcpSecretManagerProvider {
             }
             let response = self.request("GET", &url, None)?;
             if response.status != 200 {
-                return Err(self.status_error(&response, "secret list"));
+                return Err(gcp_status_error(&response, "secret list"));
             }
             #[derive(Deserialize)]
             struct Envelope {
@@ -179,11 +176,13 @@ impl Provider for GcpSecretManagerProvider {
                 name: String,
             }
             let envelope: Envelope = HttpClient::json(&response)?;
-            let resource_prefix = format!("projects/{}/secrets/", self.project);
             for entry in envelope.secrets {
-                let Some(name) = entry.name.strip_prefix(&resource_prefix) else {
+                let Some(name) = secret_name_from_resource(&entry.name, &self.project) else {
                     continue;
                 };
+                if !valid_secret_name(name) {
+                    continue;
+                }
                 if prefix.is_empty() || name.starts_with(prefix) {
                     keys.push(ListedKey::new(name.to_owned()));
                     if keys.len() >= MAX_LISTED {
@@ -215,7 +214,7 @@ impl Provider for GcpSecretManagerProvider {
         }
         let response = self.request("GET", &self.access_url(key.path())?, None)?;
         if response.status != 200 {
-            return Err(self.status_error(&response, key.path()));
+            return Err(gcp_status_error(&response, key.path()));
         }
         #[derive(Deserialize)]
         struct Envelope {
@@ -255,56 +254,47 @@ impl Provider for GcpSecretManagerProvider {
         if response.status == 404 {
             let created = self.create_secret(key.path())?;
             if !matches!(created.status, 200 | 201 | 409) {
-                return Err(self.status_error(&created, key.path()));
+                return Err(gcp_status_error(&created, key.path()));
             }
             let retried = self.add_version(key.path(), value.expose())?;
             if matches!(retried.status, 200 | 201) {
                 return Ok(());
             }
-            return Err(self.status_error(&retried, key.path()));
+            return Err(gcp_status_error(&retried, key.path()));
         }
-        Err(self.status_error(&response, key.path()))
-    }
-
-    fn ensure(&self, raw_key: &str, value: &Secret) -> Result<EnsureStatus> {
-        let key = Key::parse(raw_key)?;
-        if key.field().is_some() {
-            return Err(Error::new("GCP Secret Manager keys do not have fields"));
-        }
-        if !valid_secret_name(key.path()) {
-            return Err(Error::new(
-                "GCP secret names must contain only letters, digits, '-' and '_'",
-            ));
-        }
-        let response = self.create_secret(key.path())?;
-        if matches!(response.status, 200 | 201) {
-            // Secret Manager has no create-with-payload call. If adding the
-            // first version fails, report the failure rather than claiming the
-            // secret is usable.
-            let version = self.add_version(key.path(), value.expose())?;
-            if matches!(version.status, 200 | 201) {
-                return Ok(EnsureStatus::Created);
-            }
-            return Err(self.status_error(&version, key.path()));
-        }
-        if response.status == 409 {
-            return Ok(EnsureStatus::Present);
-        }
-        Err(self.status_error(&response, key.path()))
+        Err(gcp_status_error(&response, key.path()))
     }
 }
 
-fn gcp_error_status(response: &HttpResponse) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Envelope {
-        error: Option<ErrorBody>,
+/// Maps a response status to a fixed message without echoing response fields.
+fn gcp_status_error(response: &HttpResponse, key: &str) -> Error {
+    match response.status {
+        400 => Error::new(format!(
+            "GCP Secret Manager rejected the request for {key:?}"
+        )),
+        401 | 403 => Error::new(format!("GCP Secret Manager denied access to {key:?}")),
+        404 => Error::new(format!("GCP Secret Manager has no secret {key:?}")),
+        409 => Error::new(format!("GCP Secret Manager already has a secret {key:?}")),
+        status => Error::new(format!(
+            "GCP Secret Manager returned HTTP {status} for {key:?}"
+        )),
     }
-    #[derive(Deserialize)]
-    struct ErrorBody {
-        status: Option<String>,
+}
+
+/// Extracts the secret id from `projects/{project}/secrets/{secret}`.
+///
+/// The API may return the project number instead of the configured project id,
+/// so a numeric project is accepted alongside the configured identifier.
+fn secret_name_from_resource<'a>(resource: &'a str, project: &str) -> Option<&'a str> {
+    let rest = resource.strip_prefix("projects/")?;
+    let (resource_project, secret) = rest.split_once("/secrets/")?;
+    if resource_project.is_empty() || secret.is_empty() || secret.contains('/') {
+        return None;
     }
-    let envelope: Envelope = serde_json::from_slice(&response.body).ok()?;
-    envelope.error?.status
+    if resource_project != project && !resource_project.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(secret)
 }
 
 fn valid_secret_name(name: &str) -> bool {
@@ -317,7 +307,25 @@ fn valid_secret_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_secret_name;
+    use std::path::Path;
+
+    use super::{
+        GcpSecretManagerProvider, gcp_status_error, secret_name_from_resource, valid_secret_name,
+    };
+    use crate::config::GcpSecretManagerConfig;
+    use crate::provider::{HttpResponse, Provider};
+    use crate::secret::Secret;
+
+    fn loopback_config() -> GcpSecretManagerConfig {
+        GcpSecretManagerConfig {
+            project: "floci-local".to_owned(),
+            endpoint: "http://127.0.0.1:4588".to_owned(),
+            token_env: None,
+            token_file: None,
+            allow_anonymous: true,
+            allow_http_loopback: true,
+        }
+    }
 
     #[test]
     fn accepts_documented_secret_names() {
@@ -325,5 +333,69 @@ mod tests {
         assert!(valid_secret_name("apps_prod_db"));
         assert!(!valid_secret_name("apps/prod/db"));
         assert!(!valid_secret_name(""));
+    }
+
+    #[test]
+    fn constructor_revalidates_endpoint_security() {
+        let mut config = loopback_config();
+        config.endpoint = "http://secretmanager.example".to_owned();
+        config.allow_anonymous = false;
+        assert!(GcpSecretManagerProvider::new("gcp", &config, Path::new(".")).is_err());
+
+        let mut config = loopback_config();
+        config.endpoint = "https://secretmanager.googleapis.com".to_owned();
+        config.allow_http_loopback = false;
+        assert!(GcpSecretManagerProvider::new("gcp", &config, Path::new(".")).is_err());
+
+        let mut config = loopback_config();
+        config.project = "bad/project".to_owned();
+        assert!(GcpSecretManagerProvider::new("gcp", &config, Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn ensure_is_not_advertised_or_attempted() {
+        let provider = GcpSecretManagerProvider::new("gcp", &loopback_config(), Path::new("."))
+            .expect("loopback provider");
+        assert!(!provider.capabilities().ensure);
+        let error = provider
+            .ensure("app-db", &Secret::new(b"not-a-real-secret".to_vec()))
+            .expect_err("ensure must be refused");
+        assert!(error.message().contains("does not support ensure"));
+    }
+
+    #[test]
+    fn accepts_project_numbers_in_resource_names() {
+        assert_eq!(
+            secret_name_from_resource("projects/floci-local/secrets/app-db", "floci-local"),
+            Some("app-db")
+        );
+        assert_eq!(
+            secret_name_from_resource("projects/123456789012/secrets/app-db", "floci-local"),
+            Some("app-db")
+        );
+        assert_eq!(
+            secret_name_from_resource("projects/other/secrets/app-db", "floci-local"),
+            None
+        );
+        assert_eq!(
+            secret_name_from_resource("projects/123/secrets/app-db/versions/1", "floci-local"),
+            None
+        );
+        assert_eq!(
+            secret_name_from_resource("projects//secrets/app-db", "floci-local"),
+            None
+        );
+    }
+
+    #[test]
+    fn error_messages_do_not_echo_response_fields() {
+        let response = HttpResponse {
+            status: 400,
+            body: br#"{"error":{"status":"INJECTED_STATUS","message":"INJECTED_MESSAGE"}}"#
+                .to_vec(),
+        };
+        let error = gcp_status_error(&response, "app-db");
+        assert!(!error.message().contains("INJECTED"));
+        assert!(error.message().contains("HTTP 400") || error.message().contains("rejected"));
     }
 }

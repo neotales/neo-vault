@@ -46,6 +46,12 @@ impl AzureKeyVaultProvider {
     /// Returns an error for an invalid vault URL or when the bearer token is
     /// not configured.
     pub fn new(name: &str, config: &AzureKeyVaultConfig, root: &Path) -> Result<Self> {
+        crate::config::validate_http_base(&config.vault_url, config.allow_http_loopback).map_err(
+            |error| Error::new(format!("Azure Key Vault endpoint: {}", error.message())),
+        )?;
+        if !crate::config::valid_api_version(&config.api_version) {
+            return Err(Error::new("Azure Key Vault api_version is invalid"));
+        }
         let base = url::Url::parse(&config.vault_url)
             .map_err(|_| Error::new("Azure Key Vault URL is not valid"))?;
         let token = load_credential(
@@ -258,7 +264,32 @@ fn valid_secret_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{item_name, valid_secret_name};
+    use std::path::Path;
+
+    use super::{AzureKeyVaultProvider, item_name, valid_secret_name};
+    use crate::config::AzureKeyVaultConfig;
+
+    fn config(vault_url: &str) -> AzureKeyVaultConfig {
+        AzureKeyVaultConfig {
+            vault_url: vault_url.to_owned(),
+            api_version: "7.4".to_owned(),
+            token_env: None,
+            token_file: None,
+            allow_http_loopback: false,
+        }
+    }
+
+    #[test]
+    fn constructor_revalidates_endpoint_security() {
+        assert!(
+            AzureKeyVaultProvider::new("az", &config("http://vault.example"), Path::new("."))
+                .is_err()
+        );
+
+        let mut invalid_version = config("https://vault.example");
+        invalid_version.api_version = "7.4&x=y".to_owned();
+        assert!(AzureKeyVaultProvider::new("az", &invalid_version, Path::new(".")).is_err());
+    }
 
     #[test]
     fn extracts_a_name_from_a_vault_id() {

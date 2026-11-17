@@ -22,5 +22,6 @@ These are product limits, not temporary bugs.
 - AWS Secrets Manager, GCP Secret Manager, and Azure Key Vault were tested only against pinned local Floci emulators. The emulator does not validate AWS SigV4 signatures and does not prove production authentication, IAM, quotas, or regional behavior.
 - Cloud credentials are static for the process lifetime. There is no AWS STS/IMDS chain, GCP ADC or service-account JWT exchange, Azure Entra ID or managed-identity flow, or token refresh.
 - Azure Key Vault `ensure` is refused because there is no conditional create. Only the latest version is read.
+- GCP Secret Manager `ensure` is refused because create and add-version are separate calls. A partial create could leave an empty secret, and a retry would report Present.
 - GCP `allow_anonymous` is a loopback-emulator switch and is refused for any non-loopback endpoint.
 - Windows and macOS were not exercised.
