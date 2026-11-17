@@ -47,6 +47,14 @@ documented. Do not run these steps as part of the current gates.
    the README verification matrix. Until then the cloud provider remains
    **fixture-only or unimplemented**, never "verified."
 
+## Check on 2026-11-17
+
+`command -v floci` found no executable in this workspace. No emulator was
+started. No container was created for this check, and no Docker cleanup was
+run. AWS, GCP, and Azure adapters are still unimplemented, so they were not
+tested against Floci. Installing Floci was not attempted: there is no adapter
+to point at an emulator, and an install without a test would not change that.
+
 ## Why it is deferred
 
 Adding one cloud adapter requires an authentication design that does not put
