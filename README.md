@@ -94,14 +94,16 @@ nsvault dir                         # nearest configuration directory
 
 `get` prints the exact value with no trailing newline unless `--newline` is
 given. `set` refuses to take a value as an argument and refuses an empty value.
-`ensure` uses the same stdin or hidden-prompt input. It creates the key only
-when the provider confirms the key is absent, and it leaves an existing key
-unchanged. It never deletes. Success writes no secret to stdout. `--json`
-prints `{"status":"created"}` or `{"status":"present"}` and nothing else.
-Auth, network, and other ambiguous errors are failures, not absence. A
-provider without a race-safe create path — Infisical, GitHub, and every
-read-only kind in this build — exits with an unsupported error and contacts no
-provider. There is no `remove` command.
+`ensure` uses the same stdin or hidden-prompt input. It writes only through a
+provider path that cannot replace an existing key: a successful atomic create
+confirms absence, and a provider-confirmed duplicate is reported present. It
+never deletes. Success writes no secret to stdout. `--json` prints
+`{"status":"created"}` or `{"status":"present"}` and nothing else. Auth,
+network, and other ambiguous errors are failures, not absence. A provider
+whose adapter has no race-safe create path — GitHub, GCP Secret Manager,
+Azure Key Vault, Vaultwarden, and every read-only kind in this build — exits
+with an unsupported error and contacts no provider. There is no `remove`
+command.
 `search` and `ls` are name operations. Vault, Infisical, KeePass, Proton, and
 GitHub listings are metadata-only. The Vaultwarden CLI has no metadata-only list
 command, so its adapter fetches full items and keeps only names; see the
@@ -129,7 +131,7 @@ history still sees exported values, so autoload is a deliberate trade.
 | `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
 | `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
 | `keepass` | yes | no | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
-| `infisical` | yes | yes | no | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` is disabled because the Create endpoint's duplicate behavior is unproven. | Fixture-tested for list/get/set and for the `ensure` refusal, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis; no production server |
+| `infisical` | yes | yes | yes | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` sends only Create (`POST`); the pinned server's partial unique index rejects a duplicate with `400`, which the adapter reports present. A create that loses a concurrent insert race is an error. | Fixture-tested for list/get/set/ensure, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis, including concurrent duplicate creates; no production server |
 | `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
@@ -237,12 +239,18 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   not retried with an unconditional write. A subkeys response without the
   documented `data.subkeys` map is an error, not field absence, and no patch is
   sent.
-- Infisical `ensure` is disabled. The adapter returns "does not support
-  ensure" and sends no request. The v4 Create (`POST`) has not been proven to
-  reject a duplicate rather than upsert it against a live server; until that is
-  recorded here, a check-then-create race could replace another writer's value.
-  `set` is unaffected: it reads the name and then sends Update (`PATCH`) or
-  Create (`POST`) under the same-user write lock.
+- Infisical `ensure` sends only the v4 Create (`POST`); it does not check for
+  absence first. In v0.167.11 the server enforces the partial unique index
+  `uq_secrets_v2_key_folder_id_shared` on (`key`, `folderId`) for shared
+  secrets, so a duplicate insert cannot replace the existing row. A sequential
+  duplicate is HTTP `400` with the documented "already exists" message and is
+  reported `present`. A create that loses a concurrent insert race is an error
+  (observed as HTTP `500`), never a silent update or a `present` result. A
+  `200` response must be the documented secret object and identify the
+  requested key, project, environment, and shared type; an approval-only,
+  malformed, empty, or mismatched body is a redacted error, not `created`.
+  `set` is unchanged: it reads the name and then sends Update
+  (`PATCH`) or Create (`POST`) under the same-user write lock.
 - There is no remove, delete, or destroy operation.
 - There is no backup import or export. See the roadmap. No age identity,
   recipient, or encrypted backup file is read or written.
@@ -419,7 +427,9 @@ NSVAULT_TEST_BW=/path/to/pinned/bw \
 
 The Infisical test runs `infisical/infisical:v0.167.11` with
 `postgres:17-alpine` and `redis:7.4-alpine`, bootstraps the instance, creates a
-project, and covers `list`, `get`, and `set`. The Vaultwarden test runs
+project, and covers `list`, `get`, `set`, and `ensure`. Eight concurrent Create
+requests prove that exactly one succeeds, every loser fails, and the winner's
+value is the one that remains. The Vaultwarden test runs
 `vaultwarden/server:1.37.5` with a pinned `@bitwarden/cli` 2025.6.1, creates a
 throwaway account inside the container, and covers `list`, `get`, and `set`
 including sibling fields. Exact evidence and prerequisites are in

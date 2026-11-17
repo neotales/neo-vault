@@ -90,10 +90,21 @@ the `default` template (which creates the `dev` environment) and configures the
 adapter with the bootstrap machine token in an owner-only file. The token and
 every value live only in this throwaway instance and a temporary directory.
 
-The run covers `set` (create), `get`, `set` (replace), and the metadata-only
-list. `ensure` stays disabled in this build and this test neither enables nor
-exercises it: proving the Create (`POST`) duplicate behavior is a separate
-decision, and the adapter must not rely on an unproven check-then-create.
+The run covers `set` (create), `get`, `set` (replace), the metadata-only list,
+and `ensure`. It proves `ensure` with the adapter: a first call creates, a
+second call with a different value reports present and leaves the first value
+unchanged.
+
+It also probes the server's Create (`POST`) contract directly. Eight requests
+with distinct values are released through one barrier. Exactly one must return
+`200`; every other request must return an error status, the winner's value must
+be the one read back, and the list must contain one row for that name. The
+pinned source for tag v0.167.11 (commit `37b7556`) defines the partial unique
+index `uq_secrets_v2_key_folder_id_shared` on (`key`, `folderId`) where
+`type = 'shared'`; the concurrent run confirms a losing insert is rejected
+instead of replacing the winning row. A loopback fixture also checks that
+approval, malformed, empty, and mismatched `200` Create bodies are errors
+rather than reported creates.
 
 Run it explicitly:
 
@@ -104,9 +115,10 @@ cargo test --test container_infisical -- --ignored --nocapture
 Observed in this workspace on 2026-11-17:
 
 ```text
+concurrent Create statuses: [(0, 200), (1, 500), (2, 500), (3, 500), (4, 500), (5, 500), (6, 500), (7, 500)]
 test infisical_reads_writes_and_lists_against_the_pinned_image ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-finished in 44.39s
+finished in 67.72s
 ```
 
 The three testcontainers-managed containers were gone after the run.
@@ -192,8 +204,11 @@ and does not reuse the CLI state of the developer running it.
 ## What is not claimed
 
 No production Vault, Infisical, or Vaultwarden server was contacted. The
-Infisical `ensure` remains disabled; the Vaultwarden adapter has no `ensure`,
-and its write path has not been exercised against a current CLI over HTTPS.
+Infisical `ensure` atomicity is a property of the pinned v0.167.11 server: it
+depends on the partial unique index named above, and a create that loses a
+concurrent insert race is returned as an error rather than `present`. The
+Vaultwarden adapter has no `ensure`, and its write path has not been exercised
+against a current CLI over HTTPS.
 The Vaultwarden test proves the server's stale-revision rejection, not
 coordination of external clients; the README states the residual race.
 Floci does not validate AWS SigV4 signatures, and passing the cloud tests is

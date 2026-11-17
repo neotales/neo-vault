@@ -1,9 +1,9 @@
 //! Same-user advisory lock for nsvault writes on this machine.
 //!
 //! `set` and `ensure` hold this lock for the whole call, including the
-//! existence check. The kernel releases an exclusive `flock` when the process
-//! exits, including a crash or `SIGKILL`. The lock file is left in place; it
-//! does not have to be deleted to recover.
+//! provider read or create. The kernel releases an exclusive `flock` when the
+//! process exits, including a crash or `SIGKILL`. The lock file is left in
+//! place; it does not have to be deleted to recover.
 //!
 //! # Scope
 //!

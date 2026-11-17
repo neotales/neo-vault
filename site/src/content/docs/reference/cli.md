@@ -41,7 +41,7 @@ Reads the value from stdin, or from a hidden prompt when stdin is a terminal. `-
 nsvault ensure KEY [--field FIELD] [--stdin] [--json]
 ```
 
-Creates the key only when the provider confirms it is absent. An existing key is left unchanged. There is no delete. `--json` prints `{"status":"created"}` or `{"status":"present"}` and no value. Default stdout is empty. Stderr says `created` or `present` plus the key. Auth, network, and other ambiguous errors are failures, not absence. Providers without a race-safe create-if-absent path exit non-zero. See [Providers](/reference/providers/).
+Creates the key only through a provider path that cannot replace an existing key. A successful atomic create confirms absence; a provider-confirmed duplicate is reported present. An existing key is left unchanged. There is no delete. `--json` prints `{"status":"created"}` or `{"status":"present"}` and no value. Default stdout is empty. Stderr says `created` or `present` plus the key. Auth, network, and other ambiguous errors are failures, not absence. Providers without a race-safe create-if-absent path exit non-zero. See [Providers](/reference/providers/).
 
 ## `search`
 

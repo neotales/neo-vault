@@ -3,7 +3,7 @@ title: Write lock
 description: What the same-user lock covers, and what it does not.
 ---
 
-`set` and `ensure` take an exclusive `flock` before they contact the provider. The lock is held for the whole call, including an existence check. Library and C ABI writes use the same path as the CLI, so one OS user's nsvault writers serialize across threads, processes, and entry points.
+`set` and `ensure` take an exclusive `flock` before they contact the provider. The lock is held for the whole call, including the provider read or create. Library and C ABI writes use the same path as the CLI, so one OS user's nsvault writers serialize across threads, processes, and entry points.
 
 The identity is a hash of a canonical address plus non-secret scope. Profile names and config paths are not included, so two files that point at the same Vault mount share a lock. Vaultwarden has no server address in its configuration, so every Vaultwarden profile on the machine shares one conservative identity; a per-wrapper identity would let two profiles for the same vault lose an item field. `https://Host:443/team/` and `https://host/team` match. `localhost` and `127.0.0.1` do not. Vault and OpenBao share the `kv2` identity when the address, mount, and namespace match.
 

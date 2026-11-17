@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use nsvault::{Client, Secret};
+use nsvault::{Client, EnsureStatus, Secret};
 use serde_json::{Value, json};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -136,10 +136,10 @@ fn infisical_reads_writes_and_lists_against_the_pinned_image() {
         .get_host_port_ipv4(8080.tcp())
         .expect("Infisical host port");
     let base = format!("http://127.0.0.1:{port}");
-    let agent = agent();
+    let http = agent();
 
     let started = std::time::Instant::now();
-    while status(&agent, &format!("{base}/api/status")) != Some(200) {
+    while status(&http, &format!("{base}/api/status")) != Some(200) {
         assert!(
             started.elapsed() < Duration::from_secs(300),
             "Infisical did not become ready in time"
@@ -148,7 +148,7 @@ fn infisical_reads_writes_and_lists_against_the_pinned_image() {
     }
 
     let (bootstrap_status, bootstrap_body) = post(
-        &agent,
+        &http,
         &format!("{base}/api/v1/admin/bootstrap"),
         None,
         &json!({
@@ -164,7 +164,7 @@ fn infisical_reads_writes_and_lists_against_the_pinned_image() {
         .expect("bootstrap machine token")
         .to_owned();
     let (project_status, project_body) = post(
-        &agent,
+        &http,
         &format!("{base}/api/v1/projects"),
         Some(&token),
         &json!({
@@ -253,6 +253,117 @@ allow_http_loopback = true
 
     let listed = client.list(Some("i"), "").expect("list the folder");
     assert!(listed.iter().any(|key| key.key == "NSVAULT_CONTAINER_TEST"));
+
+    // Ensure is an atomic Create request. A sequential duplicate is a 400 and
+    // must leave the first value alone.
+    let ensured = client
+        .ensure(
+            Some("i"),
+            "NSVAULT_CONTAINER_ENSURE",
+            &Secret::new(b"first-ensure-value".to_vec()),
+        )
+        .expect("ensure creates the secret");
+    assert_eq!(ensured, EnsureStatus::Created);
+    let ensured_again = client
+        .ensure(
+            Some("i"),
+            "NSVAULT_CONTAINER_ENSURE",
+            &Secret::new(b"second-ensure-value".to_vec()),
+        )
+        .expect("ensure reports the existing secret");
+    assert_eq!(ensured_again, EnsureStatus::Present);
+    let ensured_value = client
+        .get(Some("i"), "NSVAULT_CONTAINER_ENSURE")
+        .expect("read the ensured secret");
+    assert_eq!(ensured_value.expose(), b"first-ensure-value");
+
+    // Prove the server's Create is an atomic insert rather than an upsert.
+    // Run the documented POST concurrently with distinct values: exactly one
+    // request may succeed, every loser must fail, and no loser may replace the
+    // winner's value.
+    let project_query = format!("projectId={project_id}&environment=dev&secretPath=%2F");
+    let concurrent_name = "NSVAULT_CONTAINER_CONCURRENT";
+    let workers = 8usize;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+    let results: Vec<(usize, u16, String)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|index| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let token = token.clone();
+                let project_id = project_id.clone();
+                let project_query = project_query.clone();
+                let base = base.clone();
+                scope.spawn(move || {
+                    let thread_agent = agent();
+                    barrier.wait();
+                    let value = format!("concurrent-value-{index}");
+                    let (status, text) = post(
+                        &thread_agent,
+                        &format!("{base}/api/v4/secrets/{concurrent_name}?{project_query}"),
+                        Some(&token),
+                        &json!({
+                            "projectId": project_id,
+                            "environment": "dev",
+                            "secretPath": "/",
+                            "secretValue": value,
+                            "type": "shared",
+                            "skipMultilineEncoding": true,
+                        }),
+                    );
+                    (index, status, text)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("concurrent create thread"))
+            .collect()
+    });
+    let statuses: Vec<_> = results
+        .iter()
+        .map(|(index, status, _)| (index, status))
+        .collect();
+    println!("concurrent Create statuses: {statuses:?}");
+    let mut winners = Vec::new();
+    for (index, status, text) in &results {
+        if *status == 200 {
+            let response: Value =
+                serde_json::from_str(text).expect("concurrent create response shape");
+            let value = response["secret"]["secretValue"]
+                .as_str()
+                .expect("concurrent create value")
+                .to_owned();
+            winners.push((*index, value));
+        } else {
+            assert!(
+                *status >= 400,
+                "a losing concurrent create returned {status}"
+            );
+        }
+    }
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one concurrent Create may succeed: {statuses:?}"
+    );
+    let (winner_index, winner_value) = &winners[0];
+    assert_eq!(*winner_value, format!("concurrent-value-{winner_index}"));
+    let concurrent_value = client
+        .get(Some("i"), concurrent_name)
+        .expect("read the concurrently created secret");
+    assert_eq!(
+        std::str::from_utf8(concurrent_value.expose()).expect("utf8"),
+        winner_value
+    );
+    let concurrent_listing = client.list(Some("i"), "").expect("list the folder");
+    assert_eq!(
+        concurrent_listing
+            .iter()
+            .filter(|key| key.key == concurrent_name)
+            .count(),
+        1,
+        "the unique index must leave exactly one row for the winning create"
+    );
 
     std::fs::remove_dir_all(directory).expect("remove temp dir");
     // The containers are dropped here; testcontainers removes only those.
