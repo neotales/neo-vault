@@ -21,7 +21,10 @@ secret, not a whole-secret POST replacement. The initial create also exercises
 the Vault KV v2 CAS 0 create body on a real server. The same run then calls
 `ensure` for a missing path and again with a different value, and asserts the
 second call leaves the first value in place. It also ensures a missing field
-on the existing secret and checks the sibling field is still there.
+on the existing secret, checks the sibling field is still there, and then
+ensures that same field a second time with a different value. That second call
+must report `present` and leave the value unchanged; it is the check that the
+adapter reads the documented `data.subkeys` response on a real server.
 
 Run it explicitly:
 
@@ -104,7 +107,11 @@ A future test must:
    credential may appear in source, logs, or output.
 3. Create a project, environment, and a fixture secret with an obviously fake
    value, then run `nsvault ls/get/set` against a loopback endpoint.
-4. Tear down only those three containers and the test network.
+4. Prove the Create (`POST`) behavior for a duplicate secret name: the second
+   create must be rejected rather than upserted. Record the exact status and
+   evidence. Until that is written down here, the adapter's `ensure` stays
+   disabled and this test must not enable it.
+5. Tear down only those three containers and the test network.
 
 Reason for deferral: this is a multi-service harness and its startup contract
 needs its own documented verification. Running a half-configured container

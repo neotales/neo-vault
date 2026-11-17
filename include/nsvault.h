@@ -13,8 +13,26 @@
  *     next FFI call on that thread.
  *   - A client may be used concurrently for reads/list/set/ensure, but
  *     nsvault_client_close must not race with another call on the same handle.
- *   - set and ensure take a same-user advisory lock on this machine. It does
- *     not exclude writers that are not nsvault.
+ *   - set and ensure take a per-machine, same-user advisory lock keyed by the
+ *     provider's canonical origin and non-secret scope. This is the same lock
+ *     the CLI and the Rust API use, so writes to one provider scope serialize
+ *     across threads, processes, and entry points for one OS user. A call can
+ *     block until the other nsvault writer exits. Lock failures are returned
+ *     as errors (status 1); there is no unlocked fallback and no timeout. The
+ *     lock does not exclude writers that are not nsvault, another host, or
+ *     another OS user. Coordination requires the same lock directory on every
+ *     writer: the same NSVAULT_LOCK_DIR, or the same XDG_STATE_HOME/HOME when
+ *     it is unset. Different values are different locks, and no component of
+ *     that path may be a symbolic link. The path must be absolute; a relative
+ *     NSVAULT_LOCK_DIR or XDG_STATE_HOME is rejected. Every ancestor must be
+ *     owned by root or this user (an owner can rename entries even without
+ *     write permission), and an ancestor writable by group or others must also
+ *     be sticky.
+ *   - The lock is advisory. Do not remove, rename, or replace the lock
+ *     directory or its lock files while a write may be in progress: a new
+ *     inode or directory is a different lock. A hostile same-user process or
+ *     root can break cooperation that way; this lock is not a boundary
+ *     against them.
  *
  * Status: 0 = success, 1 = error (or, for nsvault_last_error, 1 = message).
  * Build:  cargo build --release --lib

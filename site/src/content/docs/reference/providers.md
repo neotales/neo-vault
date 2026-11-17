@@ -10,7 +10,7 @@ No adapter in this repository has been verified against a live production servic
 | `vault` | yes | yes | yes | Fixture plus opt-in container test. Ensure uses metadata, subkeys, and CAS. |
 | `openbao` | yes | yes | yes | Same adapter as `vault`. Not exercised as its own server. |
 | `keepass` | yes | no | no | Fake CLI fixture. Writes are refused. |
-| `infisical` | yes | yes | yes | List, get, and set are fixture-shaped in the library. Ensure follows the published Create endpoint and has not been run against a live server. |
+| `infisical` | yes | yes | no | List, get, and set are fixture-shaped in the library. `set` is a GET-then-POST/PATCH write. `ensure` is refused: the Create endpoint's duplicate behavior is unproven, so no check-then-create is attempted. |
 | `vaultwarden` | yes | no | no | Fake `bw` fixture. `bw list items` returns full items; the adapter keeps names. |
 | `proton` | yes | no | no | Fake `pass-cli` fixture. A write would put the value in `argv`, so it is refused. |
 | `github` | no | yes | no | Sealed-box unit test only. The API never returns a value. Ensure is refused because PUT would overwrite. |

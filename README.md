@@ -98,8 +98,10 @@ given. `set` refuses to take a value as an argument and refuses an empty value.
 when the provider confirms the key is absent, and it leaves an existing key
 unchanged. It never deletes. Success writes no secret to stdout. `--json`
 prints `{"status":"created"}` or `{"status":"present"}` and nothing else.
-Auth, network, and other ambiguous errors are failures, not absence. There is
-no `remove` command.
+Auth, network, and other ambiguous errors are failures, not absence. A
+provider without a race-safe create path — Infisical, GitHub, and every
+read-only kind in this build — exits with an unsupported error and contacts no
+provider. There is no `remove` command.
 `search` and `ls` are name operations. Vault, Infisical, KeePass, Proton, and
 GitHub listings are metadata-only. The Vaultwarden CLI has no metadata-only list
 command, so its adapter fetches full items and keeps only names; see the
@@ -127,7 +129,7 @@ history still sees exported values, so autoload is a deliberate trade.
 | `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
 | `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
 | `keepass` | yes | no | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
-| `infisical` | yes | yes | yes | v4 secrets HTTP API; service token or Universal Auth. Ensure uses documented Create (`POST`), never Update (`PATCH`). | Fixture-tested for list/get/set; ensure follows the published Create contract and is not live-verified |
+| `infisical` | yes | yes | no | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` is disabled because the Create endpoint's duplicate behavior is unproven. | Fixture-tested for list/get/set and for the `ensure` refusal; ensure is not verified and does not contact the provider |
 | `vaultwarden` | yes | no | no | `bw` CLI, existing session | Fake `bw` fixture; `bw` not installed here |
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
@@ -203,15 +205,19 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 - `ensure` without `#field` treats an existing Vault/OpenBao path as present,
   even when the `value` field is missing and even when the latest version is
   soft-deleted. It does not undelete or add fields in that form. `#field`
-  checks names through the subkeys API and adds a missing field with
-  `cas` set to the current version. A lost CAS race is not retried with an
-  unconditional write.
-- Infisical `ensure` is not an atomic server-side conditional write. It GETs
-  the name, and only a confirmed 404 is followed by the documented Create
-  POST. A 400 or 409 is treated as present only after a second GET shows the
-  name. It never sends the Update PATCH. This has not been run against a live
-  Infisical server. If that server's Create upserts, the race is not closed;
-  do not treat this adapter as live-verified.
+  reads the metadata version first, checks names through the subkeys API, then
+  adds a missing field with `cas` set to that earlier version. A writer that
+  creates the field between those two reads also advances the version, so the
+  CAS fails and the field is re-checked instead of replaced. A lost CAS race is
+  not retried with an unconditional write. A subkeys response without the
+  documented `data.subkeys` map is an error, not field absence, and no patch is
+  sent.
+- Infisical `ensure` is disabled. The adapter returns "does not support
+  ensure" and sends no request. The v4 Create (`POST`) has not been proven to
+  reject a duplicate rather than upsert it against a live server; until that is
+  recorded here, a check-then-create race could replace another writer's value.
+  `set` is unaffected: it reads the name and then sends Update (`PATCH`) or
+  Create (`POST`) under the same-user write lock.
 - There is no remove, delete, or destroy operation.
 - There is no backup import or export. See the roadmap. No age identity,
   recipient, or encrypted backup file is read or written.
@@ -242,7 +248,12 @@ let value = client.get(Some("work"), "apps/production/db#password")?;
 
 `Client` is synchronous and can be shared across threads. Provider adapters are
 created per operation from the configuration, so a token read at process start
-is not cached by the client.
+is not cached by the client. `set` and `ensure` take the same same-user write
+lock as the CLI, so two threads or processes that write the same provider scope
+serialize; the call can block, and a lock failure is returned as an error
+rather than performed unlocked. This requires both writers to resolve the same
+lock directory: the same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+`XDG_STATE_HOME`/`HOME` when it is unset.
 
 ## C ABI
 
@@ -257,7 +268,12 @@ Every entry point catches panics. Strings are NUL-terminated UTF-8. Output
 buffers are caller-owned, freed exactly once, and zeroed before release. A
 status of `0` is success and `1` is an error. The last error is redacted and
 per-thread. `nsvault_client_close` must not race another call using the same
-handle. There is no callback, async, or streaming API.
+handle. There is no callback, async, or streaming API. `nsvault_set` and
+`nsvault_ensure` take the same same-user write lock as the CLI; they may block
+behind another nsvault writer, and a lock failure is returned as status `1`
+instead of writing unlocked. Coordination requires the same lock directory:
+the same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+`XDG_STATE_HOME`/`HOME` when it is unset. Different values are different locks.
 
 Smoke test:
 
@@ -282,22 +298,43 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   rule, cloud project/region/API-version fields, and the GCP anonymous
   restriction. Calling a constructor directly does not bypass the configuration
   checks.
-- Vault/OpenBao and GitHub `set`/`ensure` take a same-user advisory file lock
-  on this machine before they contact the provider. Infisical and the cloud
-  adapters rely on their provider's own create/version semantics instead. The
-  lock identity is a hash of the
-  canonical address plus non-secret scope (Vault/OpenBao: mount and
-  namespace, shared across those two kind labels; Infisical: project,
-  environment, and folder; GitHub: owner and repository). Profile names and
-  config file paths are not part of it. `https://Host:443/path/` and
-  `https://host/path` match. `localhost` and `127.0.0.1` do not. The lock
-  file lives under `$XDG_STATE_HOME/nsvault/locks` or
-  `~/.local/state/nsvault/locks`, mode `0700`/`0600`. `NSVAULT_LOCK_DIR`
-  overrides that directory and must stay owner-only. The kernel releases the
-  lock when the process exits, including a crash. This does not stop the
-  Vault CLI, another host, or another OS user. Provider CAS is still required
-  for those writers. Linux `flock` is what this workspace can exercise.
-  Windows and macOS are not.
+- Vault/OpenBao `set`/`ensure`, GitHub `set`, and Infisical `set` take a
+  same-user advisory file lock on this machine before they contact the
+  provider. The CLI, the Rust `Client`, and the C ABI share the mechanism. The
+  cloud adapters do not take it; they rely on their provider's own
+  create/version semantics instead. The lock identity is a hash of the canonical address plus
+  non-secret scope (Vault/OpenBao: mount and namespace, shared across those two
+  kind labels; Infisical: project, environment, and folder; GitHub: owner and
+  repository). Profile names and config file paths are not part of it.
+  `https://Host:443/path/` and `https://host/path` match. `localhost` and
+  `127.0.0.1` do not. The lock file lives under
+  `$XDG_STATE_HOME/nsvault/locks` or `~/.local/state/nsvault/locks`. A missing
+  directory is created `0700`; lock files are created `0600` and must be
+  regular, single-link, owner-only files. `NSVAULT_LOCK_DIR` overrides the
+  directory. The path is resolved one component at a time and the verified
+  directory handle is retained, so the lock file is opened relative to it; no
+  component of the path may be a symbolic link. The path must be absolute; a
+  relative `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected. On a system with
+  a symlinked home or state directory, set `NSVAULT_LOCK_DIR` to a real,
+  non-symlink absolute path. Every parent must be owned by root or this user:
+  an owner can rename entries even without write permission. A parent writable
+  by group or others must also be sticky. An existing directory is never
+  chmodded: it must already be owned by this user and inaccessible to group
+  and others. Creation respects the process umask: a directory that does not
+  end up exactly owner-only is an error, not something that is chmodded.
+  Writers coordinate only when they resolve the same lock directory: the same
+  OS user and the same `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME`
+  when it is unset.
+  Acquisition fails closed, with no unlocked fallback and no timeout, and a
+  lock failure is an error instead of a write. The lock is advisory: while a
+  write may be in progress, do not remove, rename, or replace the lock
+  directory or its `write-*.lock` files. A new inode or directory is a
+  different lock, so a hostile same-user process (or root) can break
+  cooperation; the lock is not a boundary against it. The kernel releases the
+  lock when the process exits, including a crash. This does not stop the Vault
+  CLI, another host, or another OS user. Provider CAS is still required for
+  those writers. Linux `flock` is what this workspace can exercise; Windows and
+  macOS are not.
 - `Secret` has no `Display`; `Debug` prints `Secret([REDACTED])`.
 - The C ABI zeroes output buffers on free.
 
@@ -426,7 +463,7 @@ Observed:
 ```text
 cargo fmt --check                         clean
 cargo clippy --all-targets -- -D warnings clean
-cargo test                                54 lib + 1 AWS contract + 16 CLI
+cargo test                                71 lib + 1 AWS contract + 26 CLI
                                           + 3 FFI passed;
                                           0 failed; 3 cloud + 1 Vault
                                           container tests ignored
@@ -435,9 +472,12 @@ C ABI smoke                               exit 0, "redacted error received
                                           (34 bytes)"
 ```
 
-The opt-in cloud emulator test also passed:
+The opt-in Vault and cloud emulator tests also passed:
 
 ```sh
+cargo test --test container_vault -- --ignored --nocapture
+# 1 passed; 0 failed
+
 cargo test --test container_cloud -- --ignored --nocapture
 # 3 passed; 0 failed
 ```

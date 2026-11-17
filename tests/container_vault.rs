@@ -129,6 +129,21 @@ allow_http_loopback = true
         )
         .expect("ensure field");
     assert_eq!(note, nsvault::EnsureStatus::Created);
+    // A second ensure of the same field must see the real subkeys response and
+    // leave the value alone. This is the assertion that would fail if the
+    // adapter treated a missing or misplaced subkeys map as absence.
+    let note_again = client
+        .ensure(
+            Some("v"),
+            "apps/prod/db#note",
+            &Secret::new(b"replaced".to_vec()),
+        )
+        .expect("ensure existing field");
+    assert_eq!(note_again, nsvault::EnsureStatus::Present);
+    let note_value = client
+        .get(Some("v"), "apps/prod/db#note")
+        .expect("read existing field");
+    assert_eq!(note_value.expose(), b"kept");
     let user = client
         .get(Some("v"), "apps/prod/db#user")
         .expect("sibling after field ensure");
