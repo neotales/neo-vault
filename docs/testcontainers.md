@@ -72,55 +72,130 @@ test aws_secrets_manager_round_trips_through_floci ... ok
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-## Vaultwarden: deferred, concrete prerequisites
+## Infisical: implemented and exercised
 
-Not implemented in this increment. The adapter invokes the Bitwarden CLI; the
-test image alone is not enough.
+`tests/container_infisical.rs` starts three containers, each only for this
+test, on the default Docker bridge and reaches each by its own container
+address. Only Infisical's port is published to the host.
 
-A future test must:
+- `postgres:17-alpine`, with a dummy `infisical` database and password
+- `redis:7.4-alpine`
+- `infisical/infisical:v0.167.11`, with a fixed dummy `ENCRYPTION_KEY` and
+  `AUTH_SECRET`, `HOST=0.0.0.0`, telemetry and the update check disabled
 
-1. Start `vaultwarden/server:1.37.5` with `SIGNUPS_ALLOWED=true` and a dummy
-   `ADMIN_TOKEN`; use only a loopback mapped port.
-2. Install a pinned `bw` CLI in the test runner (the adapter's documented
-   dependency; it is not present here).
-3. Create an isolated account with a dummy master password, unlock it, and
-   export only the resulting test session. Do not use a real account or real
-   vault.
-4. Run `get`, `ls`, and the read-only refusal paths through `nsvault`.
-5. Tear down only the test's Vaultwarden container and temporary `bw` state.
+The test polls `/api/status` until the instance answers, then calls the
+documented bootstrap endpoint `POST /api/v1/admin/bootstrap` with an
+`@example.invalid` address and a fixed fake password. It creates a project with
+the `default` template (which creates the `dev` environment) and configures the
+adapter with the bootstrap machine token in an owner-only file. The token and
+every value live only in this throwaway instance and a temporary directory.
 
-Reason for deferral: the missing pinned `bw` prerequisite and account/session
-setup are a separate test-harness increment, not something to fake with the
-HTTP API.
+The run covers `set` (create), `get`, `set` (replace), and the metadata-only
+list. `ensure` stays disabled in this build and this test neither enables nor
+exercises it: proving the Create (`POST`) duplicate behavior is a separate
+decision, and the adapter must not rely on an unproven check-then-create.
 
-## Infisical: deferred, concrete prerequisites
+Run it explicitly:
 
-Not implemented in this increment. The official image is not a single-container
-service.
+```sh
+cargo test --test container_infisical -- --ignored --nocapture
+```
 
-A future test must:
+Observed in this workspace on 2026-11-17:
 
-1. Start a private testcontainers network with pinned
-   `postgres:17-alpine`, `redis:7.4-alpine`, and
-   `infisical/infisical:v0.167.11`.
-2. Supply dummy local encryption/auth/database/Redis settings. No real
-   credential may appear in source, logs, or output.
-3. Create a project, environment, and a fixture secret with an obviously fake
-   value, then run `nsvault ls/get/set` against a loopback endpoint.
-4. Prove the Create (`POST`) behavior for a duplicate secret name: the second
-   create must be rejected rather than upserted. Record the exact status and
-   evidence. Until that is written down here, the adapter's `ensure` stays
-   disabled and this test must not enable it.
-5. Tear down only those three containers and the test network.
+```text
+test infisical_reads_writes_and_lists_against_the_pinned_image ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+finished in 44.39s
+```
 
-Reason for deferral: this is a multi-service harness and its startup contract
-needs its own documented verification. Running a half-configured container
-would not prove the adapter works.
+The three testcontainers-managed containers were gone after the run.
+
+Notes:
+
+- Startup takes roughly two minutes while migrations run; the readiness budget
+  is 300 seconds.
+- The first run of this test exposed a real adapter defect: the request sent
+  the raw machine token in `Authorization`, and Infisical answered `403`. The
+  API requires the `Bearer` scheme. `src/provider/infisical.rs` now builds the
+  header value with that scheme, and the loopback fixture test asserts it.
+
+## Vaultwarden: implemented and exercised
+
+`tests/container_vaultwarden.rs` starts:
+
+- image: `vaultwarden/server:1.37.5`
+- `SIGNUPS_ALLOWED=true`, `I_REALLY_WANT_VOLATILE_STORAGE=true`,
+  `WEB_VAULT_ENABLED=false`, only its own mapped port
+- a pinned `@bitwarden/cli` supplied through `NSVAULT_TEST_BW`
+
+The test creates a throwaway account inside the container through the
+documented registration flow (`/identity/accounts/register/send-verification-email`,
+then `/identity/accounts/register/finish`). It derives the account keys locally
+the way the clients do: PBKDF2-SHA256 over the email, HKDF-Expand with `enc` and
+`mac`, and a type-2 EncString over a random 64-byte user key. `100000`
+iterations is the minimum this Vaultwarden release accepts. The address is
+`@example.invalid` and the password is a fixed fake.
+
+Two independent CLI states are prepared, each with its own
+`BITWARDENCLI_APPDATA_DIR`, wrapper script, session file, and configuration.
+The second state logs in before the item exists, so its local copy is missing
+it. The first state creates `DB`; the second state then sets `DB#username`.
+Because a write syncs under the shared lock before the lookup, the second state
+sees the item and updates it instead of creating a duplicate. The run asserts
+both fields on one item, replaces the password from the first state, adds a
+custom field from the second, and checks every sibling survives. The refusal of
+`ensure` is checked too.
+
+The second state then acts as an external writer: it edits `login.password`
+directly. The adapter's next write syncs, preserves that external password, and
+replaces only `notes`. Finally, the test captures the first state's item, lets
+the second state advance the revision, and replays the captured stale item
+through the CLI; the server must reject it. That checks the residual
+sync-to-edit window, not coordination. A loopback fixture with a failing `sync`
+asserts that no lookup or write is attempted and no value leaks.
+
+Run it explicitly:
+
+```sh
+NSVAULT_TEST_BW=/path/to/pinned/bw \
+  cargo test --test container_vaultwarden -- --ignored --nocapture
+```
+
+Observed in this workspace on 2026-11-17, with `NSVAULT_TEST_BW` pointing at
+`@bitwarden/cli` 2025.6.1:
+
+```text
+test vaultwarden_two_cli_states_preserve_fields ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+finished in 123.68s
+```
+
+The testcontainers-managed container was gone after the run. The temporary
+Bitwarden CLI state and session file were removed with the test directory.
+
+CLI pinning is deliberate:
+
+- `@bitwarden/cli` 2024.9.0 sends item writes without the `encryptedFor` field
+  that Vaultwarden 1.37.5 requires, so an item create fails with `422`.
+- `@bitwarden/cli` 2026.10.1 refuses any non-HTTPS server URL before sending a
+  request (`InsecureUrlNotAllowedError`), so it cannot reach this plaintext
+  loopback container.
+- `@bitwarden/cli` 2025.6.1 is the newest release this harness verified against
+  the pinned container over loopback HTTP. The adapter's command surface
+  (`list items`, `get item`, `create item`, `edit item` reading encoded JSON
+  from stdin) is the same surface the newer CLI documents.
+
+The test never logs in to or unlocks a real account, never reads a real vault,
+and does not reuse the CLI state of the developer running it.
 
 ## What is not claimed
 
-No Vaultwarden or Infisical container test ran. The container tests that ran
-are Vault and the three Floci cloud adapters; their evidence is above. Floci
-does not validate AWS SigV4 signatures, and passing these tests is not
-production verification against AWS, GCP, or Azure. CI does not run container
-tests by default; they are explicit opt-in commands.
+No production Vault, Infisical, or Vaultwarden server was contacted. The
+Infisical `ensure` remains disabled; the Vaultwarden adapter has no `ensure`,
+and its write path has not been exercised against a current CLI over HTTPS.
+The Vaultwarden test proves the server's stale-revision rejection, not
+coordination of external clients; the README states the residual race.
+Floci does not validate AWS SigV4 signatures, and passing the cloud tests is
+not production verification against AWS, GCP, or Azure. CI does not run
+container tests by default; they are explicit opt-in commands.

@@ -129,8 +129,8 @@ history still sees exported values, so autoload is a deliberate trade.
 | `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
 | `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
 | `keepass` | yes | no | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
-| `infisical` | yes | yes | no | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` is disabled because the Create endpoint's duplicate behavior is unproven. | Fixture-tested for list/get/set and for the `ensure` refusal; ensure is not verified and does not contact the provider |
-| `vaultwarden` | yes | no | no | `bw` CLI, existing session | Fake `bw` fixture; `bw` not installed here |
+| `infisical` | yes | yes | no | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` is disabled because the Create endpoint's duplicate behavior is unproven. | Fixture-tested for list/get/set and for the `ensure` refusal, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis; no production server |
+| `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
 | `aws-secrets-manager` | yes | yes | yes | Secrets Manager JSON 1.1 API with local SigV4 signing | Opt-in Floci test against `floci/floci:2.5.0`; signer unit-tested against AWS's published SigV4 vectors; no AWS account |
@@ -169,8 +169,33 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   v4 endpoint is unpaginated by design.
 - KeePass is read-only. Database passwords and key files are the caller's
   responsibility; the password is written to `keepassxc-cli` stdin.
-- Vaultwarden is read-only and never logs in or unlocks. `bw list items`
-  returns full items, which this adapter parses and discards except for names.
+- Vaultwarden never logs in or unlocks; the session must already be unlocked when
+  the adapter runs. `bw list items` returns full items, which this adapter
+  parses and discards except for names. A write reads the whole item, changes
+  one field, and sends the item back through `bw edit item`, so the session
+  needs write access. Writes require UTF-8 text, refuse an empty value, and are
+  capped at 1 MiB. A key without a field writes `login.password` (or `notes` on
+  a secure note); `#password`, `#username`, `#notes`, and `#name` are the named
+  fields, and any other field name updates or appends a custom field. A missing
+  item name is created as a login. There is no `ensure`: a create-then-race
+  cannot be made atomic through this CLI, and two items with the same name are
+  legal in Bitwarden.
+  A write holds one shared lock, runs `bw sync` (failing closed), and only then
+  reads and updates the item. Two profiles with separate CLI state directories
+  therefore update the same item without losing a field. Reads (`get`, `ls`)
+  use the local copy and can be stale until a write or an explicit sync.
+  Concurrent external clients are not coordinated. The CLI sends
+  `lastKnownRevisionDate` from the synced copy, and the Bitwarden server and
+  Vaultwarden reject an update whose revision is more than one second stale
+  (Bitwarden `CipherService.ValidateCipherLastKnownRevisionDate`, Vaultwarden
+  `update_cipher_from_data`). A change before the sync is incorporated (the
+  selected field is replaced) and a change between the sync and the edit is
+  rejected where the server enforces the check. That is not coordination: the
+  one-second window can let an update through, a server may not enforce the
+  check, and a later accepted write wins. This adapter does not claim to
+  preserve concurrent external changes. Writes take one conservative same-user
+  advisory lock shared by every Vaultwarden profile on this machine, because
+  the configuration has no server address and wrapper paths differ.
 - Proton writes are unsupported because the documented update command takes
   the value in `argv`.
 - GitHub repository secrets only. Organization, environment, Codespaces, and
@@ -298,14 +323,15 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   rule, cloud project/region/API-version fields, and the GCP anonymous
   restriction. Calling a constructor directly does not bypass the configuration
   checks.
-- Vault/OpenBao `set`/`ensure`, GitHub `set`, Infisical `set`, and cloud
-  `set` (AWS `ensure` too) take a same-user advisory file lock on this machine
+- Vault/OpenBao `set`/`ensure`, GitHub `set`, Infisical `set`, Vaultwarden
+  `set`, and cloud `set` (AWS `ensure` too) take a same-user advisory file lock on this machine
   before they contact the provider. The CLI, the Rust `Client`, and the C ABI
   share the mechanism. GCP and Azure `ensure` remain unsupported and send no
   request, so there is no write to lock. The lock identity is a hash of the
   canonical address plus non-secret scope (Vault/OpenBao: mount and namespace,
   shared across those two kind labels; Infisical: project, environment, and
-  folder; GitHub: owner and repository). For the clouds it is deliberately
+  folder; GitHub: owner and repository; Vaultwarden: one shared identity for
+  every profile on this machine, because wrapper paths differ). For the clouds it is deliberately
   conservative:
   - AWS recognizes `secretsmanager.{region}` and
     `secretsmanager-fips.{region}` on `amazonaws.com`, `amazonaws.com.cn`,
@@ -372,13 +398,6 @@ provider may log its own request. This project does not claim to prevent those.
 
 ## Container integration tests
 
-Vault has an opt-in, isolated testcontainers test pinned to
-`hashicorp/vault:1.21.4`:
-
-```sh
-cargo test --test container_vault -- --ignored --nocapture
-```
-
 The three cloud adapters have opt-in Floci tests pinned to release images:
 
 ```sh
@@ -389,9 +408,23 @@ It starts `floci/floci:2.5.0`, `floci/floci-gcp:0.13.0`, and
 `floci/floci-az:0.17.0` on random loopback-mapped ports, writes only obviously
 fake fixture values, and lets testcontainers remove only those containers.
 Azure Functions is disabled in the Azure container so no Docker socket is
-needed. Vaultwarden and Infisical container tests are deferred with concrete
-prerequisites in [`docs/testcontainers.md`](docs/testcontainers.md); no test is
-claimed for them. Container tests do not run in the default gate.
+needed. Three more container tests cover Vault, Infisical, and Vaultwarden:
+
+```sh
+cargo test --test container_vault -- --ignored --nocapture
+cargo test --test container_infisical -- --ignored --nocapture
+NSVAULT_TEST_BW=/path/to/pinned/bw \
+  cargo test --test container_vaultwarden -- --ignored --nocapture
+```
+
+The Infisical test runs `infisical/infisical:v0.167.11` with
+`postgres:17-alpine` and `redis:7.4-alpine`, bootstraps the instance, creates a
+project, and covers `list`, `get`, and `set`. The Vaultwarden test runs
+`vaultwarden/server:1.37.5` with a pinned `@bitwarden/cli` 2025.6.1, creates a
+throwaway account inside the container, and covers `list`, `get`, and `set`
+including sibling fields. Exact evidence and prerequisites are in
+[`docs/testcontainers.md`](docs/testcontainers.md). Container tests do not run
+in the default gate.
 
 The AWS JSON request contract has a separate loopback fixture test:
 

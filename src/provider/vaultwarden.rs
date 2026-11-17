@@ -1,22 +1,44 @@
 //! Vaultwarden/Bitwarden provider backed by the `bw` CLI.
 //!
-//! The adapter is read-only. It never logs in, unlocks, or changes CLI state;
-//! the caller supplies a session through `BW_SESSION` (or a file). Values are
-//! parsed from the CLI's JSON response in memory and never echo to an error.
+//! The adapter never logs in or unlocks; the caller supplies an unlocked
+//! session through `BW_SESSION` (or a file). Reads parse the CLI's JSON in
+//! memory and use the CLI's local copy, which can be stale until `bw sync`.
+//! A write sends the complete item to the CLI on stdin as encoded JSON, so the
+//! value never appears in `argv`, and the CLI's echoed item is discarded rather
+//! than printed. Values never echo to an error.
+//!
+//! A write holds one shared lock, runs `bw sync` (failing closed), and then
+//! reads and updates the whole item. Because the sync happens under the lock,
+//! a second profile with its own CLI state sees an item created by the first
+//! instead of creating a duplicate. Concurrent external clients are not
+//! coordinated: a change before the sync is incorporated (the selected field is
+//! replaced), and a change between the sync and the edit is rejected by the
+//! server's revision check where the server enforces it. That check is not
+//! coordination: the check tolerates a one-second difference, a server may not
+//! enforce it, and an update accepted after this one simply wins later. This
+//! adapter does not claim to preserve concurrent external changes.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use base64::Engine;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config::VaultwardenConfig;
-use crate::error::{Error, Result, unsupported};
+use crate::error::{Error, Result};
 use crate::key::Key;
 use crate::provider::{Capabilities, ListedKey, Provider, command_available};
 use crate::secret::Secret;
 
-/// Read-only Vaultwarden provider.
+/// Maximum bytes accepted for one write.
+///
+/// The value travels inside a base64 JSON document on the CLI's stdin; the
+/// bound keeps that document, and the item the CLI returns, bounded.
+const MAX_SET_BYTES: usize = 1024 * 1024;
+
+/// Vaultwarden/Bitwarden provider.
 #[derive(Debug)]
 pub struct VaultwardenProvider {
     name: String,
@@ -52,14 +74,13 @@ impl VaultwardenProvider {
         })
     }
 
-    fn run(&self, arguments: &[&str]) -> Result<Vec<u8>> {
+    fn command(&self, arguments: &[&str]) -> Result<Command> {
         let mut command = Command::new(&self.command);
         command
             .arg("--nointeraction")
             .args(arguments)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(session) = &self.session {
             command.env(
                 "BW_SESSION",
@@ -67,7 +88,13 @@ impl VaultwardenProvider {
                     .map_err(|_| Error::new("Bitwarden session is not valid UTF-8"))?,
             );
         }
-        let output = command
+        Ok(command)
+    }
+
+    fn run(&self, arguments: &[&str]) -> Result<Vec<u8>> {
+        let output = self
+            .command(arguments)?
+            .stdin(Stdio::null())
             .spawn()
             .map_err(|_| Error::new("could not start the Bitwarden CLI"))?
             .wait_with_output()
@@ -83,6 +110,34 @@ impl VaultwardenProvider {
         Ok(output.stdout)
     }
 
+    /// Writes one encoded item to the CLI and discards its response.
+    ///
+    /// The response echoes the item, including the value, so it is never
+    /// captured or logged. Only the exit status is observed.
+    fn write(&self, arguments: &[&str], input: &[u8]) -> Result<()> {
+        let mut command = self.command(arguments)?;
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = command
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|_| Error::new("could not start the Bitwarden CLI"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::new("Bitwarden CLI stdin is unavailable"))?
+            .write_all(input)
+            .map_err(|_| Error::new("Bitwarden CLI did not accept the item"))?;
+        let status = child
+            .wait()
+            .map_err(|_| Error::new("Bitwarden CLI did not finish"))?;
+        if !status.success() {
+            return Err(Error::new(
+                "Bitwarden CLI refused the write; the vault may be locked, the session stale, or the item changed since the last sync",
+            ));
+        }
+        Ok(())
+    }
+
     fn items(&self) -> Result<Vec<Value>> {
         let output = self.run(&["list", "items"])?;
         parse_items(&output)
@@ -93,9 +148,9 @@ impl VaultwardenProvider {
         parse_item(&output)
     }
 
-    fn resolve_item(&self, selector: &str) -> Result<Value> {
+    fn find_item(&self, selector: &str) -> Result<Option<Value>> {
         if is_uuid(selector) {
-            return self.item(selector);
+            return self.item(selector).map(Some);
         }
         let matches: Vec<String> = self
             .items()?
@@ -104,13 +159,49 @@ impl VaultwardenProvider {
             .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
             .collect();
         match matches.len() {
-            1 => self.item(&matches[0]),
-            0 => Err(Error::new(format!(
-                "Vaultwarden item {selector:?} was not found"
-            ))),
+            1 => self.item(&matches[0]).map(Some),
+            0 => Ok(None),
             _ => Err(Error::new(format!(
                 "Vaultwarden item name {selector:?} is ambiguous; use the item UUID"
             ))),
+        }
+    }
+
+    fn resolve_item(&self, selector: &str) -> Result<Value> {
+        self.find_item(selector)?
+            .ok_or_else(|| Error::new(format!("Vaultwarden item {selector:?} was not found")))
+    }
+
+    /// Lock identity for Vaultwarden writes.
+    ///
+    /// The configuration has no server address, and two profiles can name
+    /// different wrapper scripts that reach the same vault. A per-executable
+    /// identity would let those profiles write concurrently and lose an item
+    /// field, so every Vaultwarden write on this machine shares one
+    /// conservative lock. It is coarser than the vault, never finer.
+    fn write_identity(&self) -> String {
+        crate::provider::lock::identity("vaultwarden", "shared", &[])
+    }
+
+    /// Refreshes the CLI's local copy from the server.
+    ///
+    /// Called while the write lock is held, before the existence check. A
+    /// failure is fatal: an unsynced copy can miss an item that another CLI
+    /// state already created, and treating that as absence would create a
+    /// duplicate instead of updating the existing item.
+    fn sync(&self) -> Result<()> {
+        self.run(&["sync"])
+            .map_err(|_| Error::new("Vaultwarden sync failed; the write was not attempted"))?;
+        Ok(())
+    }
+
+    fn write_item(&self, id: Option<&str>, item: &Value) -> Result<()> {
+        let document = serde_json::to_vec(item)
+            .map_err(|_| Error::new("cannot encode the Vaultwarden item"))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(document);
+        match id {
+            Some(id) => self.write(&["edit", "item", id], encoded.as_bytes()),
+            None => self.write(&["create", "item"], encoded.as_bytes()),
         }
     }
 }
@@ -125,7 +216,7 @@ impl Provider for VaultwardenProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::READ_ONLY
+        Capabilities::READ_WRITE
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>> {
@@ -170,9 +261,163 @@ impl Provider for VaultwardenProvider {
             })
     }
 
-    fn set(&self, _key: &str, _value: &Secret) -> Result<()> {
-        Err(unsupported("set", &self.name))
+    /// Writes one field by syncing, reading the item, changing that field, and
+    /// sending the whole item back. The lock is held across the sync and the
+    /// write, so another nsvault writer cannot change the item in between.
+    /// Sibling fields are preserved within this call. Concurrent external
+    /// clients are not coordinated; the server's revision check can reject a
+    /// change that lands after the sync, but it is not a guarantee.
+    fn set(&self, raw_key: &str, value: &Secret) -> Result<()> {
+        let key = Key::parse(raw_key)?;
+        if key.field() == Some("id") {
+            return Err(Error::new("Vaultwarden item ids cannot be set"));
+        }
+        let text = std::str::from_utf8(value.expose())
+            .map_err(|_| Error::new("Vaultwarden values must be UTF-8 text"))?;
+        if text.is_empty() {
+            return Err(Error::new("refusing to store an empty secret"));
+        }
+        if value.expose().len() > MAX_SET_BYTES {
+            return Err(Error::new(format!(
+                "Vaultwarden values are limited to {MAX_SET_BYTES} bytes"
+            )));
+        }
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity())?;
+        self.sync()?;
+        match self.find_item(key.path())? {
+            Some(mut item) => {
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::new("Bitwarden CLI returned an item without an id"))?;
+                apply_field(&mut item, key.field(), text)?;
+                self.write_item(Some(&id), &item)
+            }
+            None => {
+                let item = new_item(key.path(), key.field(), text)?;
+                self.write_item(None, &item)
+            }
+        }
     }
+}
+
+/// Builds the smallest item that can hold one value under `name`.
+///
+/// The item is a login by default; `#notes` creates a secure note. A missing
+/// item has no name field to change, so `#name` is refused rather than
+/// inventing an item named after a secret.
+fn new_item(name: &str, field: Option<&str>, text: &str) -> Result<Value> {
+    let mut item = json!({
+        "type": 1,
+        "name": name,
+        "notes": "",
+        "login": { "username": null, "password": null },
+        "fields": [],
+    });
+    match field {
+        None | Some("password") => {
+            set_login(&mut item, "password", text)?;
+        }
+        Some("username") => {
+            set_login(&mut item, "username", text)?;
+        }
+        Some("notes") => {
+            item["type"] = Value::from(2);
+            set_text(&mut item, "notes", text)?;
+            if let Some(object) = item.as_object_mut() {
+                object.remove("login");
+            }
+        }
+        Some("name") => {
+            return Err(Error::new(
+                "Vaultwarden item names come from the key; create the item with another field",
+            ));
+        }
+        Some("id") => return Err(Error::new("Vaultwarden item ids cannot be set")),
+        Some(custom) => set_custom_field(&mut item, custom, text)?,
+    }
+    Ok(item)
+}
+
+/// Applies one value to the field a key selects.
+///
+/// Without a field, a secure note writes `notes` and a login writes
+/// `password`; other item types need an explicit field. Unknown field names
+/// become custom fields, uppercase and lowercase names matching one entry.
+fn apply_field(item: &mut Value, field: Option<&str>, text: &str) -> Result<()> {
+    let item_type = item.get("type").and_then(Value::as_u64);
+    match field {
+        None => {
+            if item_type == Some(2) {
+                set_text(item, "notes", text)?;
+            } else if item_type == Some(1) || item.get("login").is_some() {
+                set_login(item, "password", text)?;
+            } else {
+                return Err(Error::new(
+                    "Vaultwarden item has no default field; name one with #field",
+                ));
+            }
+        }
+        Some("password") => set_login(item, "password", text)?,
+        Some("username") => set_login(item, "username", text)?,
+        Some("notes") => set_text(item, "notes", text)?,
+        Some("name") => set_text(item, "name", text)?,
+        Some("id") => return Err(Error::new("Vaultwarden item ids cannot be set")),
+        Some(custom) => set_custom_field(item, custom, text)?,
+    }
+    Ok(())
+}
+
+fn set_login(item: &mut Value, name: &str, text: &str) -> Result<()> {
+    if item.get("type").and_then(Value::as_u64) == Some(2) {
+        return Err(Error::new(
+            "Vaultwarden item is a secure note; #password and #username need a login item",
+        ));
+    }
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| Error::new("Bitwarden CLI returned an unexpected item"))?;
+    let login = object.entry("login").or_insert_with(|| json!({}));
+    let login = login
+        .as_object_mut()
+        .ok_or_else(|| Error::new("Vaultwarden item has no login object"))?;
+    login.insert(name.to_owned(), Value::String(text.to_owned()));
+    Ok(())
+}
+
+fn set_text(item: &mut Value, name: &str, text: &str) -> Result<()> {
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| Error::new("Bitwarden CLI returned an unexpected item"))?;
+    object.insert(name.to_owned(), Value::String(text.to_owned()));
+    Ok(())
+}
+
+fn set_custom_field(item: &mut Value, name: &str, text: &str) -> Result<()> {
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| Error::new("Bitwarden CLI returned an unexpected item"))?;
+    let fields = object
+        .entry("fields")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let fields = fields
+        .as_array_mut()
+        .ok_or_else(|| Error::new("Vaultwarden item has no field list"))?;
+    if let Some(existing) = fields.iter_mut().find(|field| {
+        field
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
+    }) {
+        let existing = existing
+            .as_object_mut()
+            .ok_or_else(|| Error::new("Vaultwarden item has an unexpected field entry"))?;
+        existing.insert("value".to_owned(), Value::String(text.to_owned()));
+        return Ok(());
+    }
+    fields.push(json!({ "name": name, "value": text, "type": 0 }));
+    Ok(())
 }
 
 fn parse_items(bytes: &[u8]) -> Result<Vec<Value>> {
@@ -242,7 +487,7 @@ fn is_uuid(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_field, is_uuid, parse_item};
+    use super::{apply_field, default_field, is_uuid, new_item, parse_item};
     use serde_json::json;
 
     #[test]
@@ -261,5 +506,45 @@ mod tests {
     fn parses_a_response_envelope_without_printing_it() {
         let item = parse_item(br#"{"success":true,"data":{"name":"x"}}"#).expect("item");
         assert_eq!(item["name"], "x");
+    }
+
+    #[test]
+    fn a_login_field_update_keeps_the_other_fields() {
+        let mut item = json!({
+            "type": 1,
+            "name": "DB",
+            "login": {"username": "alice", "password": "old"},
+            "fields": [{"name": "api", "value": "key"}],
+        });
+        apply_field(&mut item, Some("password"), "new").expect("update");
+        assert_eq!(item["login"]["password"], "new");
+        assert_eq!(item["login"]["username"], "alice");
+        assert_eq!(item["fields"][0]["value"], "key");
+    }
+
+    #[test]
+    fn custom_fields_match_case_insensitively() {
+        let mut item =
+            json!({"type": 1, "name": "DB", "fields": [{"name": "API", "value": "old"}]});
+        apply_field(&mut item, Some("api"), "new").expect("update");
+        assert_eq!(item["fields"].as_array().expect("fields").len(), 1);
+        assert_eq!(item["fields"][0]["value"], "new");
+    }
+
+    #[test]
+    fn a_secure_note_refuses_login_fields() {
+        let mut item = json!({"type": 2, "name": "Note", "notes": "old"});
+        assert!(apply_field(&mut item, Some("password"), "new").is_err());
+        apply_field(&mut item, None, "new").expect("default field");
+        assert_eq!(item["notes"], "new");
+    }
+
+    #[test]
+    fn a_new_named_field_is_refused() {
+        assert!(new_item("DB", Some("name"), "other").is_err());
+        let item = new_item("DB", Some("notes"), "text").expect("secure note");
+        assert_eq!(item["type"], 2);
+        assert_eq!(item["notes"], "text");
+        assert!(item.get("login").is_none());
     }
 }

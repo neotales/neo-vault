@@ -13,15 +13,17 @@ cargo test
 cargo build --release --lib
 ```
 
-Opt-in container test (requires Docker and does not run by default):
+Opt-in container tests (require Docker and do not run by default):
 
 ```sh
 cargo test --test container_vault -- --ignored --nocapture
+cargo test --test container_infisical -- --ignored --nocapture
+NSVAULT_TEST_BW=/path/to/pinned/bw \
+  cargo test --test container_vaultwarden -- --ignored --nocapture
 ```
 
-It starts only its own pinned Vault container and never performs broad Docker
-cleanup. Vaultwarden/Infisical container tests are deferred; see
-`docs/testcontainers.md`.
+Each starts only its own pinned containers and never performs broad Docker
+cleanup. See `docs/testcontainers.md`.
 
 The C ABI check is:
 

@@ -61,16 +61,29 @@ impl GithubProvider {
         })
     }
 
+    /// Returns the `Authorization` header value.
+    ///
+    /// GitHub documents `Authorization: Bearer <token>` (or the legacy
+    /// `token` scheme) for the REST API. A bare token has no scheme and is not
+    /// a credential; the value is zeroized like any other secret.
+    fn authorization(&self) -> Secret {
+        let mut header = Vec::with_capacity(7 + self.token.expose().len());
+        header.extend_from_slice(b"Bearer ");
+        header.extend_from_slice(self.token.expose());
+        Secret::new(header)
+    }
+
     fn request(
         &self,
         method: &str,
         url: &url::Url,
         body: Option<&[u8]>,
     ) -> Result<crate::provider::HttpResponse> {
+        let authorization = self.authorization();
         self.client.request(
             method,
             url,
-            Some(("Authorization", &self.token)),
+            Some(("Authorization", &authorization)),
             &[],
             "application/json",
             body,
@@ -265,9 +278,24 @@ fn valid_secret_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_secret_name;
+    use super::{GithubProvider, valid_secret_name};
+    use crate::provider::HttpClient;
+    use crate::secret::Secret;
     use crypto_box::SecretKey;
     use crypto_box::aead::rand_core::OsRng;
+
+    #[test]
+    fn authorization_uses_the_bearer_scheme() {
+        let provider = GithubProvider {
+            name: "gh".to_owned(),
+            base: url::Url::parse("https://api.github.com").expect("url"),
+            owner: "owner".to_owned(),
+            repo: "repo".to_owned(),
+            token: Secret::new(b"test-token".to_vec()),
+            client: HttpClient::new(),
+        };
+        assert_eq!(provider.authorization().expose(), b"Bearer test-token");
+    }
 
     #[test]
     fn sealed_box_round_trips_and_adds_the_expected_overhead() {
