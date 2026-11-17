@@ -362,7 +362,7 @@ fn inspect_ancestor(fd: &OwnedFd) -> Result<()> {
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Err(Error::new("provider write lock path is not a directory"));
     }
-    let mode = stat.st_mode & 0o777;
+    let mode = stat.st_mode & 0o7777;
     if mode & 0o022 != 0 && mode & 0o1000 == 0 {
         return Err(Error::new(
             "provider write lock path has a parent that other users can modify",
@@ -686,6 +686,22 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o755, "an existing directory must keep its mode");
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sticky_writable_parent_is_allowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_dir("sticky-parent");
+        let sticky = base.join("sticky");
+        std::fs::create_dir(&sticky).expect("sticky dir");
+        std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+        let locks = sticky.join("locks");
+        std::fs::create_dir(&locks).expect("lock dir");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        LockDirectory::open(&locks, false).expect("a sticky parent is allowed");
         std::fs::remove_dir_all(base).expect("cleanup");
     }
 
