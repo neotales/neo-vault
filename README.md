@@ -179,8 +179,18 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   fields, and any other field name updates or appends a custom field. A missing
   item name is created as a login. There is no `ensure`: a create-then-race
   cannot be made atomic through this CLI, and two items with the same name are
-  legal in Bitwarden. Writes take the same-user advisory lock; its identity is
-  the configured CLI executable because the configuration has no server address.
+  legal in Bitwarden.
+  Concurrent external clients are not coordinated. The CLI sends
+  `lastKnownRevisionDate` from its local copy, and the Bitwarden server and
+  Vaultwarden reject an update whose revision is more than one second stale
+  (Bitwarden `CipherService.ValidateCipherLastKnownRevisionDate`, Vaultwarden
+  `update_cipher_from_data`). That turns a common external edit into a failed
+  write, but it is not coordination: the CLI's copy can be stale until it is
+  synced, a server may not enforce the check, the one-second window can let an
+  update through, and a later accepted write wins. This adapter does not claim
+  to preserve concurrent external changes. Writes take one conservative
+  same-user advisory lock shared by every Vaultwarden profile on this machine,
+  because the configuration has no server address and wrapper paths differ.
 - Proton writes are unsupported because the documented update command takes
   the value in `argv`.
 - GitHub repository secrets only. Organization, environment, Codespaces, and
@@ -315,7 +325,8 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   create/version semantics instead. The lock identity is a hash of the canonical address plus
   non-secret scope (Vault/OpenBao: mount and namespace, shared across those two
   kind labels; Infisical: project, environment, and folder; GitHub: owner and
-  repository; Vaultwarden: the configured CLI executable). Profile names and
+  repository; Vaultwarden: one shared identity for every profile on this
+  machine). Profile names and
   config file paths are not part of it.
   `https://Host:443/path/` and `https://host/path` match. `localhost` and
   `127.0.0.1` do not. The lock file lives under

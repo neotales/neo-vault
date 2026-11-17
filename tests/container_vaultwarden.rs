@@ -12,6 +12,12 @@
 //! container; testcontainers removes that container on drop. It never touches
 //! another container, network, volume, or image.
 //!
+//! The last phase uses a second CLI state as an external writer: it edits the
+//! item and asserts that the first state's stale whole-item write is refused
+//! and the external value survives. That checks the server's
+//! `lastKnownRevisionDate` behavior; it is not a claim that nsvault
+//! coordinates external clients.
+//!
 //! The CLI must accept a plaintext loopback server URL. Packages after
 //! `@bitwarden/cli` 2025.6.1 reject any non-HTTPS server URL before sending a
 //! request, and `@bitwarden/cli` 2024.9.0 is too old for this Vaultwarden
@@ -82,18 +88,40 @@ fn run_bw(
     appdata: &Path,
     arguments: &[&str],
     password: Option<&str>,
+    session: Option<&str>,
+    input: Option<&[u8]>,
 ) -> std::process::Output {
     let mut command = Command::new(bw);
     command
         .args(arguments)
         .env("BITWARDENCLI_APPDATA_DIR", appdata)
-        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     if let Some(password) = password {
         command.env("BW_PASSWORD", password);
     }
-    command.output().expect("run the pinned Bitwarden CLI")
+    if let Some(session) = session {
+        command.env("BW_SESSION", session);
+    }
+    if let Some(input) = input {
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the pinned Bitwarden CLI");
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("CLI stdin")
+            .write_all(input)
+            .expect("write the encoded item");
+        child.wait_with_output().expect("wait for the pinned CLI")
+    } else {
+        command
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the pinned Bitwarden CLI")
+    }
 }
 
 fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
@@ -208,13 +236,22 @@ fn vaultwarden_reads_and_writes_through_the_cli() {
     std::fs::create_dir_all(&appdata).expect("Bitwarden state directory");
 
     register_account(&agent, &base);
-    let configured = run_bw(&bw, &appdata, &["config", "server", &base], None);
+    let configured = run_bw(
+        &bw,
+        &appdata,
+        &["config", "server", &base],
+        None,
+        None,
+        None,
+    );
     assert!(configured.status.success(), "bw config server failed");
     let login = run_bw(
         &bw,
         &appdata,
         &["login", EMAIL, "--passwordenv", "BW_PASSWORD", "--raw"],
         Some(PASSWORD),
+        None,
+        None,
     );
     assert!(
         login.status.success(),
@@ -227,6 +264,8 @@ fn vaultwarden_reads_and_writes_through_the_cli() {
         &appdata,
         &["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
         Some(PASSWORD),
+        None,
+        None,
     );
     assert!(
         unlock.status.success(),
@@ -316,6 +355,99 @@ session_file = "session"
         &Secret::new(b"must-not-be-written".to_vec()),
     );
     assert!(ensured.is_err(), "Vaultwarden ensure must stay unsupported");
+
+    // A second CLI state (another device) edits the item. The server advances
+    // the item revision, so this state's next write carries a stale
+    // `lastKnownRevisionDate` and must be refused instead of overwriting the
+    // external value.
+    let external_appdata = directory.join("bw-external");
+    let external_config = run_bw(
+        &bw,
+        &external_appdata,
+        &["config", "server", &base],
+        None,
+        None,
+        None,
+    );
+    assert!(
+        external_config.status.success(),
+        "second-device server configuration failed"
+    );
+    let external_login = run_bw(
+        &bw,
+        &external_appdata,
+        &["login", EMAIL, "--passwordenv", "BW_PASSWORD", "--raw"],
+        Some(PASSWORD),
+        None,
+        None,
+    );
+    assert!(
+        external_login.status.success(),
+        "second-device login failed"
+    );
+    let external_unlock = run_bw(
+        &bw,
+        &external_appdata,
+        &["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
+        Some(PASSWORD),
+        None,
+        None,
+    );
+    assert!(
+        external_unlock.status.success(),
+        "second-device unlock failed"
+    );
+    let external_session =
+        String::from_utf8(external_unlock.stdout).expect("external session is UTF-8");
+    let external_session = external_session.trim();
+
+    let current = run_bw(
+        &bw,
+        &external_appdata,
+        &["get", "item", "DB"],
+        None,
+        Some(external_session),
+        None,
+    );
+    assert!(
+        current.status.success(),
+        "second device could not read the item"
+    );
+    let mut item: Value = serde_json::from_slice(&current.stdout).expect("item JSON");
+    let id = item["id"].as_str().expect("item id").to_owned();
+    item["login"]["password"] = Value::String("external-value".to_owned());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(item.to_string());
+    let external_edit = run_bw(
+        &bw,
+        &external_appdata,
+        &["edit", "item", &id],
+        None,
+        Some(external_session),
+        Some(encoded.as_bytes()),
+    );
+    assert!(
+        external_edit.status.success(),
+        "second device could not edit the item"
+    );
+
+    let refused = client.set(
+        Some("vw"),
+        "DB#password",
+        &Secret::new(b"adapter-value".to_vec()),
+    );
+    let message = match refused {
+        Err(error) => error.to_string(),
+        Ok(()) => panic!("a write with a stale revision must fail"),
+    };
+    assert!(!message.contains("external-value"));
+    assert!(!message.contains("adapter-value"));
+
+    let sync = run_bw(&bw, &appdata, &["sync"], None, Some(session), None);
+    assert!(sync.status.success(), "bw sync failed");
+    let external = client
+        .get(Some("vw"), "DB#password")
+        .expect("read the external value after sync");
+    assert_eq!(external.expose(), b"external-value");
 
     std::fs::remove_dir_all(directory).expect("remove temp dir");
     // `container` is dropped here; testcontainers removes only this container.

@@ -5,6 +5,15 @@
 //! the CLI's JSON in memory. A write sends the complete item to the CLI on
 //! stdin as encoded JSON, so the value never appears in `argv`, and the CLI's
 //! echoed item is discarded rather than printed. Values never echo to an error.
+//!
+//! A write is a whole-item read-modify-write through the CLI. The CLI sends
+//! `lastKnownRevisionDate` from its local copy, and both the Bitwarden server
+//! and Vaultwarden reject a stale revision, so an external client's update
+//! since that copy fails the write instead of being overwritten. That check is
+//! not coordination: the CLI's local copy can be stale until it is synced, a
+//! server may not enforce the check, the check tolerates a one-second
+//! difference, and an update accepted after this one simply wins later. This
+//! adapter does not claim to preserve concurrent external changes.
 
 use std::io::Write;
 use std::path::Path;
@@ -120,7 +129,7 @@ impl VaultwardenProvider {
             .map_err(|_| Error::new("Bitwarden CLI did not finish"))?;
         if !status.success() {
             return Err(Error::new(
-                "Bitwarden CLI failed; is the vault unlocked and BW_SESSION current?",
+                "Bitwarden CLI refused the write; the vault may be locked, the session stale, or the item changed since the last sync",
             ));
         }
         Ok(())
@@ -160,14 +169,15 @@ impl VaultwardenProvider {
             .ok_or_else(|| Error::new(format!("Vaultwarden item {selector:?} was not found")))
     }
 
-    /// Lock identity for writes through this CLI.
+    /// Lock identity for Vaultwarden writes.
     ///
-    /// There is no server address in the configuration; the executable is the
-    /// closest stable, non-secret scope. Two profiles that name the same
-    /// executable serialize their read-modify-write item updates, which is what
-    /// keeps one write from discarding another item field.
+    /// The configuration has no server address, and two profiles can name
+    /// different wrapper scripts that reach the same vault. A per-executable
+    /// identity would let those profiles write concurrently and lose an item
+    /// field, so every Vaultwarden write on this machine shares one
+    /// conservative lock. It is coarser than the vault, never finer.
     fn write_identity(&self) -> String {
-        crate::provider::lock::identity("vaultwarden", &self.command, &[])
+        crate::provider::lock::identity("vaultwarden", "shared", &[])
     }
 
     fn write_item(&self, id: Option<&str>, item: &Value) -> Result<()> {
@@ -236,6 +246,10 @@ impl Provider for VaultwardenProvider {
             })
     }
 
+    /// Writes one field by reading the item, changing that field, and sending
+    /// the whole item back. Sibling fields are preserved within this call.
+    /// Concurrent external clients are not coordinated; the server's revision
+    /// check can reject a stale write, but it is not a guarantee.
     fn set(&self, raw_key: &str, value: &Secret) -> Result<()> {
         let _write_lock = crate::provider::lock::acquire(&self.write_identity())?;
         let key = Key::parse(raw_key)?;

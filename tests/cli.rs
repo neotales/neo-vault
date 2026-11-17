@@ -1933,6 +1933,111 @@ fn write_lock_creates_a_missing_private_directory() {
     assert!(!stderr(&set).contains("new-value"));
 }
 
+#[test]
+fn vaultwarden_profiles_with_different_command_paths_share_one_write_lock() {
+    struct ReleaseOnDrop(std::path::PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("release"), b"release");
+        }
+    }
+
+    let root = tempfile_dir();
+    let _release = ReleaseOnDrop(root.clone());
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    std::fs::create_dir_all(&alpha).expect("alpha directory");
+    std::fs::create_dir_all(&beta).expect("beta directory");
+    for (directory, label) in [(&alpha, "alpha"), (&beta, "beta")] {
+        let script = directory.join("bw");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+root="{root}"
+if mkdir "$root/held" 2>/dev/null; then
+  : > "$root/first-entered"
+  while [ ! -f "$root/release" ]; do sleep 0.1; done
+fi
+printf '%s %s\n' "{label}" "$*" >> "$root/invocations.log"
+case "$*" in
+  *"list items"*) printf '[]' ;;
+  *"create item"*|*"edit item"*) cat > /dev/null ;;
+  *) exit 2 ;;
+esac
+"#,
+                root = root.display(),
+                label = label
+            ),
+        )
+        .expect("write fixture");
+        make_executable(&script);
+        std::fs::write(
+            directory.join(".nsvault.toml"),
+            format!(
+                r#"version = 1
+provider = "v"
+[providers.v]
+kind = "vaultwarden"
+command = "{}"
+session_env = "BW_SESSION"
+"#,
+                script.display()
+            ),
+        )
+        .expect("write config");
+    }
+
+    let alpha_dir = alpha.clone();
+    let first = thread::spawn(move || {
+        run(
+            &alpha_dir,
+            &["set", "ITEM"],
+            &[("BW_SESSION", "test-session")],
+            Some(b"first-value\n"),
+        )
+    });
+    let started = std::time::Instant::now();
+    while !root.join("first-entered").exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the first profile never reached its CLI"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let beta_dir = beta.clone();
+    let second = thread::spawn(move || {
+        run(
+            &beta_dir,
+            &["set", "ITEM"],
+            &[("BW_SESSION", "test-session")],
+            Some(b"second-value\n"),
+        )
+    });
+    thread::sleep(Duration::from_millis(500));
+    let held_invocations =
+        std::fs::read_to_string(root.join("invocations.log")).unwrap_or_default();
+    std::fs::write(root.join("release"), b"release").expect("release the first CLI");
+    let first = first.join().expect("join the first write");
+    let second = second.join().expect("join the second write");
+    assert!(
+        !held_invocations
+            .lines()
+            .any(|line| line.starts_with("beta ")),
+        "the second profile reached its CLI while the first profile held the write lock"
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(second.status.success(), "{}", stderr(&second));
+    for output in [&first, &second] {
+        assert!(!stderr(output).contains("first-value"));
+        assert!(!stderr(output).contains("second-value"));
+    }
+    let invocations =
+        std::fs::read_to_string(root.join("invocations.log")).expect("invocation log");
+    assert!(invocations.lines().any(|line| line.starts_with("alpha ")));
+    assert!(invocations.lines().any(|line| line.starts_with("beta ")));
+}
+
 fn tempfile_dir() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
         "nsvault-test-{}-{}",

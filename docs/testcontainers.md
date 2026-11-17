@@ -145,7 +145,11 @@ executes the pinned CLI. No process-wide environment variable is changed.
 
 The run covers `list`, `get`, `set` on a missing item (create), `set` on
 `#password` (replace with the sibling `#username` and a custom field still
-present), `get` for those siblings, and the refusal of `ensure`.
+present), `get` for those siblings, and the refusal of `ensure`. It then
+starts a second CLI state for the same account, edits `login.password`
+externally, and asserts that the first state's next write fails instead of
+overwriting it; after `bw sync`, the adapter reads the external value back.
+This exercises the server's `lastKnownRevisionDate` check through the CLI.
 
 Run it explicitly:
 
@@ -160,7 +164,7 @@ Observed in this workspace on 2026-11-17, with `NSVAULT_TEST_BW` pointing at
 ```text
 test vaultwarden_reads_and_writes_through_the_cli ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-finished in 179.34s
+finished in 81.26s
 ```
 
 The testcontainers-managed container was gone after the run. The temporary
@@ -186,6 +190,8 @@ and does not reuse the CLI state of the developer running it.
 No production Vault, Infisical, or Vaultwarden server was contacted. The
 Infisical `ensure` remains disabled; the Vaultwarden adapter has no `ensure`,
 and its write path has not been exercised against a current CLI over HTTPS.
+The Vaultwarden test proves the server's stale-revision rejection, not
+coordination of external clients; the README states the residual race.
 Floci does not validate AWS SigV4 signatures, and passing the cloud tests is
 not production verification against AWS, GCP, or Azure. CI does not run
 container tests by default; they are explicit opt-in commands.
