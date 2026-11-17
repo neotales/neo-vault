@@ -4,7 +4,7 @@ An automation-first secrets proxy: resolve a secret from a directory-scoped
 provider without putting the value in `argv`, a log line, or a checked-in file.
 
 The first increment is deliberately small. It implements a CLI, a reusable Rust
-client, a conservative C ABI, directory discovery, shell integration, and seven
+client, a conservative C ABI, directory discovery, shell integration, and ten
 provider kinds. **No adapter has been verified against a live production
 service in this repository.** The verification matrix below states exactly what
 was exercised.
@@ -131,6 +131,9 @@ history still sees exported values, so autoload is a deliberate trade.
 | `vaultwarden` | yes | no | no | `bw` CLI, existing session | Fake `bw` fixture; `bw` not installed here |
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
+| `aws-secrets-manager` | yes | yes | yes | Secrets Manager JSON 1.1 API with local SigV4 signing | Opt-in Floci test against `floci/floci:2.5.0`; signer unit-tested against AWS's published SigV4 vectors; no AWS account |
+| `gcp-secret-manager` | yes | yes | yes | Secret Manager v1 REST API | Opt-in Floci test against `floci/floci-gcp:0.13.0`; no GCP project |
+| `azure-key-vault` | yes | yes | no | Key Vault secrets REST API `7.4` | Opt-in Floci test against `floci/floci-az:0.17.0`; no Azure account. Ensure is unsupported because Key Vault has no conditional create. |
 
 Key grammar:
 
@@ -145,6 +148,12 @@ Key grammar:
 - Proton: item title, optionally `#password` (default), `#username`, or
   another field name. Titles must be unique.
 - GitHub: `SECRET_NAME`; list and set only. The API never returns a value.
+- AWS Secrets Manager: `SECRET_NAME`; no fields. The adapter reads and writes
+  the string value, or reads a base64-encoded binary value.
+- GCP Secret Manager: `SECRET_ID`; no fields, latest version only. Every `set`
+  adds a version.
+- Azure Key Vault: `SECRET_NAME`; no fields, latest version only. Every `set`
+  adds a version.
 
 The phrase "OpenTofu's version" in the request is treated as **OpenBao**, the
 open-source Vault-compatible fork. OpenTofu is a Terraform fork and does not
@@ -166,6 +175,29 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   Dependabot scopes are future work. `ensure` is unsupported: the secrets API
   has one PUT that creates or updates, and a check-then-PUT race would
   overwrite a value this adapter cannot read back.
+- AWS credentials are static for the process lifetime: an access key id, secret
+  access key, and optional session token from named environment variables or
+  owner-only files. There is no STS AssumeRole, IMDS, credential-provider
+  chain, or refresh. SigV4 signing is implemented locally; the emulator does
+  not reject an unsigned request, so the emulator test does not prove AWS would
+  accept the signature. The signer is unit-tested against AWS's published
+  `get-vanilla` and `post-vanilla-query` vectors. No AWS account was used.
+- GCP authentication is a static OAuth 2.0 access token from a named
+  environment variable or owner-only file. There is no Application Default
+  Credentials, service-account JWT exchange, impersonation, or refresh, so a
+  long-running process fails when the token expires. `allow_anonymous` exists
+  only for a loopback emulator and is refused for any non-loopback endpoint.
+  No GCP project was used.
+- Azure authentication is a static bearer token from a named environment
+  variable or owner-only file. There is no Microsoft Entra ID
+  client-credential flow, managed identity, challenge-based auth, or refresh.
+  `ensure` is unsupported because Key Vault has no conditional create and a
+  check-then-PUT would race. Only the latest secret version is read. No Azure
+  account was used.
+- The cloud emulator tests prove that these adapters speak the pinned Floci
+  images' wire protocols. They do not prove production authentication, IAM
+  policy enforcement, quota behavior, regional endpoints, or service edge
+  cases.
 - `ensure` without `#field` treats an existing Vault/OpenBao path as present,
   even when the `value` field is missing and even when the latest version is
   soft-deleted. It does not undelete or add fields in that form. `#field`
@@ -244,8 +276,10 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
 - `search` is a name operation. It does not call a value endpoint.
 - Redirects are disabled for provider HTTP requests, so an authorization header
   is not forwarded to a second origin.
-- `set` and `ensure` take a same-user advisory file lock on this machine
-  before they contact the provider. The lock identity is a hash of the
+- Vault/OpenBao and GitHub `set`/`ensure` take a same-user advisory file lock
+  on this machine before they contact the provider. Infisical and the cloud
+  adapters rely on their provider's own create/version semantics instead. The
+  lock identity is a hash of the
   canonical address plus non-secret scope (Vault/OpenBao: mount and
   namespace, shared across those two kind labels; Infisical: project,
   environment, and folder; GitHub: owner and repository). Profile names and
@@ -274,29 +308,53 @@ Vault has an opt-in, isolated testcontainers test pinned to
 cargo test --test container_vault -- --ignored --nocapture
 ```
 
-It ran successfully here and removed only its own container. Vaultwarden and
-Infisical container tests are deferred with concrete prerequisites in
-[`docs/testcontainers.md`](docs/testcontainers.md); no test is claimed for them.
-Container tests do not run in the default gate.
+The three cloud adapters have opt-in Floci tests pinned to release images:
+
+```sh
+cargo test --test container_cloud -- --ignored --nocapture
+```
+
+It starts `floci/floci:2.5.0`, `floci/floci-gcp:0.13.0`, and
+`floci/floci-az:0.17.0` on random loopback-mapped ports, writes only obviously
+fake fixture values, and lets testcontainers remove only those containers.
+Azure Functions is disabled in the Azure container so no Docker socket is
+needed. Vaultwarden and Infisical container tests are deferred with concrete
+prerequisites in [`docs/testcontainers.md`](docs/testcontainers.md); no test is
+claimed for them. Container tests do not run in the default gate.
 
 ## Floci / cloud emulation
 
-Floci's AWS Secrets Manager, GCP Secret Manager, and Azure Key Vault emulation
-are confirmed by the vendor documentation, but this increment has no AWS, GCP,
-or Azure provider to test. The tool is not installed here, no emulator was
-started, and no Docker cleanup was performed. See
-[`docs/floci.md`](docs/floci.md) for the support evidence and the conditional
-test plan. A cloud provider stays "unimplemented" or "fixture-only" until that
-plan actually runs.
+The AWS Secrets Manager, GCP Secret Manager, and Azure Key Vault adapters are
+implemented and exercised against pinned Floci release images. The Floci CLI
+was not installed; the images were pulled and run directly with Docker:
+
+```sh
+docker pull floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+docker pull floci/floci-gcp:0.13.0@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
+docker pull floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
+
+docker run -d --rm --name nsvault-floci-aws -p 127.0.0.1:4566:4566 \
+  floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+docker run -d --rm --name nsvault-floci-gcp -p 127.0.0.1:4588:4588 \
+  floci/floci-gcp:0.13.0@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
+docker run -d --rm --name nsvault-floci-az \
+  -e FLOCI_AZ_SERVICES_FUNCTIONS_ENABLED=false -p 127.0.0.1:4577:4577 \
+  floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
+```
+
+The opt-in test and a manual CLI run covered list, get, set, ensure (AWS and
+GCP), Azure's refused ensure, and search. Exact commands, outputs, and
+limitations are in [`docs/floci.md`](docs/floci.md). No global Docker cleanup
+was performed. These tests do not make the adapters "production verified": the
+emulator does not validate AWS SigV4 signatures, and it does not prove real
+cloud authentication, IAM, quotas, or regional behavior.
 
 ## Roadmap
 
 The provider boundary is a Rust trait plus one configuration variant and one
 metadata row. Future adapters, **none of which are implemented today**:
 
-- Azure Key Vault
-- AWS Secrets Manager / SSM Parameter Store
-- Google Cloud Secret Manager
+- AWS SSM Parameter Store (Secrets Manager is implemented)
 - Cloudflare Secrets Store
 - 1Password (Service Accounts / Connect)
 - Bitwarden Secrets Manager
@@ -335,14 +393,38 @@ into a child environment; it does not rewrite request bodies.
 
 ## Verification in this change
 
-Run and reported:
+Run in this worktree on 2026-11-17:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release --lib
-cc examples/ffi_smoke.c ... && /tmp/nsvault-ffi-smoke
+cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
+   -Wl,-rpath,"$PWD/target/release" -o <tmp>/nsvault-ffi-smoke
+<tmp>/nsvault-ffi-smoke
 ```
 
-See the final report for the exact counts and any caveats.
+Observed:
+
+```text
+cargo fmt --check                         clean
+cargo clippy --all-targets -- -D warnings clean
+cargo test                                46 lib + 16 CLI + 3 FFI passed;
+                                          0 failed; 3 cloud + 1 Vault
+                                          container tests ignored
+cargo build --release --lib               succeeded
+C ABI smoke                               exit 0, "redacted error received
+                                          (34 bytes)"
+```
+
+The opt-in cloud emulator test also passed:
+
+```sh
+cargo test --test container_cloud -- --ignored --nocapture
+# 3 passed; 0 failed
+```
+
+The C ABI binary was written under a private cache directory because `/tmp` on
+this machine was at a per-process disk quota; the compile and link command was
+otherwise the documented one. No claim here covers a live cloud service.
