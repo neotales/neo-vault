@@ -17,5 +17,5 @@ mod shell;
 
 pub use api::Client;
 pub use error::{Error, Result};
-pub use provider::ListedKey;
+pub use provider::{EnsureStatus, ListedKey};
 pub use secret::Secret;

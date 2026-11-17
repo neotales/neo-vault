@@ -105,6 +105,30 @@ fn dispatch(cli: Cli) -> Result<u8> {
             eprintln!("nsvault: stored {key}");
             Ok(0)
         }
+        Command::Ensure {
+            key,
+            field,
+            stdin,
+            json,
+        } => {
+            let config = require_config(config)?;
+            let selected = provider::select(&config, cli.provider.as_deref())?;
+            let key = apply_field(&key, field.as_deref())?;
+            if !selected.provider.capabilities().ensure {
+                return Err(crate::error::unsupported("ensure", &selected.name));
+            }
+            let secret = read_secret(stdin)?;
+            let status = selected.provider.ensure(&key, &secret)?;
+            let label = match status {
+                provider::EnsureStatus::Created => "created",
+                provider::EnsureStatus::Present => "present",
+            };
+            if json {
+                println!(r#"{{"status":"{label}"}}"#);
+            }
+            eprintln!("nsvault: {label} {key}");
+            Ok(0)
+        }
         Command::Search { query, limit, json } => {
             let config = require_config(config)?;
             let selected = provider::select(&config, cli.provider.as_deref())?;
@@ -335,34 +359,43 @@ fn run_child(command: &[String], exports: &[Export]) -> Result<u8> {
 
 fn list_providers(config: &Config) {
     for (name, profile) in &config.document.providers {
-        let (kind, read, write, available) = describe(profile);
+        let (kind, read, write, ensure, available) = describe(profile);
         let marker = if available {
             ""
         } else {
             " (command unavailable)"
         };
-        println!("{name}\t{kind}\tread={read}\twrite={write}{marker}");
+        println!("{name}\t{kind}\tread={read}\twrite={write}\tensure={ensure}{marker}");
     }
 }
 
-fn describe(profile: &ProviderConfig) -> (&'static str, bool, bool, bool) {
+fn describe(profile: &ProviderConfig) -> (&'static str, bool, bool, bool, bool) {
     match profile {
-        ProviderConfig::Vault(_) => ("vault", true, true, true),
-        ProviderConfig::Openbao(_) => ("openbao", true, true, true),
-        ProviderConfig::Keepass(config) => {
-            ("keepass", true, false, command_available(&config.command))
-        }
-        ProviderConfig::Infisical(_) => ("infisical", true, true, true),
+        ProviderConfig::Vault(_) => ("vault", true, true, true, true),
+        ProviderConfig::Openbao(_) => ("openbao", true, true, true, true),
+        ProviderConfig::Keepass(config) => (
+            "keepass",
+            true,
+            false,
+            false,
+            command_available(&config.command),
+        ),
+        ProviderConfig::Infisical(_) => ("infisical", true, true, true, true),
         ProviderConfig::Vaultwarden(config) => (
             "vaultwarden",
             true,
             false,
+            false,
             command_available(&config.command),
         ),
-        ProviderConfig::Proton(config) => {
-            ("proton", true, false, command_available(&config.command))
-        }
-        ProviderConfig::Github(_) => ("github", false, true, true),
+        ProviderConfig::Proton(config) => (
+            "proton",
+            true,
+            false,
+            false,
+            command_available(&config.command),
+        ),
+        ProviderConfig::Github(_) => ("github", false, true, false, true),
     }
 }
 

@@ -54,6 +54,23 @@ pub enum Command {
         #[arg(long)]
         newline: bool,
     },
+    /// Create a secret from stdin when the provider confirms it is absent.
+    ///
+    /// Does not replace an existing secret and does not delete. Providers
+    /// without a race-safe create-if-absent path refuse this command.
+    Ensure {
+        /// Key, optionally with a `#field` suffix.
+        key: String,
+        /// Field name, as an alternative to `key#field`.
+        #[arg(long)]
+        field: Option<String>,
+        /// Read from stdin even when stdin is a terminal.
+        #[arg(long)]
+        stdin: bool,
+        /// Print `{"status":"created"}` or `{"status":"present"}`. Never a value.
+        #[arg(long)]
+        json: bool,
+    },
     /// Read a secret from stdin (or a hidden prompt) and write it to the provider.
     Set {
         /// Key, optionally with a `#field` suffix.

@@ -281,6 +281,57 @@ pub unsafe extern "C" fn nsvault_set(
     })
 }
 
+/// Creates a secret when it is absent. Does not return the value.
+///
+/// # Safety
+///
+/// `client` must be a live handle. `provider` may be null. `key` must be a
+/// NUL-terminated UTF-8 string. If `len` is non-zero, `value` must point at
+/// `len` readable bytes. `created` may be null; when it is not, it must be
+/// writable. The bytes must not overlap `client` or `created`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsvault_ensure(
+    client: *const NsvaultClient,
+    provider: *const c_char,
+    key: *const c_char,
+    value: *const u8,
+    len: usize,
+    created: *mut c_int,
+) -> c_int {
+    guard(|| {
+        if client.is_null() {
+            return Err(Error::new("client must not be null"));
+        }
+        if len == 0 || value.is_null() {
+            return Err(Error::new("refusing to store an empty secret"));
+        }
+        if len > 8 * 1024 * 1024 {
+            return Err(Error::new("secret value exceeds the 8 MiB limit"));
+        }
+        // SAFETY: the caller contract requires valid optional strings.
+        let provider = unsafe { optional_string(provider, "provider") }?;
+        let key = unsafe { required_string(key, "key") }?;
+        // SAFETY: the caller contract guarantees `len` readable bytes.
+        let bytes = unsafe { slice::from_raw_parts(value, len) };
+        let secret = Secret::new(bytes.to_vec());
+        if secret.expose().contains(&0) {
+            return Err(Error::new("secret value must not contain NUL"));
+        }
+        // SAFETY: checked non-null above.
+        let client = unsafe { &*client };
+        let status = client.client.ensure(provider.as_deref(), &key, &secret)?;
+        if !created.is_null() {
+            let flag = match status {
+                crate::EnsureStatus::Created => 1,
+                crate::EnsureStatus::Present => 0,
+            };
+            // SAFETY: caller provided a writable int.
+            unsafe { *created = flag };
+        }
+        Ok(())
+    })
+}
+
 /// Copies the last error message for the calling thread into `out`.
 ///
 /// Returns `1` when a message was copied and `0` when there is none.

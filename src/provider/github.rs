@@ -14,7 +14,9 @@ use serde_json::json;
 use crate::config::GithubConfig;
 use crate::error::{Error, Result, unsupported};
 use crate::key::Key;
-use crate::provider::{Capabilities, HttpClient, ListedKey, Provider, endpoint, load_credential};
+use crate::provider::{
+    Capabilities, EnsureStatus, HttpClient, ListedKey, Provider, endpoint, load_credential,
+};
 use crate::secret::Secret;
 
 const PER_PAGE: u32 = 100;
@@ -133,6 +135,17 @@ impl GithubProvider {
             .map_err(|_| Error::new("GitHub public key has the wrong length"))?;
         Ok((PublicKey::from_bytes(bytes), key.key_id))
     }
+
+    fn write_identity(&self) -> Result<String> {
+        let origin = crate::provider::lock::canonical_origin(&self.base)?;
+        let owner = self.owner.to_ascii_lowercase();
+        let repo = self.repo.to_ascii_lowercase();
+        Ok(crate::provider::lock::identity(
+            "github-actions",
+            &origin,
+            &[&owner, &repo],
+        ))
+    }
 }
 
 impl Provider for GithubProvider {
@@ -149,6 +162,7 @@ impl Provider for GithubProvider {
             read: false,
             write: true,
             list: true,
+            ensure: false,
         }
     }
 
@@ -202,6 +216,7 @@ impl Provider for GithubProvider {
                 "GitHub secret names must start with a letter or '_' and contain only letters, digits, and '_'",
             ));
         }
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let (public_key, key_id) = self.public_key()?;
         let encrypted = public_key
             .seal(&mut OsRng, value.expose())
@@ -225,6 +240,16 @@ impl Provider for GithubProvider {
         )?;
         let response = self.request("PUT", &url, Some(body.as_bytes()))?;
         self.map_status(response.status, key.path())
+    }
+
+    fn ensure(&self, _key: &str, _value: &Secret) -> Result<EnsureStatus> {
+        // The Actions secrets API exposes one PUT that creates or updates.
+        // A list-then-PUT race would overwrite a secret this process cannot
+        // read back. There is no create-if-absent or conditional header.
+        Err(crate::error::unsupported(
+            "ensure (GitHub secret writes are unconditional updates)",
+            &self.name,
+        ))
     }
 }
 

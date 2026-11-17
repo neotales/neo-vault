@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::config::InfisicalConfig;
 use crate::error::{Error, Result};
 use crate::key::Key;
-use crate::provider::{Capabilities, HttpClient, ListedKey, Provider, endpoint};
+use crate::provider::{Capabilities, EnsureStatus, HttpClient, ListedKey, Provider, endpoint};
 use crate::secret::Secret;
 
 /// Infisical provider.
@@ -149,6 +149,15 @@ impl InfisicalProvider {
             ))),
         }
     }
+
+    fn write_identity(&self) -> Result<String> {
+        let origin = crate::provider::lock::canonical_origin(&self.base)?;
+        Ok(crate::provider::lock::identity(
+            "infisical",
+            &origin,
+            &[&self.project_id, &self.environment, &self.path],
+        ))
+    }
 }
 
 impl Provider for InfisicalProvider {
@@ -161,7 +170,12 @@ impl Provider for InfisicalProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::READ_WRITE
+        Capabilities {
+            read: true,
+            write: true,
+            list: true,
+            ensure: true,
+        }
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>> {
@@ -254,6 +268,7 @@ impl Provider for InfisicalProvider {
     }
 
     fn set(&self, raw_key: &str, value: &Secret) -> Result<()> {
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let key = Key::parse(raw_key)?;
         if key.field().is_some() {
             return Err(Error::new(
@@ -295,6 +310,104 @@ impl Provider for InfisicalProvider {
             Some(body.as_bytes()),
         )?;
         self.map_status(response.status, key.path())
+    }
+
+    fn ensure(&self, raw_key: &str, value: &Secret) -> Result<EnsureStatus> {
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
+        let key = Key::parse(raw_key)?;
+        if key.field().is_some() {
+            return Err(Error::new(
+                "Infisical keys do not have fields; use the secret name directly",
+            ));
+        }
+        let text = std::str::from_utf8(value.expose())
+            .map_err(|_| Error::new("Infisical values must be UTF-8 text"))?;
+        if text.is_empty() {
+            return Err(Error::new("refusing to store an empty secret"));
+        }
+        let token = self.token()?;
+        let url = self.secret_url(key.path())?;
+        // Status only. The body may contain a value and is not parsed or logged.
+        let existing = self.client.request(
+            "GET",
+            &url,
+            Some(("Authorization", &token)),
+            &[],
+            "application/json",
+            None,
+        )?;
+        match existing.status {
+            200 => return Ok(EnsureStatus::Present),
+            404 => {}
+            401 | 403 => {
+                return Err(Error::new(format!(
+                    "Infisical denied access to {:?}",
+                    key.path()
+                )));
+            }
+            status => {
+                return Err(Error::new(format!(
+                    "Infisical returned HTTP {status} for {:?}; not treating that as absence",
+                    key.path()
+                )));
+            }
+        }
+        // Documented Create, not the Update PATCH. A duplicate is expected to
+        // fail rather than upsert. This repository has not verified that
+        // against a live Infisical server.
+        let body = json!({
+            "projectId": &self.project_id,
+            "environment": &self.environment,
+            "secretPath": &self.path,
+            "secretValue": text,
+            "type": "shared",
+            "skipMultilineEncoding": true,
+        })
+        .to_string();
+        let created = self.client.request(
+            "POST",
+            &url,
+            Some(("Authorization", &token)),
+            &[],
+            "application/json",
+            Some(body.as_bytes()),
+        )?;
+        match created.status {
+            200 | 201 => Ok(EnsureStatus::Created),
+            400 | 409 => {
+                let again = self.client.request(
+                    "GET",
+                    &url,
+                    Some(("Authorization", &token)),
+                    &[],
+                    "application/json",
+                    None,
+                )?;
+                match again.status {
+                    200 => Ok(EnsureStatus::Present),
+                    404 => Err(Error::new(format!(
+                        "Infisical refused to create {:?} and the key is still absent",
+                        key.path()
+                    ))),
+                    401 | 403 => Err(Error::new(format!(
+                        "Infisical denied access to {:?}",
+                        key.path()
+                    ))),
+                    status => Err(Error::new(format!(
+                        "Infisical returned HTTP {status} for {:?} after a create conflict",
+                        key.path()
+                    ))),
+                }
+            }
+            401 | 403 => Err(Error::new(format!(
+                "Infisical denied access to {:?}",
+                key.path()
+            ))),
+            status => Err(Error::new(format!(
+                "Infisical returned HTTP {status} creating {:?}; not treating that as absence",
+                key.path()
+            ))),
+        }
     }
 }
 

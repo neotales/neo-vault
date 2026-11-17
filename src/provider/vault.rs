@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use crate::config::VaultConfig;
 use crate::error::{Error, Result};
 use crate::key::Key;
-use crate::provider::{Capabilities, HttpClient, ListedKey, Provider, endpoint, load_credential};
+use crate::provider::{
+    Capabilities, EnsureStatus, HttpClient, ListedKey, Provider, endpoint, load_credential,
+};
 use crate::secret::Secret;
 
 /// Vault product label.
@@ -75,9 +77,27 @@ impl VaultProvider {
         })
     }
 
+    fn write_identity(&self) -> Result<String> {
+        let origin = crate::provider::lock::canonical_origin(&self.base)?;
+        let mount = self.mount.trim().trim_matches('/');
+        let namespace = self.namespace.as_deref().unwrap_or("").trim();
+        Ok(crate::provider::lock::identity(
+            "kv2",
+            &origin,
+            &[mount, namespace],
+        ))
+    }
+
     fn data_url(&self, path: &str) -> Result<url::Url> {
         let segments = split_path(path)?;
         let mut parts = vec!["v1", self.mount.as_str(), "data"];
+        parts.extend(segments.iter().map(String::as_str));
+        endpoint(&self.base, &parts)
+    }
+
+    fn subkeys_url(&self, path: &str) -> Result<url::Url> {
+        let segments = split_path(path)?;
+        let mut parts = vec!["v1", self.mount.as_str(), "subkeys"];
         parts.extend(segments.iter().map(String::as_str));
         endpoint(&self.base, &parts)
     }
@@ -128,6 +148,161 @@ impl VaultProvider {
             ))),
             _ => Err(Error::new(format!(
                 "{} returned HTTP {status} for {key:?}",
+                self.flavor.kind()
+            ))),
+        }
+    }
+
+    /// Reads KV v2 metadata only. `Ok(None)` is a confirmed 404. Every other
+    /// failure is an error, including a body that cannot be parsed.
+    fn metadata_version(&self, path: &str) -> Result<Option<u64>> {
+        let url = self.metadata_url(path)?;
+        let response = self.request("GET", &url, None)?;
+        match response.status {
+            404 => Ok(None),
+            200 => {
+                #[derive(Deserialize)]
+                struct Envelope {
+                    data: Option<Meta>,
+                }
+                #[derive(Deserialize)]
+                struct Meta {
+                    #[serde(default)]
+                    current_version: u64,
+                }
+                let envelope: Envelope = HttpClient::json(&response)?;
+                Ok(Some(
+                    envelope.data.map(|meta| meta.current_version).unwrap_or(0),
+                ))
+            }
+            401 | 403 => Err(Error::new(format!(
+                "{} denied access to {path:?}",
+                self.flavor.kind()
+            ))),
+            status => Err(Error::new(format!(
+                "{} returned HTTP {status} for metadata {path:?}; not treating that as absence",
+                self.flavor.kind()
+            ))),
+        }
+    }
+
+    /// Field names only. Subkeys replaces leaf values with null, so this does
+    /// not read a secret value. A 404 here is not absence when metadata exists.
+    fn field_present(&self, path: &str, field: &str) -> Result<bool> {
+        let url = self.subkeys_url(path)?;
+        let response = self.request("GET", &url, None)?;
+        match response.status {
+            200 => {
+                #[derive(Deserialize)]
+                struct Envelope {
+                    #[serde(default)]
+                    subkeys: serde_json::Map<String, Value>,
+                }
+                let envelope: Envelope = HttpClient::json(&response)?;
+                Ok(envelope.subkeys.contains_key(field))
+            }
+            401 | 403 => Err(Error::new(format!(
+                "{} denied access to {path:?}",
+                self.flavor.kind()
+            ))),
+            404 => Err(Error::new(format!(
+                "{} has metadata for {path:?} but subkeys are unavailable; refusing to treat that as field absence",
+                self.flavor.kind()
+            ))),
+            status => Err(Error::new(format!(
+                "{} returned HTTP {status} for subkeys {path:?}; not treating that as absence",
+                self.flavor.kind()
+            ))),
+        }
+    }
+
+    fn create_if_absent(
+        &self,
+        path: &str,
+        field: Option<&str>,
+        text: &str,
+    ) -> Result<EnsureStatus> {
+        let field_name = field.unwrap_or("value");
+        let url = self.data_url(path)?;
+        let body = json!({
+            "data": { field_name: text },
+            "options": { "cas": 0 }
+        })
+        .to_string();
+        let response = self.request("POST", &url, Some(body.as_bytes()))?;
+        match response.status {
+            200 | 204 => Ok(EnsureStatus::Created),
+            400 | 409 => self.after_create_conflict(path, field, text),
+            401 | 403 => Err(Error::new(format!(
+                "{} denied access to {path:?}",
+                self.flavor.kind()
+            ))),
+            status => Err(Error::new(format!(
+                "{} returned HTTP {status} creating {path:?}; not treating that as absence",
+                self.flavor.kind()
+            ))),
+        }
+    }
+
+    fn after_create_conflict(
+        &self,
+        path: &str,
+        field: Option<&str>,
+        text: &str,
+    ) -> Result<EnsureStatus> {
+        // CAS 0 lost. Do not POST again. A path-level ensure stops here.
+        // A field ensure may still add that field with its own CAS.
+        match (self.metadata_version(path)?, field) {
+            (None, _) => Err(Error::new(format!(
+                "{} refused to create {path:?} with CAS 0 and the key is still absent",
+                self.flavor.kind()
+            ))),
+            (Some(_), None) => Ok(EnsureStatus::Present),
+            (Some(_), Some(field)) => self.ensure_missing_field(path, field, text),
+        }
+    }
+
+    fn ensure_missing_field(&self, path: &str, field: &str, text: &str) -> Result<EnsureStatus> {
+        if self.field_present(path, field)? {
+            return Ok(EnsureStatus::Present);
+        }
+        let Some(version) = self.metadata_version(path)? else {
+            return Err(Error::new(format!(
+                "{} key {path:?} disappeared before a conditional field write",
+                self.flavor.kind()
+            )));
+        };
+        if version == 0 {
+            return Err(Error::new(format!(
+                "{} has no current version for {path:?}; refusing an unconditional field write",
+                self.flavor.kind()
+            )));
+        }
+        let url = self.data_url(path)?;
+        let body = json!({
+            "data": { field: text },
+            "options": { "cas": version }
+        })
+        .to_string();
+        let response = self.request("PATCH", &url, Some(body.as_bytes()))?;
+        match response.status {
+            200 | 204 => Ok(EnsureStatus::Created),
+            400 | 409 => {
+                if self.field_present(path, field)? {
+                    Ok(EnsureStatus::Present)
+                } else {
+                    Err(Error::new(format!(
+                        "{} lost a CAS race adding field {field:?} on {path:?} and the field is still absent",
+                        self.flavor.kind()
+                    )))
+                }
+            }
+            401 | 403 => Err(Error::new(format!(
+                "{} denied access to {path:?}",
+                self.flavor.kind()
+            ))),
+            status => Err(Error::new(format!(
+                "{} returned HTTP {status} patching {path:?}; the existing secret was not replaced",
                 self.flavor.kind()
             ))),
         }
@@ -201,7 +376,12 @@ impl Provider for VaultProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::READ_WRITE
+        Capabilities {
+            read: true,
+            write: true,
+            list: true,
+            ensure: true,
+        }
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>> {
@@ -238,6 +418,7 @@ impl Provider for VaultProvider {
     }
 
     fn set(&self, raw_key: &str, value: &Secret) -> Result<()> {
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
         let key = Key::parse(raw_key)?;
         let text = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("Vault values must be UTF-8 text"))?;
@@ -270,6 +451,25 @@ impl Provider for VaultProvider {
             return self.map_status(response.status, key.path());
         }
         self.map_status(response.status, key.path())
+    }
+
+    fn ensure(&self, raw_key: &str, value: &Secret) -> Result<EnsureStatus> {
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
+        let key = Key::parse(raw_key)?;
+        let text = std::str::from_utf8(value.expose())
+            .map_err(|_| Error::new("Vault values must be UTF-8 text"))?;
+        if text.is_empty() {
+            return Err(Error::new("refusing to store an empty secret"));
+        }
+        // A path with no `#field` is the secret itself. Metadata existence is
+        // enough; this does not add a missing `value` field to an existing
+        // secret, because that would be a write. `#field` uses the subkeys
+        // API so the check does not fetch values, then a CAS patch.
+        match (self.metadata_version(key.path())?, key.field()) {
+            (None, field) => self.create_if_absent(key.path(), field, text),
+            (Some(_), None) => Ok(EnsureStatus::Present),
+            (Some(_), Some(field)) => self.ensure_missing_field(key.path(), field, text),
+        }
     }
 }
 
