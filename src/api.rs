@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::provider::{self, ListedKey};
+use crate::provider::{self, EnsureStatus, ListedKey};
 use crate::secret::Secret;
 
 /// A configured, reusable secrets client.
@@ -62,5 +62,20 @@ impl Client {
     pub fn set(&self, selected: Option<&str>, key: &str, value: &Secret) -> Result<()> {
         let provider = provider::select(&self.config, selected)?;
         provider.provider.set(key, value)
+    }
+
+    /// Creates a secret when it is absent and leaves an existing secret unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration or provider error. An error is not absence.
+    pub fn ensure(
+        &self,
+        selected: Option<&str>,
+        key: &str,
+        value: &Secret,
+    ) -> Result<EnsureStatus> {
+        let provider = provider::select(&self.config, selected)?;
+        provider.provider.ensure(key, value)
     }
 }

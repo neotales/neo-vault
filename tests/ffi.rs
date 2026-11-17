@@ -5,8 +5,8 @@
 use std::ffi::{CString, c_char};
 
 use nsvault::ffi::{
-    NsvaultBytes, nsvault_bytes_free, nsvault_client_close, nsvault_client_open, nsvault_get,
-    nsvault_last_error, nsvault_list, nsvault_set,
+    NsvaultBytes, nsvault_bytes_free, nsvault_client_close, nsvault_client_open, nsvault_ensure,
+    nsvault_get, nsvault_last_error, nsvault_list, nsvault_set,
 };
 
 fn temp_config(contents: &str) -> std::path::PathBuf {
@@ -154,6 +154,20 @@ fn ffi_refuses_an_empty_value() {
     let status =
         unsafe { nsvault_set(client, std::ptr::null(), key.as_ptr(), std::ptr::null(), 0) };
     assert_eq!(status, 1);
+    let mut created = 7;
+    // SAFETY: the client is live; the value pointer is null with len 0.
+    let status = unsafe {
+        nsvault_ensure(
+            client,
+            std::ptr::null(),
+            key.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut created,
+        )
+    };
+    assert_eq!(status, 1);
+    assert_eq!(created, 7);
     // SAFETY: the client was opened once and is closed once.
     unsafe { nsvault_client_close(client) };
 }

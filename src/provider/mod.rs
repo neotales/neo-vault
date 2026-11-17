@@ -1,5 +1,8 @@
 //! Provider boundary, shared credential loading, and HTTP helpers.
 
+#[allow(unsafe_code)]
+mod lock;
+
 pub mod github;
 pub mod infisical;
 pub mod keepass;
@@ -39,15 +42,29 @@ impl ListedKey {
     }
 }
 
+/// Result of a create-if-absent write.
+///
+/// Neither variant carries a secret. `Present` means the provider confirmed
+/// the key already existed and this call did not write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnsureStatus {
+    /// This call created the key.
+    Created,
+    /// The key was already present. The existing value was not read or replaced.
+    Present,
+}
+
 /// What a provider can do in this build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities {
     /// Values can be read.
     pub read: bool,
-    /// Values can be written.
+    /// Values can be written, including over an existing key.
     pub write: bool,
     /// Names can be enumerated without reading values.
     pub list: bool,
+    /// Create-if-absent is implemented and will not overwrite.
+    pub ensure: bool,
 }
 
 impl Capabilities {
@@ -56,13 +73,17 @@ impl Capabilities {
         read: true,
         write: false,
         list: true,
+        ensure: false,
     };
 
-    /// Read and write capabilities.
+    /// Read and write capabilities. `ensure` stays false until the adapter
+    /// has a race-safe create-if-absent path.
+    #[allow(dead_code)]
     pub const READ_WRITE: Self = Self {
         read: true,
         write: true,
         list: true,
+        ensure: false,
     };
 }
 
@@ -86,6 +107,15 @@ pub trait Provider: Send + Sync {
     /// Writes one value. The default is an explicit unsupported error.
     fn set(&self, _key: &str, _value: &Secret) -> Result<()> {
         Err(crate::error::unsupported("set", self.name()))
+    }
+
+    /// Creates a key only when the provider confirms it is absent.
+    ///
+    /// The default is unsupported. An implementation must not treat an auth,
+    /// network, or ambiguous error as absence, and must not overwrite a key
+    /// that appears during a race. There is no delete path on this trait.
+    fn ensure(&self, _key: &str, _value: &Secret) -> Result<EnsureStatus> {
+        Err(crate::error::unsupported("ensure", self.name()))
     }
 }
 

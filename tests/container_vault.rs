@@ -105,6 +105,35 @@ allow_http_loopback = true
         .expect("read sibling");
     assert_eq!(user.expose(), b"alice");
 
+    let created = client
+        .ensure(Some("v"), "apps/prod/fresh", &Secret::new(b"once".to_vec()))
+        .expect("ensure create");
+    assert_eq!(created, nsvault::EnsureStatus::Created);
+    let present = client
+        .ensure(
+            Some("v"),
+            "apps/prod/fresh",
+            &Secret::new(b"twice".to_vec()),
+        )
+        .expect("ensure present");
+    assert_eq!(present, nsvault::EnsureStatus::Present);
+    let fresh = client
+        .get(Some("v"), "apps/prod/fresh")
+        .expect("read ensured secret");
+    assert_eq!(fresh.expose(), b"once");
+    let note = client
+        .ensure(
+            Some("v"),
+            "apps/prod/db#note",
+            &Secret::new(b"kept".to_vec()),
+        )
+        .expect("ensure field");
+    assert_eq!(note, nsvault::EnsureStatus::Created);
+    let user = client
+        .get(Some("v"), "apps/prod/db#user")
+        .expect("sibling after field ensure");
+    assert_eq!(user.expose(), b"alice");
+
     std::fs::remove_dir_all(directory).expect("remove temp dir");
     // `container` is dropped here; testcontainers removes only this container.
 }

@@ -11,8 +11,10 @@
  *     nsvault_last_error to copy a redacted message for the current thread.
  *   - The last error is consumed by nsvault_last_error and is valid until the
  *     next FFI call on that thread.
- *   - A client may be used concurrently for reads/list/set, but
+ *   - A client may be used concurrently for reads/list/set/ensure, but
  *     nsvault_client_close must not race with another call on the same handle.
+ *   - set and ensure take a same-user advisory lock on this machine. It does
+ *     not exclude writers that are not nsvault.
  *
  * Status: 0 = success, 1 = error (or, for nsvault_last_error, 1 = message).
  * Build:  cargo build --release --lib
@@ -72,6 +74,19 @@ int nsvault_set(const NsvaultClient *client,
                 const char *key,
                 const uint8_t *value,
                 size_t value_len);
+
+/*
+ * Creates a secret only when the provider confirms it is absent. Does not
+ * replace an existing secret and does not delete. On success, if created is
+ * non-NULL, *created is 1 when this call created the secret and 0 when it was
+ * already present. The value is never copied to an output buffer.
+ */
+int nsvault_ensure(const NsvaultClient *client,
+                   const char *provider,
+                   const char *key,
+                   const uint8_t *value,
+                   size_t value_len,
+                   int *created);
 
 /* Copies the current thread's last redacted error, if any. */
 int nsvault_last_error(NsvaultBytes *out);

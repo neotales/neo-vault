@@ -18,7 +18,10 @@ The test covers the security fixes directly: after writing `value` and a
 sibling `user` field, it replaces `value` without `#field` and asserts that
 `user` survives. This proves the adapter uses a merge patch for an existing
 secret, not a whole-secret POST replacement. The initial create also exercises
-the Vault KV v2 CAS 0 create body on a real server.
+the Vault KV v2 CAS 0 create body on a real server. The same run then calls
+`ensure` for a missing path and again with a different value, and asserts the
+second call leaves the first value in place. It also ensures a missing field
+on the existing secret and checks the sibling field is still there.
 
 Run it explicitly:
 
@@ -26,11 +29,12 @@ Run it explicitly:
 cargo test --test container_vault -- --ignored --nocapture
 ```
 
-Observed in this workspace on 2026-11-17:
+Observed in this workspace on 2026-11-17, including the ensure checks above:
 
 ```text
 test vault_kv_v2_round_trip_preserves_sibling_fields ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+finished in 44.41s
 ```
 
 The testcontainers-managed container was gone after the run. The pulled image

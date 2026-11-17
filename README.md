@@ -81,6 +81,7 @@ not accepted; use `token_env`, `token_file`, `password_env`, or
 nsvault ls [PREFIX]                 # names only, no values
 nsvault get KEY [--field FIELD]     # exact bytes to stdout
 nsvault set KEY                     # value from stdin or a hidden prompt
+nsvault ensure KEY                  # create only if the provider confirms absence
 nsvault search QUERY                # names only
 nsvault exec -- CMD [ARGS...]       # secrets in the child environment
 nsvault x -- CMD [ARGS...]          # alias
@@ -93,6 +94,12 @@ nsvault dir                         # nearest configuration directory
 
 `get` prints the exact value with no trailing newline unless `--newline` is
 given. `set` refuses to take a value as an argument and refuses an empty value.
+`ensure` uses the same stdin or hidden-prompt input. It creates the key only
+when the provider confirms the key is absent, and it leaves an existing key
+unchanged. It never deletes. Success writes no secret to stdout. `--json`
+prints `{"status":"created"}` or `{"status":"present"}` and nothing else.
+Auth, network, and other ambiguous errors are failures, not absence. There is
+no `remove` command.
 `search` and `ls` are name operations. Vault, Infisical, KeePass, Proton, and
 GitHub listings are metadata-only. The Vaultwarden CLI has no metadata-only list
 command, so its adapter fetches full items and keeps only names; see the
@@ -115,15 +122,15 @@ history still sees exported values, so autoload is a deliberate trade.
 
 ## Providers
 
-| Kind | Read | Write | Mechanism | Status in this repository |
-| --- | --- | --- | --- | --- |
-| `vault` | yes | yes | KV v2 HTTP API | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
-| `openbao` | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
-| `keepass` | yes | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
-| `infisical` | yes | yes | v4 secrets HTTP API; service token or Universal Auth | Fixture-tested only; no live instance |
-| `vaultwarden` | yes | no | `bw` CLI, existing session | Fake `bw` fixture; `bw` not installed here |
-| `proton` | yes | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
-| `github` | **no** | yes | Actions repository secrets REST API | Sealed-box unit test only; no live repository |
+| Kind | Read | Write | Ensure | Mechanism | Status in this repository |
+| --- | --- | --- | --- | --- | --- |
+| `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
+| `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
+| `keepass` | yes | no | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
+| `infisical` | yes | yes | yes | v4 secrets HTTP API; service token or Universal Auth. Ensure uses documented Create (`POST`), never Update (`PATCH`). | Fixture-tested for list/get/set; ensure follows the published Create contract and is not live-verified |
+| `vaultwarden` | yes | no | no | `bw` CLI, existing session | Fake `bw` fixture; `bw` not installed here |
+| `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
+| `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
 
 Key grammar:
 
@@ -156,7 +163,27 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 - Proton writes are unsupported because the documented update command takes
   the value in `argv`.
 - GitHub repository secrets only. Organization, environment, Codespaces, and
-  Dependabot scopes are future work.
+  Dependabot scopes are future work. `ensure` is unsupported: the secrets API
+  has one PUT that creates or updates, and a check-then-PUT race would
+  overwrite a value this adapter cannot read back.
+- `ensure` without `#field` treats an existing Vault/OpenBao path as present,
+  even when the `value` field is missing and even when the latest version is
+  soft-deleted. It does not undelete or add fields in that form. `#field`
+  checks names through the subkeys API and adds a missing field with
+  `cas` set to the current version. A lost CAS race is not retried with an
+  unconditional write.
+- Infisical `ensure` is not an atomic server-side conditional write. It GETs
+  the name, and only a confirmed 404 is followed by the documented Create
+  POST. A 400 or 409 is treated as present only after a second GET shows the
+  name. It never sends the Update PATCH. This has not been run against a live
+  Infisical server. If that server's Create upserts, the race is not closed;
+  do not treat this adapter as live-verified.
+- There is no remove, delete, or destroy operation.
+- There is no backup import or export. See the roadmap. No age identity,
+  recipient, or encrypted backup file is read or written.
+- There is no request-rewriting proxy, placeholder syntax, or second
+  executable. `exec` does not edit outbound HTTP bodies. A proxy remains an
+  open question on the roadmap, not a committed design.
 - No daemon, cache, keyring, or local encrypted store. Every call resolves from
   the provider.
 - Shell completion lists commands and options; it does not dynamically complete
@@ -187,7 +214,7 @@ is not cached by the client.
 See [`include/nsvault.h`](include/nsvault.h). The ABI is intentionally narrow:
 
 - `nsvault_client_open` / `nsvault_client_close`
-- `nsvault_list`, `nsvault_get`, `nsvault_set`
+- `nsvault_list`, `nsvault_get`, `nsvault_set`, `nsvault_ensure`
 - `nsvault_last_error`
 - `nsvault_bytes_free`
 
@@ -216,6 +243,20 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
 - `search` is a name operation. It does not call a value endpoint.
 - Redirects are disabled for provider HTTP requests, so an authorization header
   is not forwarded to a second origin.
+- `set` and `ensure` take a same-user advisory file lock on this machine
+  before they contact the provider. The lock identity is a hash of the
+  canonical address plus non-secret scope (Vault/OpenBao: mount and
+  namespace, shared across those two kind labels; Infisical: project,
+  environment, and folder; GitHub: owner and repository). Profile names and
+  config file paths are not part of it. `https://Host:443/path/` and
+  `https://host/path` match. `localhost` and `127.0.0.1` do not. The lock
+  file lives under `$XDG_STATE_HOME/nsvault/locks` or
+  `~/.local/state/nsvault/locks`, mode `0700`/`0600`. `NSVAULT_LOCK_DIR`
+  overrides that directory and must stay owner-only. The kernel releases the
+  lock when the process exits, including a crash. This does not stop the
+  Vault CLI, another host, or another OS user. Provider CAS is still required
+  for those writers. Linux `flock` is what this workspace can exercise.
+  Windows and macOS are not.
 - `Secret` has no `Display`; `Debug` prints `Secret([REDACTED])`.
 - The C ABI zeroes output buffers on free.
 
@@ -268,6 +309,28 @@ Adding one means: a validated non-secret config variant, an adapter implementing
 `Provider`, a capability row, fixture tests, and a doc update. There is no plugin
 ABI, dynamic loading, or network fallback; an unsupported `kind` is rejected at
 configuration parse time.
+
+Backup import and export are also not implemented. A later increment may add
+one common encrypted file format, using [age](https://age-encryption.org/), so
+a store can be backed up and moved between machines. That work is not started.
+This build has no `import` command, no `export` command, no age recipient or
+identity field, and no age dependency. An age file created elsewhere is not a
+nsvault backup and cannot be loaded.
+
+A local proxy that replaces secret placeholders in agent requests is a future
+consideration, not a design this project has accepted. One sketch, still
+uncommitted, is a separate executable that shares crates with `nsvault`
+instead of growing the `nsvault` binary. Nothing here chooses that split,
+a placeholder syntax, a listen address, or a wire format.
+
+If that work is ever started, the trust boundary has to be explicit: the
+process would see secret values and the request bodies it rewrites, so it is
+not a transparent hop and not a reason to log either. It would also need
+injection and egress controls before it could be used: which hosts it may
+contact, which placeholders it may expand, and a refusal to send a value to
+an unexpected URL. None of that exists today. There is no proxy binary, no
+placeholder syntax, and no local listener. `nsvault exec` only exports names
+into a child environment; it does not rewrite request bodies.
 
 ## Verification in this change
 
