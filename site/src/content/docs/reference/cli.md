@@ -3,7 +3,7 @@ title: CLI
 description: Commands and flags implemented by nsvault.
 ---
 
-Global flags, accepted before the subcommand:
+Global flags, accepted before or after the subcommand:
 
 | Flag | Argument | Meaning |
 | --- | --- | --- |

@@ -220,9 +220,21 @@ fn vaultwarden_reads_and_writes_through_the_cli() {
         login.status.success(),
         "bw login failed; pin a CLI that accepts a loopback HTTP server at NSVAULT_TEST_BW"
     );
-    let session = String::from_utf8(login.stdout).expect("session is UTF-8");
+    // `login` can return a session while the CLI still reports the vault as
+    // locked. A write needs the user key, so ask for an explicit unlock.
+    let unlock = run_bw(
+        &bw,
+        &appdata,
+        &["unlock", "--passwordenv", "BW_PASSWORD", "--raw"],
+        Some(PASSWORD),
+    );
+    assert!(
+        unlock.status.success(),
+        "bw unlock failed after login; the session is not usable for writes"
+    );
+    let session = String::from_utf8(unlock.stdout).expect("session is UTF-8");
     let session = session.trim();
-    assert!(!session.is_empty(), "bw login returned no session");
+    assert!(!session.is_empty(), "bw unlock returned no session");
 
     let session_file = directory.join("session");
     std::fs::write(&session_file, session).expect("write session file");

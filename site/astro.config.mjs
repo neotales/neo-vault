@@ -1,12 +1,14 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
 	integrations: [
 		starlight({
 			title: 'nsvault',
 			description: 'Directory-scoped secrets proxy. Values stay out of argv.',
+			customCss: ['./src/styles/global.css'],
 			social: [
 				{
 					icon: 'github',
@@ -16,22 +18,25 @@ export default defineConfig({
 			],
 			sidebar: [
 				{
-					label: 'Start',
+					label: 'Start 🚀',
 					items: [{ label: 'First config', slug: 'guides/first-config' }],
 				},
 				{
-					label: 'How-to',
+					label: 'How-to 🧰',
 					items: [{ label: 'Agent cheat sheet', slug: 'guides/agents' }],
 				},
 				{
-					label: 'Reference',
+					label: 'Reference 📚',
 					items: [{ autogenerate: { directory: 'reference' } }],
 				},
 				{
-					label: 'Explanation',
+					label: 'Explanation 🧠',
 					items: [{ autogenerate: { directory: 'explanation' } }],
 				},
 			],
 		}),
 	],
+	vite: {
+		plugins: [tailwindcss()],
+	},
 });

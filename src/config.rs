@@ -84,6 +84,12 @@ pub enum ProviderConfig {
     Proton(ProtonConfig),
     /// GitHub Actions repository secrets through the `GitHub` REST API.
     Github(GithubConfig),
+    /// AWS Secrets Manager through the JSON 1.1 API and SigV4.
+    AwsSecretsManager(AwsSecretsManagerConfig),
+    /// Google Cloud Secret Manager through the v1 REST API.
+    GcpSecretManager(GcpSecretManagerConfig),
+    /// Azure Key Vault through the secrets data-plane REST API.
+    AzureKeyVault(AzureKeyVaultConfig),
 }
 
 /// Shared Vault/OpenBao configuration.
@@ -222,6 +228,90 @@ pub struct GithubConfig {
     pub token_file: Option<PathBuf>,
 }
 
+/// AWS Secrets Manager configuration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsSecretsManagerConfig {
+    /// AWS region used for the credential scope and the default endpoint.
+    pub region: String,
+    /// API root. Defaults to `https://secretsmanager.{region}.amazonaws.com`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Environment variable holding the access key id. Defaults to
+    /// `AWS_ACCESS_KEY_ID`.
+    #[serde(default = "default_aws_access_key_env")]
+    pub access_key_env: Option<String>,
+    /// Owner-only file holding the access key id.
+    #[serde(default)]
+    pub access_key_file: Option<PathBuf>,
+    /// Environment variable holding the secret access key. Defaults to
+    /// `AWS_SECRET_ACCESS_KEY`.
+    #[serde(default = "default_aws_secret_key_env")]
+    pub secret_key_env: Option<String>,
+    /// Owner-only file holding the secret access key.
+    #[serde(default)]
+    pub secret_key_file: Option<PathBuf>,
+    /// Environment variable holding a temporary session token. Defaults to
+    /// `AWS_SESSION_TOKEN`; an absent variable means no session token.
+    #[serde(default = "default_aws_session_token_env")]
+    pub session_token_env: Option<String>,
+    /// Owner-only file holding a temporary session token.
+    #[serde(default)]
+    pub session_token_file: Option<PathBuf>,
+    /// Permit plaintext HTTP only for a loopback address. Intended for the
+    /// local emulator; refused for every other host.
+    #[serde(default)]
+    pub allow_http_loopback: bool,
+}
+
+/// Google Cloud Secret Manager configuration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcpSecretManagerConfig {
+    /// Project id or number used in the resource path.
+    pub project: String,
+    /// API root. Defaults to `https://secretmanager.googleapis.com`.
+    #[serde(default = "default_gcp_endpoint")]
+    pub endpoint: String,
+    /// Environment variable holding an OAuth 2.0 access token. Defaults to
+    /// `GOOGLE_OAUTH_ACCESS_TOKEN`.
+    #[serde(default = "default_gcp_token_env")]
+    pub token_env: Option<String>,
+    /// Owner-only file holding an OAuth 2.0 access token.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    /// Send no credential. Accepted only for a loopback emulator endpoint;
+    /// real Secret Manager requires a token.
+    #[serde(default)]
+    pub allow_anonymous: bool,
+    /// Permit plaintext HTTP only for a loopback address.
+    #[serde(default)]
+    pub allow_http_loopback: bool,
+}
+
+/// Azure Key Vault configuration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AzureKeyVaultConfig {
+    /// Vault data-plane root, for example `https://myvault.vault.azure.net` or
+    /// the local emulator's `http://127.0.0.1:4577/devstoreaccount1-keyvault`.
+    pub vault_url: String,
+    /// Key Vault data-plane API version. Defaults to `7.4`.
+    #[serde(default = "default_azure_api_version")]
+    pub api_version: String,
+    /// Environment variable holding a bearer token. Defaults to
+    /// `AZURE_ACCESS_TOKEN`.
+    #[serde(default = "default_azure_token_env")]
+    pub token_env: Option<String>,
+    /// Owner-only file holding a bearer token.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    /// Permit plaintext HTTP only for a loopback address. Intended for the
+    /// local emulator; refused for every other host.
+    #[serde(default)]
+    pub allow_http_loopback: bool,
+}
+
 fn default_mount() -> String {
     "secret".to_owned()
 }
@@ -268,6 +358,34 @@ fn default_github_api() -> String {
 
 fn default_github_token_env() -> Option<String> {
     Some("GITHUB_TOKEN".to_owned())
+}
+
+fn default_aws_access_key_env() -> Option<String> {
+    Some("AWS_ACCESS_KEY_ID".to_owned())
+}
+
+fn default_aws_secret_key_env() -> Option<String> {
+    Some("AWS_SECRET_ACCESS_KEY".to_owned())
+}
+
+fn default_aws_session_token_env() -> Option<String> {
+    Some("AWS_SESSION_TOKEN".to_owned())
+}
+
+fn default_gcp_endpoint() -> String {
+    "https://secretmanager.googleapis.com".to_owned()
+}
+
+fn default_gcp_token_env() -> Option<String> {
+    Some("GOOGLE_OAUTH_ACCESS_TOKEN".to_owned())
+}
+
+fn default_azure_api_version() -> String {
+    "7.4".to_owned()
+}
+
+fn default_azure_token_env() -> Option<String> {
+    Some("AZURE_ACCESS_TOKEN".to_owned())
 }
 
 impl Config {
@@ -436,8 +554,82 @@ fn validate_provider(name: &str, provider: &ProviderConfig) -> Result<()> {
             validate_env_optional(config.token_env.as_deref(), "token_env")
                 .map_err(|error| invalid(error.message().to_owned()))?;
         }
+        ProviderConfig::AwsSecretsManager(config) => {
+            if !valid_aws_region(&config.region) {
+                return Err(invalid(
+                    "region must contain only lowercase letters, digits, and '-'".to_owned(),
+                ));
+            }
+            if let Some(endpoint) = &config.endpoint {
+                validate_http_base(endpoint, config.allow_http_loopback)
+                    .map_err(|error| invalid(error.message().to_owned()))?;
+            }
+            for (value, field) in [
+                (config.access_key_env.as_deref(), "access_key_env"),
+                (config.secret_key_env.as_deref(), "secret_key_env"),
+                (config.session_token_env.as_deref(), "session_token_env"),
+            ] {
+                validate_env_optional(value, field)
+                    .map_err(|error| invalid(error.message().to_owned()))?;
+            }
+        }
+        ProviderConfig::GcpSecretManager(config) => {
+            validate_http_base(&config.endpoint, config.allow_http_loopback)
+                .map_err(|error| invalid(error.message().to_owned()))?;
+            if !valid_gcp_project(&config.project) {
+                return Err(invalid(
+                    "project must contain only letters, digits, '_' and '-'".to_owned(),
+                ));
+            }
+            validate_env_optional(config.token_env.as_deref(), "token_env")
+                .map_err(|error| invalid(error.message().to_owned()))?;
+            if config.allow_anonymous {
+                let endpoint = url::Url::parse(&config.endpoint)
+                    .map_err(|_| invalid("endpoint is not a valid URL".to_owned()))?;
+                if !is_loopback_url(&endpoint) {
+                    return Err(invalid(
+                        "allow_anonymous is accepted only for a loopback endpoint".to_owned(),
+                    ));
+                }
+            }
+        }
+        ProviderConfig::AzureKeyVault(config) => {
+            validate_http_base(&config.vault_url, config.allow_http_loopback)
+                .map_err(|error| invalid(error.message().to_owned()))?;
+            if !valid_api_version(&config.api_version) {
+                return Err(invalid(
+                    "api_version must contain only digits and '.'".to_owned(),
+                ));
+            }
+            validate_env_optional(config.token_env.as_deref(), "token_env")
+                .map_err(|error| invalid(error.message().to_owned()))?;
+        }
     }
     Ok(())
+}
+
+pub(crate) fn valid_aws_region(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+pub(crate) fn valid_gcp_project(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn valid_api_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 20
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
 }
 
 fn is_profile_name(name: &str) -> bool {
@@ -480,7 +672,7 @@ fn validate_namespace(value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn validate_http_base(value: &str, allow_loopback: bool) -> Result<()> {
+pub(crate) fn validate_http_base(value: &str, allow_loopback: bool) -> Result<()> {
     let url = url::Url::parse(value).map_err(|_| Error::new("invalid URL"))?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(Error::new("URL must not contain credentials"));
@@ -589,6 +781,93 @@ providers:
         let config = Config::load(&path).expect("yaml config");
         assert_eq!(config.document.provider.as_deref(), Some("v"));
         std::fs::remove_file(path).expect("remove yaml");
+    }
+
+    #[test]
+    fn accepts_cloud_profiles_for_loopback_emulators() {
+        let document = r#"
+version = 1
+provider = "aws"
+
+[providers.aws]
+kind = "aws-secrets-manager"
+region = "us-east-1"
+endpoint = "http://127.0.0.1:4566"
+access_key_env = "TEST_AWS_ACCESS_KEY_ID"
+secret_key_env = "TEST_AWS_SECRET_ACCESS_KEY"
+allow_http_loopback = true
+
+[providers.gcp]
+kind = "gcp-secret-manager"
+project = "floci-local"
+endpoint = "http://127.0.0.1:4588"
+allow_anonymous = true
+allow_http_loopback = true
+
+[providers.azure]
+kind = "azure-key-vault"
+vault_url = "http://127.0.0.1:4577/devstoreaccount1-keyvault"
+token_env = "TEST_AZURE_ACCESS_TOKEN"
+allow_http_loopback = true
+"#;
+        let parsed: Document = toml::from_str(document).expect("document");
+        let config = Config {
+            root: "test".into(),
+            document: parsed,
+        };
+        config.validate().expect("cloud profiles");
+    }
+
+    #[test]
+    fn gcp_anonymous_is_refused_outside_loopback() {
+        let document = r#"
+version = 1
+[providers.gcp]
+kind = "gcp-secret-manager"
+project = "example"
+endpoint = "https://secretmanager.googleapis.com"
+allow_anonymous = true
+"#;
+        let parsed: Document = toml::from_str(document).expect("document");
+        let config = Config {
+            root: "test".into(),
+            document: parsed,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn cloud_endpoints_refuse_plaintext_http_outside_loopback() {
+        for body in [
+            "kind = \"aws-secrets-manager\"\nregion = \"us-east-1\"\nendpoint = \"http://secrets.example\"",
+            "kind = \"gcp-secret-manager\"\nproject = \"example\"\nendpoint = \"http://secretmanager.example\"",
+            "kind = \"azure-key-vault\"\nvault_url = \"http://vault.example\"",
+        ] {
+            let document = format!("version = 1\n[providers.p]\n{body}\n");
+            let parsed: Document = toml::from_str(&document).expect("document");
+            let config = Config {
+                root: "test".into(),
+                document: parsed,
+            };
+            assert!(config.validate().is_err(), "accepted {body}");
+        }
+    }
+
+    #[test]
+    fn azure_api_version_rejects_query_injection() {
+        let document = r#"
+version = 1
+[providers.az]
+kind = "azure-key-vault"
+vault_url = "https://vault.example"
+api_version = "7.4&x=y"
+"#;
+        let parsed: Document = toml::from_str(document).expect("document");
+        let config = Config {
+            root: "test".into(),
+            document: parsed,
+        };
+        assert!(config.validate().is_err());
     }
 
     #[test]

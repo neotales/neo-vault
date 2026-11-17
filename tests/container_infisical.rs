@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use nsvault::{Client, EnsureStatus, Secret};
+use nsvault::{Client, Secret};
 use serde_json::{Value, json};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -76,7 +76,7 @@ fn wait_for_tcp(address: std::net::SocketAddr, limit: Duration) {
 
 #[test]
 #[ignore = "requires Docker; opt in with --ignored"]
-fn infisical_reads_writes_and_ensures_against_the_pinned_image() {
+fn infisical_reads_writes_and_lists_against_the_pinned_image() {
     let postgres = GenericImage::new("postgres", "17-alpine")
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_either_std(
@@ -251,34 +251,8 @@ allow_http_loopback = true
         .expect("read the updated secret");
     assert_eq!(updated.expose(), b"replacement-value");
 
-    let created = client
-        .ensure(
-            Some("i"),
-            "NSVAULT_CONTAINER_FRESH",
-            &Secret::new(b"first-value".to_vec()),
-        )
-        .expect("ensure a missing secret");
-    assert_eq!(created, EnsureStatus::Created);
-    let present = client
-        .ensure(
-            Some("i"),
-            "NSVAULT_CONTAINER_FRESH",
-            &Secret::new(b"second-value".to_vec()),
-        )
-        .expect("ensure an existing secret");
-    assert_eq!(present, EnsureStatus::Present);
-    let fresh = client
-        .get(Some("i"), "NSVAULT_CONTAINER_FRESH")
-        .expect("read the ensured secret");
-    assert_eq!(fresh.expose(), b"first-value");
-
     let listed = client.list(Some("i"), "").expect("list the folder");
     assert!(listed.iter().any(|key| key.key == "NSVAULT_CONTAINER_TEST"));
-    assert!(
-        listed
-            .iter()
-            .any(|key| key.key == "NSVAULT_CONTAINER_FRESH")
-    );
 
     std::fs::remove_dir_all(directory).expect("remove temp dir");
     // The containers are dropped here; testcontainers removes only those.

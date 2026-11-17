@@ -1,0 +1,22 @@
+---
+/**
+ * A two-panel terminal joke about argv. The panels are HTML and text, so no
+ * third-party image is embedded, hotlinked, or redistributed.
+ */
+---
+
+<figure class="not-content my-8 overflow-hidden rounded-2xl border border-border bg-bg-nav">
+	<div class="flex items-center gap-1.5 border-b border-border px-4 py-2">
+		<span class="size-2.5 rounded-full bg-red-400/80" aria-hidden="true"></span>
+		<span class="size-2.5 rounded-full bg-yellow-400/80" aria-hidden="true"></span>
+		<span class="size-2.5 rounded-full bg-green-400/80" aria-hidden="true"></span>
+		<figcaption class="ml-2 text-xs text-text-muted">argv.txt</figcaption>
+	</div>
+	<pre class="m-0 overflow-x-auto p-4 font-mono text-xs leading-6"><code><span class="text-text-muted"># the classic: the value rides along for everyone to read</span>
+<span class="text-red-500">$</span> DB_PASSWORD=not-a-real-secret ./deploy.sh
+  <span class="text-text-muted">ps aux</span>  <span class="text-red-500">✗ the command line shows the value</span>
+
+<span class="text-text-muted"># nsvault: the value goes to the environment, not argv</span>
+<span class="text-green-500">$</span> nsvault exec -- ./deploy.sh
+  <span class="text-text-muted">ps aux</span>  <span class="text-green-500">✓ nsvault exec -- ./deploy.sh</span></code></pre>
+</figure>

@@ -21,7 +21,10 @@ secret, not a whole-secret POST replacement. The initial create also exercises
 the Vault KV v2 CAS 0 create body on a real server. The same run then calls
 `ensure` for a missing path and again with a different value, and asserts the
 second call leaves the first value in place. It also ensures a missing field
-on the existing secret and checks the sibling field is still there.
+on the existing secret, checks the sibling field is still there, and then
+ensures that same field a second time with a different value. That second call
+must report `present` and leave the value unchanged; it is the check that the
+adapter reads the documented `data.subkeys` response on a real server.
 
 Run it explicitly:
 
@@ -39,6 +42,35 @@ finished in 44.41s
 
 The testcontainers-managed container was gone after the run. The pulled image
 remains locally; removing it is a separate, explicit decision.
+
+## Cloud providers: implemented and exercised with Floci
+
+`tests/container_cloud.rs` starts one pinned Floci release image per test:
+
+- AWS: `floci/floci:2.5.0` on port 4566
+- GCP: `floci/floci-gcp:0.13.0` on port 4588
+- Azure: `floci/floci-az:0.17.0` on port 4577, with Azure Functions disabled and
+  no Docker socket
+
+Each test maps the port to a random loopback host port, uses only temporary
+owner-only credential files with obviously fake values, and lets testcontainers
+remove its own container. The full evidence, image digests, and limits are in
+[`floci.md`](floci.md).
+
+```sh
+cargo test --test container_cloud -- --ignored --nocapture
+```
+
+Observed in this workspace on 2026-11-17:
+
+```text
+running 3 tests
+test gcp_secret_manager_round_trips_through_floci ... ok
+test azure_key_vault_round_trips_through_floci ... ok
+test aws_secrets_manager_round_trips_through_floci ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
 
 ## Infisical: implemented and exercised
 
@@ -58,9 +90,10 @@ the `default` template (which creates the `dev` environment) and configures the
 adapter with the bootstrap machine token in an owner-only file. The token and
 every value live only in this throwaway instance and a temporary directory.
 
-The run covers `set` (create), `get`, `set` (replace), `ensure` on a missing
-name (`created`), `ensure` on the existing name (`present`), the unchanged
-value after that second `ensure`, and the metadata-only list.
+The run covers `set` (create), `get`, `set` (replace), and the metadata-only
+list. `ensure` stays disabled in this build and this test neither enables nor
+exercises it: proving the Create (`POST`) duplicate behavior is a separate
+decision, and the adapter must not rely on an unproven check-then-create.
 
 Run it explicitly:
 
@@ -71,9 +104,9 @@ cargo test --test container_infisical -- --ignored --nocapture
 Observed in this workspace on 2026-11-17:
 
 ```text
-test infisical_reads_writes_and_ensures_against_the_pinned_image ... ok
+test infisical_reads_writes_and_lists_against_the_pinned_image ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-finished in 231.75s
+finished in 148.99s
 ```
 
 The three testcontainers-managed containers were gone after the run.
@@ -86,10 +119,6 @@ Notes:
   the raw machine token in `Authorization`, and Infisical answered `403`. The
   API requires the `Bearer` scheme. `src/provider/infisical.rs` now builds the
   header value with that scheme, and the loopback fixture test asserts it.
-- The pinned server rejects a duplicate Create with `400` instead of upserting
-  and rejects an Update `PATCH` for a missing name with `404`. The `ensure`
-  check-then-create sequence is still not atomic; the test proves the endpoint
-  semantics, not a server-side conditional write.
 
 ## Vaultwarden: implemented and exercised
 
@@ -109,9 +138,10 @@ iterations is the minimum this Vaultwarden release accepts. The address is
 `@example.invalid` and the password is a fixed fake.
 
 The CLI's state lives in a temporary `BITWARDENCLI_APPDATA_DIR`. The test logs
-in, writes the session to an owner-only file, and configures the adapter with a
-small wrapper script that sets that state directory and executes the pinned CLI.
-No process-wide environment variable is changed.
+in, explicitly unlocks the vault (a login can leave the CLI locked, and a write
+needs the user key), writes the session to an owner-only file, and configures
+the adapter with a small wrapper script that sets that state directory and
+executes the pinned CLI. No process-wide environment variable is changed.
 
 The run covers `list`, `get`, `set` on a missing item (create), `set` on
 `#password` (replace with the sibling `#username` and a custom field still
@@ -130,7 +160,7 @@ Observed in this workspace on 2026-11-17, with `NSVAULT_TEST_BW` pointing at
 ```text
 test vaultwarden_reads_and_writes_through_the_cli ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-finished in 111.93s
+finished in 179.34s
 ```
 
 The testcontainers-managed container was gone after the run. The temporary
@@ -153,7 +183,9 @@ and does not reuse the CLI state of the developer running it.
 
 ## What is not claimed
 
-No production Infisical, Vaultwarden, or Vault server was contacted. The
-Vaultwarden adapter still has no `ensure`, and the `bw` write path has not been
-exercised against a current CLI over HTTPS. CI does not run container tests by
-default; they are explicit opt-in commands.
+No production Vault, Infisical, or Vaultwarden server was contacted. The
+Infisical `ensure` remains disabled; the Vaultwarden adapter has no `ensure`,
+and its write path has not been exercised against a current CLI over HTTPS.
+Floci does not validate AWS SigV4 signatures, and passing the cloud tests is
+not production verification against AWS, GCP, or Azure. CI does not run
+container tests by default; they are explicit opt-in commands.

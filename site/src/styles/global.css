@@ -1,0 +1,42 @@
+/*
+ * Tailwind on top of Starlight.
+ *
+ * Starlight imports this file before its own `layers.css` so that custom CSS can
+ * set the cascade order. Declare Starlight's layers first and Tailwind's last so
+ * a utility class beats a Starlight component style. Keep this list in sync with
+ * node_modules/@astrojs/starlight/dist/style/layers.css.
+ */
+@layer starlight.base, starlight.reset, starlight.core, starlight.content,
+	starlight.components, starlight.components.icon, starlight.components.aside,
+	starlight.utils, theme, base, components, utilities;
+
+/*
+ * Skip Tailwind's preflight. It lives in the `base` layer and would reset the
+ * headings, lists, and forms that Starlight already styles. Starlight ships its
+ * own reset, so Tailwind only needs its theme and utilities here.
+ */
+@import 'tailwindcss/theme.css' layer(theme);
+@import 'tailwindcss/utilities.css' layer(utilities);
+
+/* Class names live in components and documentation pages. */
+@source '../components/**/*.astro';
+@source '../content/**/*.md';
+@source '../content/**/*.mdx';
+
+/*
+ * Map Tailwind tokens onto Starlight's variables. A utility then follows the
+ * light and dark theme instead of fixing a second palette that drifts from it.
+ */
+@theme {
+	--font-sans: var(--sl-font-system);
+	--font-mono: var(--sl-font-system-mono);
+
+	--color-bg: var(--sl-color-bg);
+	--color-bg-nav: var(--sl-color-bg-nav);
+	--color-text: var(--sl-color-text);
+	--color-text-muted: var(--sl-color-gray-3);
+	--color-accent: var(--sl-color-accent);
+	--color-accent-high: var(--sl-color-accent-high);
+	--color-accent-low: var(--sl-color-accent-low);
+	--color-border: var(--sl-color-hairline);
+}

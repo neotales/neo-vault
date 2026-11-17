@@ -4,7 +4,7 @@ An automation-first secrets proxy: resolve a secret from a directory-scoped
 provider without putting the value in `argv`, a log line, or a checked-in file.
 
 The first increment is deliberately small. It implements a CLI, a reusable Rust
-client, a conservative C ABI, directory discovery, shell integration, and seven
+client, a conservative C ABI, directory discovery, shell integration, and ten
 provider kinds. **No adapter has been verified against a live production
 service in this repository.** The verification matrix below states exactly what
 was exercised.
@@ -98,8 +98,10 @@ given. `set` refuses to take a value as an argument and refuses an empty value.
 when the provider confirms the key is absent, and it leaves an existing key
 unchanged. It never deletes. Success writes no secret to stdout. `--json`
 prints `{"status":"created"}` or `{"status":"present"}` and nothing else.
-Auth, network, and other ambiguous errors are failures, not absence. There is
-no `remove` command.
+Auth, network, and other ambiguous errors are failures, not absence. A
+provider without a race-safe create path — Infisical, GitHub, and every
+read-only kind in this build — exits with an unsupported error and contacts no
+provider. There is no `remove` command.
 `search` and `ls` are name operations. Vault, Infisical, KeePass, Proton, and
 GitHub listings are metadata-only. The Vaultwarden CLI has no metadata-only list
 command, so its adapter fetches full items and keeps only names; see the
@@ -127,10 +129,13 @@ history still sees exported values, so autoload is a deliberate trade.
 | `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
 | `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
 | `keepass` | yes | no | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
-| `infisical` | yes | yes | yes | v4 secrets HTTP API; service token or Universal Auth. Ensure uses documented Create (`POST`), never Update (`PATCH`). | Fixture-tested for list/get/set/ensure plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis; no production server |
+| `infisical` | yes | yes | no | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` is disabled because the Create endpoint's duplicate behavior is unproven. | Fixture-tested for list/get/set and for the `ensure` refusal, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis; no production server |
 | `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
+| `aws-secrets-manager` | yes | yes | yes | Secrets Manager JSON 1.1 API with local SigV4 signing | Opt-in Floci test against `floci/floci:2.5.0`; signer unit-tested against AWS's published SigV4 vectors; no AWS account |
+| `gcp-secret-manager` | yes | yes | **no** | Secret Manager v1 REST API | Opt-in Floci test against `floci/floci-gcp:0.13.0`; no GCP project. Ensure is refused because create and add-version are separate, non-atomic calls. |
+| `azure-key-vault` | yes | yes | no | Key Vault secrets REST API `7.4` | Opt-in Floci test against `floci/floci-az:0.17.0`; no Azure account. Ensure is unsupported because Key Vault has no conditional create. |
 
 Key grammar:
 
@@ -145,6 +150,12 @@ Key grammar:
 - Proton: item title, optionally `#password` (default), `#username`, or
   another field name. Titles must be unique.
 - GitHub: `SECRET_NAME`; list and set only. The API never returns a value.
+- AWS Secrets Manager: `SECRET_NAME`; no fields. The adapter reads and writes
+  the string value, or reads a base64-encoded binary value.
+- GCP Secret Manager: `SECRET_ID`; no fields, latest version only. Every `set`
+  adds a version.
+- Azure Key Vault: `SECRET_NAME`; no fields, latest version only. Every `set`
+  adds a version.
 
 The phrase "OpenTofu's version" in the request is treated as **OpenBao**, the
 open-source Vault-compatible fork. OpenTofu is a Terraform fork and does not
@@ -176,19 +187,47 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   Dependabot scopes are future work. `ensure` is unsupported: the secrets API
   has one PUT that creates or updates, and a check-then-PUT race would
   overwrite a value this adapter cannot read back.
+- AWS credentials are static for the process lifetime: an access key id, secret
+  access key, and optional session token from named environment variables or
+  owner-only files. There is no STS AssumeRole, IMDS, credential-provider
+  chain, or refresh. SigV4 signing is implemented locally; the emulator does
+  not reject an unsigned request, so the emulator test does not prove AWS would
+  accept the signature. The signer is unit-tested against AWS's published
+  `get-vanilla` and `post-vanilla-query` vectors. No AWS account was used.
+- GCP authentication is a static OAuth 2.0 access token from a named
+  environment variable or owner-only file. There is no Application Default
+  Credentials, service-account JWT exchange, impersonation, or refresh, so a
+  long-running process fails when the token expires. `allow_anonymous` exists
+  only for a loopback emulator and is refused for any non-loopback endpoint.
+  No GCP project was used. `ensure` is refused: Secret Manager has no atomic
+  create-with-version call. A create followed by a failed add-version can leave
+  an empty secret, and a retry would then report Present.
+- Azure authentication is a static bearer token from a named environment
+  variable or owner-only file. There is no Microsoft Entra ID
+  client-credential flow, managed identity, challenge-based auth, or refresh.
+  `ensure` is unsupported because Key Vault has no conditional create and a
+  check-then-PUT would race. Only the latest secret version is read. No Azure
+  account was used.
+- The cloud emulator tests prove that these adapters speak the pinned Floci
+  images' wire protocols. They do not prove production authentication, IAM
+  policy enforcement, quota behavior, regional endpoints, or service edge
+  cases.
 - `ensure` without `#field` treats an existing Vault/OpenBao path as present,
   even when the `value` field is missing and even when the latest version is
   soft-deleted. It does not undelete or add fields in that form. `#field`
-  checks names through the subkeys API and adds a missing field with
-  `cas` set to the current version. A lost CAS race is not retried with an
-  unconditional write.
-- Infisical `ensure` is not an atomic server-side conditional write. It GETs
-  the name, and only a confirmed 404 is followed by the documented Create
-  POST. A 400 or 409 is treated as present only after a second GET shows the
-  name. It never sends the Update PATCH. The pinned container rejects a
-  duplicate Create with 400 rather than upserting, and rejects the Update PATCH
-  for a missing name with 404; a concurrent writer can still win between the
-  GET and the POST.
+  reads the metadata version first, checks names through the subkeys API, then
+  adds a missing field with `cas` set to that earlier version. A writer that
+  creates the field between those two reads also advances the version, so the
+  CAS fails and the field is re-checked instead of replaced. A lost CAS race is
+  not retried with an unconditional write. A subkeys response without the
+  documented `data.subkeys` map is an error, not field absence, and no patch is
+  sent.
+- Infisical `ensure` is disabled. The adapter returns "does not support
+  ensure" and sends no request. The v4 Create (`POST`) has not been proven to
+  reject a duplicate rather than upsert it against a live server; until that is
+  recorded here, a check-then-create race could replace another writer's value.
+  `set` is unaffected: it reads the name and then sends Update (`PATCH`) or
+  Create (`POST`) under the same-user write lock.
 - There is no remove, delete, or destroy operation.
 - There is no backup import or export. See the roadmap. No age identity,
   recipient, or encrypted backup file is read or written.
@@ -219,7 +258,12 @@ let value = client.get(Some("work"), "apps/production/db#password")?;
 
 `Client` is synchronous and can be shared across threads. Provider adapters are
 created per operation from the configuration, so a token read at process start
-is not cached by the client.
+is not cached by the client. `set` and `ensure` take the same same-user write
+lock as the CLI, so two threads or processes that write the same provider scope
+serialize; the call can block, and a lock failure is returned as an error
+rather than performed unlocked. This requires both writers to resolve the same
+lock directory: the same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+`XDG_STATE_HOME`/`HOME` when it is unset.
 
 ## C ABI
 
@@ -234,7 +278,12 @@ Every entry point catches panics. Strings are NUL-terminated UTF-8. Output
 buffers are caller-owned, freed exactly once, and zeroed before release. A
 status of `0` is success and `1` is an error. The last error is redacted and
 per-thread. `nsvault_client_close` must not race another call using the same
-handle. There is no callback, async, or streaming API.
+handle. There is no callback, async, or streaming API. `nsvault_set` and
+`nsvault_ensure` take the same same-user write lock as the CLI; they may block
+behind another nsvault writer, and a lock failure is returned as status `1`
+instead of writing unlocked. Coordination requires the same lock directory:
+the same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+`XDG_STATE_HOME`/`HOME` when it is unset. Different values are different locks.
 
 Smoke test:
 
@@ -255,21 +304,48 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
 - `search` is a name operation. It does not call a value endpoint.
 - Redirects are disabled for provider HTTP requests, so an authorization header
   is not forwarded to a second origin.
-- `set` and `ensure` take a same-user advisory file lock on this machine
-  before they contact the provider. The lock identity is a hash of the
-  canonical address plus non-secret scope (Vault/OpenBao: mount and
-  namespace, shared across those two kind labels; Infisical: project,
-  environment, and folder; GitHub: owner and repository; Vaultwarden: the
-  configured CLI executable). Profile names and
-  config file paths are not part of it. `https://Host:443/path/` and
-  `https://host/path` match. `localhost` and `127.0.0.1` do not. The lock
-  file lives under `$XDG_STATE_HOME/nsvault/locks` or
-  `~/.local/state/nsvault/locks`, mode `0700`/`0600`. `NSVAULT_LOCK_DIR`
-  overrides that directory and must stay owner-only. The kernel releases the
-  lock when the process exits, including a crash. This does not stop the
-  Vault CLI, another host, or another OS user. Provider CAS is still required
-  for those writers. Linux `flock` is what this workspace can exercise.
-  Windows and macOS are not.
+- Provider constructors revalidate the endpoint scheme, the loopback-only HTTP
+  rule, cloud project/region/API-version fields, and the GCP anonymous
+  restriction. Calling a constructor directly does not bypass the configuration
+  checks.
+- Vault/OpenBao `set`/`ensure`, GitHub `set`, Infisical `set`, and Vaultwarden `set` take a
+  same-user advisory file lock on this machine before they contact the
+  provider. The CLI, the Rust `Client`, and the C ABI share the mechanism. The
+  cloud adapters do not take it; they rely on their provider's own
+  create/version semantics instead. The lock identity is a hash of the canonical address plus
+  non-secret scope (Vault/OpenBao: mount and namespace, shared across those two
+  kind labels; Infisical: project, environment, and folder; GitHub: owner and
+  repository; Vaultwarden: the configured CLI executable). Profile names and
+  config file paths are not part of it.
+  `https://Host:443/path/` and `https://host/path` match. `localhost` and
+  `127.0.0.1` do not. The lock file lives under
+  `$XDG_STATE_HOME/nsvault/locks` or `~/.local/state/nsvault/locks`. A missing
+  directory is created `0700`; lock files are created `0600` and must be
+  regular, single-link, owner-only files. `NSVAULT_LOCK_DIR` overrides the
+  directory. The path is resolved one component at a time and the verified
+  directory handle is retained, so the lock file is opened relative to it; no
+  component of the path may be a symbolic link. The path must be absolute; a
+  relative `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected. On a system with
+  a symlinked home or state directory, set `NSVAULT_LOCK_DIR` to a real,
+  non-symlink absolute path. Every parent must be owned by root or this user:
+  an owner can rename entries even without write permission. A parent writable
+  by group or others must also be sticky. An existing directory is never
+  chmodded: it must already be owned by this user and inaccessible to group
+  and others. Creation respects the process umask: a directory that does not
+  end up exactly owner-only is an error, not something that is chmodded.
+  Writers coordinate only when they resolve the same lock directory: the same
+  OS user and the same `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME`
+  when it is unset.
+  Acquisition fails closed, with no unlocked fallback and no timeout, and a
+  lock failure is an error instead of a write. The lock is advisory: while a
+  write may be in progress, do not remove, rename, or replace the lock
+  directory or its `write-*.lock` files. A new inode or directory is a
+  different lock, so a hostile same-user process (or root) can break
+  cooperation; the lock is not a boundary against it. The kernel releases the
+  lock when the process exits, including a crash. This does not stop the Vault
+  CLI, another host, or another OS user. Provider CAS is still required for
+  those writers. Linux `flock` is what this workspace can exercise; Windows and
+  macOS are not.
 - `Secret` has no `Display`; `Debug` prints `Secret([REDACTED])`.
 - The C ABI zeroes output buffers on free.
 
@@ -279,7 +355,17 @@ provider may log its own request. This project does not claim to prevent those.
 
 ## Container integration tests
 
-Three opt-in, isolated testcontainers tests are pinned to specific images:
+The three cloud adapters have opt-in Floci tests pinned to release images:
+
+```sh
+cargo test --test container_cloud -- --ignored --nocapture
+```
+
+It starts `floci/floci:2.5.0`, `floci/floci-gcp:0.13.0`, and
+`floci/floci-az:0.17.0` on random loopback-mapped ports, writes only obviously
+fake fixture values, and lets testcontainers remove only those containers.
+Azure Functions is disabled in the Azure container so no Docker socket is
+needed. Three more container tests cover Vault, Infisical, and Vaultwarden:
 
 ```sh
 cargo test --test container_vault -- --ignored --nocapture
@@ -288,34 +374,58 @@ NSVAULT_TEST_BW=/path/to/pinned/bw \
   cargo test --test container_vaultwarden -- --ignored --nocapture
 ```
 
-The Vault test ran against `hashicorp/vault:1.21.4`. The Infisical test ran
-against `infisical/infisical:v0.167.11` with `postgres:17-alpine` and
-`redis:7.4-alpine`; it bootstraps the instance, creates a project, and covers
-`list`, `get`, `set`, and `ensure`. The Vaultwarden test ran against
-`vaultwarden/server:1.37.5` with a pinned `@bitwarden/cli` 2025.6.1, creating a
-throwaway account inside the container and covering `list`, `get`, and `set`
-including sibling fields. Every test removed only its own containers. Container
-tests do not run in the default gate; exact evidence and prerequisites are in
-[`docs/testcontainers.md`](docs/testcontainers.md).
+The Infisical test runs `infisical/infisical:v0.167.11` with
+`postgres:17-alpine` and `redis:7.4-alpine`, bootstraps the instance, creates a
+project, and covers `list`, `get`, and `set`. The Vaultwarden test runs
+`vaultwarden/server:1.37.5` with a pinned `@bitwarden/cli` 2025.6.1, creates a
+throwaway account inside the container, and covers `list`, `get`, and `set`
+including sibling fields. Exact evidence and prerequisites are in
+[`docs/testcontainers.md`](docs/testcontainers.md). Container tests do not run
+in the default gate.
+
+The AWS JSON request contract has a separate loopback fixture test:
+
+```sh
+cargo test --test aws_contract
+```
+
+It records `CreateSecret` and `PutSecretValue` bodies and asserts every write
+carries a valid CSPRNG `ClientRequestToken`; the Put retry after a create
+conflict must reuse the same token.
 
 ## Floci / cloud emulation
 
-Floci's AWS Secrets Manager, GCP Secret Manager, and Azure Key Vault emulation
-are confirmed by the vendor documentation, but this increment has no AWS, GCP,
-or Azure provider to test. The tool is not installed here, no emulator was
-started, and no Docker cleanup was performed. See
-[`docs/floci.md`](docs/floci.md) for the support evidence and the conditional
-test plan. A cloud provider stays "unimplemented" or "fixture-only" until that
-plan actually runs.
+The AWS Secrets Manager, GCP Secret Manager, and Azure Key Vault adapters are
+implemented and exercised against pinned Floci release images. The Floci CLI
+was not installed; the images were pulled and run directly with Docker:
+
+```sh
+docker pull floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+docker pull floci/floci-gcp:0.13.0@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
+docker pull floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
+
+docker run -d --rm --name nsvault-floci-aws -p 127.0.0.1:4566:4566 \
+  floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+docker run -d --rm --name nsvault-floci-gcp -p 127.0.0.1:4588:4588 \
+  floci/floci-gcp:0.13.0@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
+docker run -d --rm --name nsvault-floci-az \
+  -e FLOCI_AZ_SERVICES_FUNCTIONS_ENABLED=false -p 127.0.0.1:4577:4577 \
+  floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
+```
+
+The opt-in test and a manual CLI run covered list, get, set, ensure (AWS),
+GCP's and Azure's refused ensure, and search. Exact commands, outputs, and
+limitations are in [`docs/floci.md`](docs/floci.md). No global Docker cleanup
+was performed. These tests do not make the adapters "production verified": the
+emulator does not validate AWS SigV4 signatures, and it does not prove real
+cloud authentication, IAM, quotas, or regional behavior.
 
 ## Roadmap
 
 The provider boundary is a Rust trait plus one configuration variant and one
 metadata row. Future adapters, **none of which are implemented today**:
 
-- Azure Key Vault
-- AWS Secrets Manager / SSM Parameter Store
-- Google Cloud Secret Manager
+- AWS SSM Parameter Store (Secrets Manager is implemented)
 - Cloudflare Secrets Store
 - 1Password (Service Accounts / Connect)
 - Bitwarden Secrets Manager
@@ -354,14 +464,42 @@ into a child environment; it does not rewrite request bodies.
 
 ## Verification in this change
 
-Run and reported:
+Run in this worktree on 2026-11-17:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release --lib
-cc examples/ffi_smoke.c ... && /tmp/nsvault-ffi-smoke
+cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
+   -Wl,-rpath,"$PWD/target/release" -o <tmp>/nsvault-ffi-smoke
+<tmp>/nsvault-ffi-smoke
 ```
 
-See the final report for the exact counts and any caveats.
+Observed:
+
+```text
+cargo fmt --check                         clean
+cargo clippy --all-targets -- -D warnings clean
+cargo test                                71 lib + 1 AWS contract + 26 CLI
+                                          + 3 FFI passed;
+                                          0 failed; 3 cloud + 1 Vault
+                                          container tests ignored
+cargo build --release --lib               succeeded
+C ABI smoke                               exit 0, "redacted error received
+                                          (34 bytes)"
+```
+
+The opt-in Vault and cloud emulator tests also passed:
+
+```sh
+cargo test --test container_vault -- --ignored --nocapture
+# 1 passed; 0 failed
+
+cargo test --test container_cloud -- --ignored --nocapture
+# 3 passed; 0 failed
+```
+
+The C ABI binary was written under a private cache directory because `/tmp` on
+this machine was at a per-process disk quota; the compile and link command was
+otherwise the documented one. No claim here covers a live cloud service.

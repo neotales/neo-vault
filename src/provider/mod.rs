@@ -3,6 +3,9 @@
 #[allow(unsafe_code)]
 mod lock;
 
+pub mod aws;
+pub mod azure;
+pub mod gcp;
 pub mod github;
 pub mod infisical;
 pub mod keepass;
@@ -211,6 +214,15 @@ fn build(name: &str, profile: &ProviderConfig, root: &Path) -> Result<Arc<dyn Pr
         ProviderConfig::Github(config) => {
             Arc::new(github::GithubProvider::new(name, config, root)?)
         }
+        ProviderConfig::AwsSecretsManager(config) => {
+            Arc::new(aws::AwsSecretsManagerProvider::new(name, config, root)?)
+        }
+        ProviderConfig::GcpSecretManager(config) => {
+            Arc::new(gcp::GcpSecretManagerProvider::new(name, config, root)?)
+        }
+        ProviderConfig::AzureKeyVault(config) => {
+            Arc::new(azure::AzureKeyVaultProvider::new(name, config, root)?)
+        }
     };
     Ok(provider)
 }
@@ -383,7 +395,7 @@ impl HttpClient {
         }
     }
 
-    /// Performs a request, optionally with a bearer token and JSON body.
+    /// Performs a request, optionally with an authentication header and body.
     ///
     /// The caller supplies the token as a secret; it is never logged.
     ///
@@ -408,6 +420,48 @@ impl HttpClient {
             )),
             None => None,
         };
+        self.send(method, url, token, extra_headers, content_type, body)
+    }
+
+    /// Performs a request with `Authorization: Bearer <token>`.
+    ///
+    /// The temporary header value is zeroized when the request returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted credential, transport, or response-too-large error.
+    /// HTTP status codes are returned to the caller.
+    pub fn request_bearer(
+        &self,
+        method: &str,
+        url: &url::Url,
+        token: &Secret,
+        extra_headers: &[(&str, &str)],
+        content_type: &str,
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse> {
+        let token = std::str::from_utf8(token.expose())
+            .map_err(|_| Error::new("credential is not valid UTF-8"))?;
+        let value = zeroize::Zeroizing::new(format!("Bearer {token}"));
+        self.send(
+            method,
+            url,
+            Some(("Authorization", value.as_str())),
+            extra_headers,
+            content_type,
+            body,
+        )
+    }
+
+    fn send(
+        &self,
+        method: &str,
+        url: &url::Url,
+        token: Option<(&str, &str)>,
+        extra_headers: &[(&str, &str)],
+        content_type: &str,
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse> {
         let response = match method {
             "GET" => {
                 let mut request = self

@@ -1410,6 +1410,7 @@ dependencies = [
  "hmac",
  "libc",
  "pbkdf2",
+ "percent-encoding",
  "rpassword",
  "serde",
  "serde_json",
