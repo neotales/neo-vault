@@ -1,0 +1,46 @@
+[package]
+name = "nsvault"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+description = "Automation-first secrets proxy with directory-scoped configuration and process-safe secret handling"
+repository = "https://github.com/neotales/neo-secrets-vault"
+readme = "README.md"
+keywords = ["secrets", "vault", "automation", "cli"]
+categories = ["command-line-utilities", "authentication"]
+
+[lib]
+name = "nsvault"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "nsvault"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+crypto_box = { version = "0.9", features = ["seal"] }
+rpassword = "7.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+toml = "0.9"
+ureq = "3.5"
+url = "2"
+zeroize = "1.9"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+
+[lints.clippy]
+all = "warn"
+
+[dev-dependencies]
+testcontainers = { version = "0.28", features = ["blocking"] }
