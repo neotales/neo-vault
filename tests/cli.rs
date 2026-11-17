@@ -1301,8 +1301,8 @@ provider = "i"
 kind = "infisical"
 address = "http://127.0.0.1:{port}"
 project_id = "test-project"
-environment = "test"
-path = "/apps"
+environment = "dev"
+path = "/"
 token_env = "TEST_INFISICAL_TOKEN"
 allow_http_loopback = true
 "#
@@ -1312,8 +1312,8 @@ allow_http_loopback = true
 }
 
 #[test]
-fn infisical_ensure_is_refused_without_contacting_the_provider() {
-    let fixture = Fixture::start();
+fn infisical_ensure_uses_create_and_reports_a_duplicate_as_present() {
+    let fixture = InfisicalFixture::start();
     let directory = tempfile_dir();
     infisical_config(&directory, fixture.port);
     let environment = [("TEST_INFISICAL_TOKEN", "test-token")];
@@ -1321,28 +1321,76 @@ fn infisical_ensure_is_refused_without_contacting_the_provider() {
     let providers = run(&directory, &["providers"], &environment, None);
     assert!(providers.status.success(), "{}", stderr(&providers));
     assert!(
-        stdout(&providers).contains("ensure=false"),
+        stdout(&providers).contains("ensure=true"),
         "{}",
         stdout(&providers)
     );
 
-    let ensured = run(
+    let present = run(
         &directory,
-        &["ensure", "DB"],
+        &["ensure", "--json", "APP_DB"],
         &environment,
-        Some(b"must-not-run\n"),
+        Some(b"must-not-replace\n"),
     );
-    assert!(!ensured.status.success());
+    assert!(present.status.success(), "{}", stderr(&present));
+    assert_eq!(stdout(&present), "{\"status\":\"present\"}\n");
+    assert!(!stdout(&present).contains("must-not-replace"));
+    assert!(!stderr(&present).contains("must-not-replace"));
+
+    let requests = fixture.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST"
+                && request.path.starts_with("/api/v4/secrets/APP_DB?"))
+            .count(),
+        1,
+        "ensure must send one Create request"
+    );
     assert!(
-        stderr(&ensured).contains("does not support ensure"),
+        !requests.iter().any(|request| {
+            request.method == "GET" || request.method == "PATCH" || request.method == "PUT"
+        }),
+        "ensure must not read or update before/after the atomic create"
+    );
+
+    let ambiguous = run(
+        &directory,
+        &["ensure", "--json", "AMBIGUOUS"],
+        &environment,
+        Some(b"must-not-land\n"),
+    );
+    assert!(!ambiguous.status.success());
+    assert!(
+        stderr(&ambiguous).contains("HTTP 500"),
         "{}",
-        stderr(&ensured)
+        stderr(&ambiguous)
     );
-    assert!(!stderr(&ensured).contains("must-not-run"));
+    assert!(!stdout(&ambiguous).contains("present"));
+    assert!(!stdout(&ambiguous).contains("must-not-land"));
+    assert!(!stderr(&ambiguous).contains("must-not-land"));
+    let requests = fixture.requests();
     assert!(
-        fixture.requests().is_empty(),
-        "a disabled ensure must not reach the provider"
+        requests.iter().any(|request| {
+            request.method == "POST" && request.path.starts_with("/api/v4/secrets/AMBIGUOUS?")
+        }),
+        "an ambiguous create result must be surfaced as an error"
     );
+
+    let approval = run(
+        &directory,
+        &["ensure", "--json", "APPROVAL"],
+        &environment,
+        Some(b"must-not-land\n"),
+    );
+    assert!(!approval.status.success());
+    assert!(
+        stderr(&approval).contains("did not confirm creating"),
+        "{}",
+        stderr(&approval)
+    );
+    assert!(!stdout(&approval).contains("created"));
+    assert!(!stdout(&approval).contains("must-not-land"));
 }
 
 fn make_executable(path: &Path) {
@@ -2070,6 +2118,18 @@ fn infisical_response(request: &Request) -> String {
             r#"{"secret":{"secretKey":"APP_DB","secretValue":"stored-value","secretValueHidden":false}}"#,
         ),
         ("GET", _) => simple_response("404 Not Found", r#"{"message":"not found"}"#),
+        ("POST", "/api/v4/secrets/APP_DB") => simple_response(
+            "400 Bad Request",
+            r#"{"statusCode":400,"message":"Secret 'APP_DB' already exists in path '/' of environment 'dev'","error":"BadRequest"}"#,
+        ),
+        ("POST", "/api/v4/secrets/AMBIGUOUS") => simple_response(
+            "500 Internal Server Error",
+            r#"{"statusCode":500,"message":"Something went wrong","error":"Create"}"#,
+        ),
+        ("POST", "/api/v4/secrets/APPROVAL") => simple_response(
+            "200 OK",
+            r#"{"approval":{"id":"approval-id","slug":"approval-slug"}}"#,
+        ),
         ("POST" | "PATCH", _) => simple_response("200 OK", r#"{"secret":{"secretKey":"written"}}"#),
         _ => simple_response("405 Method Not Allowed", "{}"),
     }
@@ -2129,10 +2189,12 @@ allow_http_loopback = true
         &directory,
         &["ensure", "APP_NEW2", "--json"],
         &environment,
-        Some(b"ignored"),
+        Some(b"created-value"),
     );
-    assert!(!ensured.status.success());
-    assert!(stderr(&ensured).contains("does not support ensure"));
+    assert!(ensured.status.success(), "{}", stderr(&ensured));
+    assert_eq!(stdout(&ensured), "{\"status\":\"created\"}\n");
+    assert!(!stdout(&ensured).contains("created-value"));
+    assert!(!stderr(&ensured).contains("created-value"));
 
     let requests = fixture.requests();
     assert!(requests.len() >= 6, "expected several requests");
@@ -2160,10 +2222,16 @@ allow_http_loopback = true
         request.method == "POST" && request.path.starts_with("/api/v4/secrets/APP_NEW?")
     }));
     assert!(
+        requests.iter().any(|request| {
+            request.method == "POST" && request.path.starts_with("/api/v4/secrets/APP_NEW2?")
+        }),
+        "ensure must use the Create request"
+    );
+    assert!(
         !requests
             .iter()
-            .any(|request| request.path.contains("APP_NEW2")),
-        "a refused ensure must not contact the provider"
+            .any(|request| { request.path.contains("APP_NEW2") && request.method != "POST" }),
+        "ensure must not check for existence before creating"
     );
 }
 

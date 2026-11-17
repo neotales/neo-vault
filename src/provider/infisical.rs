@@ -6,9 +6,13 @@
 //! never prints a response body in an error.
 //!
 //! `set` is a GET-then-POST/PATCH write under the same-user write lock.
-//! `ensure` is disabled: the v4 Create endpoint's behavior for a duplicate
-//! name has not been verified against a live server, and an unproven
-//! check-then-create would risk replacing another writer's value.
+//! `ensure` sends only the v4 Create request. The pinned v0.167.11 server
+//! enforces a partial unique index on (`key`, `folderId`) for shared secrets,
+//! so a duplicate create is rejected rather than treated as an update. A
+//! duplicate `400` is recognized by the exact server message and reported as
+//! present; any other status, including the generic `500` a concurrent create
+//! can receive when it loses that unique-index race, is an error and not
+//! absence.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -19,7 +23,9 @@ use serde_json::json;
 use crate::config::InfisicalConfig;
 use crate::error::{Error, Result};
 use crate::key::Key;
-use crate::provider::{Capabilities, HttpClient, ListedKey, Provider, endpoint};
+use crate::provider::{
+    Capabilities, EnsureStatus, HttpClient, HttpResponse, ListedKey, Provider, endpoint,
+};
 use crate::secret::Secret;
 
 /// Infisical provider.
@@ -168,6 +174,18 @@ impl InfisicalProvider {
         }
     }
 
+    fn write_body(&self, value: &str) -> String {
+        json!({
+            "projectId": &self.project_id,
+            "environment": &self.environment,
+            "secretPath": &self.path,
+            "secretValue": value,
+            "type": "shared",
+            "skipMultilineEncoding": true,
+        })
+        .to_string()
+    }
+
     fn write_identity(&self) -> Result<String> {
         let origin = crate::provider::lock::canonical_origin(&self.base)?;
         Ok(crate::provider::lock::identity(
@@ -192,10 +210,9 @@ impl Provider for InfisicalProvider {
             read: true,
             write: true,
             list: true,
-            // Disabled until the v4 Create endpoint is proven to reject a
-            // duplicate rather than upsert it. Without that proof a lost
-            // check-then-create race could replace another writer's value.
-            ensure: false,
+            // The v4 Create request is an atomic insert guarded by the
+            // server's partial unique index; it never updates an existing row.
+            ensure: true,
         }
     }
 
@@ -300,15 +317,7 @@ impl Provider for InfisicalProvider {
             .map_err(|_| Error::new("Infisical values must be UTF-8 text"))?;
         let authorization = self.authorization()?;
         let url = self.secret_url(key.path())?;
-        let body = json!({
-            "projectId": &self.project_id,
-            "environment": &self.environment,
-            "secretPath": &self.path,
-            "secretValue": value,
-            "type": "shared",
-            "skipMultilineEncoding": true,
-        })
-        .to_string();
+        let body = self.write_body(value);
         let existing = self.client.request(
             "GET",
             &url,
@@ -332,6 +341,74 @@ impl Provider for InfisicalProvider {
         )?;
         self.map_status(response.status, key.path())
     }
+
+    fn ensure(&self, raw_key: &str, value: &Secret) -> Result<EnsureStatus> {
+        let _write_lock = crate::provider::lock::acquire(&self.write_identity()?)?;
+        let key = Key::parse(raw_key)?;
+        if key.field().is_some() {
+            return Err(Error::new(
+                "Infisical keys do not have fields; use the secret name directly",
+            ));
+        }
+        let value = std::str::from_utf8(value.expose())
+            .map_err(|_| Error::new("Infisical values must be UTF-8 text"))?;
+        let authorization = self.authorization()?;
+        let url = self.secret_url(key.path())?;
+        let body = self.write_body(value);
+        let response = self.client.request(
+            "POST",
+            &url,
+            Some(("Authorization", &authorization)),
+            &[],
+            "application/json",
+            Some(body.as_bytes()),
+        )?;
+        match response.status {
+            200 | 201 => {
+                #[derive(Deserialize)]
+                struct CreateResponse {
+                    #[serde(default)]
+                    secret: Option<serde_json::Value>,
+                }
+                let created: CreateResponse = HttpClient::json(&response)?;
+                if created.secret.is_some() {
+                    Ok(EnsureStatus::Created)
+                } else {
+                    Err(Error::new(format!(
+                        "Infisical did not confirm creating {:?}; an approval may be required",
+                        key.path()
+                    )))
+                }
+            }
+            400 if is_duplicate_create(&response, key.path(), &self.path, &self.environment) => {
+                Ok(EnsureStatus::Present)
+            }
+            status => {
+                self.map_status(status, key.path())?;
+                Err(Error::new(format!(
+                    "Infisical returned HTTP {status} for {:?}",
+                    key.path()
+                )))
+            }
+        }
+    }
+}
+
+fn is_duplicate_create(response: &HttpResponse, key: &str, path: &str, environment: &str) -> bool {
+    if response.status != 400 {
+        return false;
+    }
+    #[derive(Deserialize)]
+    struct ApiError {
+        #[serde(default)]
+        message: Option<String>,
+    }
+    let Ok(error) = HttpClient::json::<ApiError>(response) else {
+        return false;
+    };
+    let expected =
+        format!("Secret '{key}' already exists in path '{path}' of environment '{environment}'");
+    error.message.as_deref() == Some(expected.as_str())
 }
 
 fn normalize_path(path: &str) -> String {
@@ -346,7 +423,7 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_path;
+    use super::{HttpResponse, is_duplicate_create, normalize_path};
 
     #[test]
     fn normalizes_folder_paths() {
@@ -354,5 +431,35 @@ mod tests {
         assert_eq!(normalize_path("/"), "/");
         assert_eq!(normalize_path("apps/"), "/apps");
         assert_eq!(normalize_path("/apps/"), "/apps");
+    }
+
+    #[test]
+    fn recognizes_only_the_exact_duplicate_create_error() {
+        let body = br#"{"message":"Secret 'DB' already exists in path '/apps' of environment 'dev'","error":"BadRequest"}"#;
+        let response = HttpResponse {
+            status: 400,
+            body: body.to_vec(),
+        };
+        assert!(is_duplicate_create(&response, "DB", "/apps", "dev"));
+        assert!(!is_duplicate_create(&response, "DB", "/other", "dev"));
+        assert!(!is_duplicate_create(&response, "DB", "/apps", "prod"));
+
+        let ambiguous = HttpResponse {
+            status: 500,
+            body: body.to_vec(),
+        };
+        assert!(!is_duplicate_create(&ambiguous, "DB", "/apps", "dev"));
+
+        let validation = HttpResponse {
+            status: 400,
+            body: br#"{"message":"Secret name is invalid","error":"BadRequest"}"#.to_vec(),
+        };
+        assert!(!is_duplicate_create(&validation, "DB", "/apps", "dev"));
+
+        let malformed = HttpResponse {
+            status: 400,
+            body: b"not json".to_vec(),
+        };
+        assert!(!is_duplicate_create(&malformed, "DB", "/apps", "dev"));
     }
 }
