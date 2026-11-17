@@ -166,6 +166,11 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 - Windows and macOS were not exercised. The code avoids Unix-only calls outside
   the `bw`/`keepassxc-cli`/`pass-cli` process boundary, but that is not a
   portability claim.
+- There is no backup import or export. See the roadmap. No age identity,
+  recipient, or encrypted backup file is read or written.
+- There is no request-rewriting proxy, placeholder syntax, or second
+  executable. `exec` does not edit outbound HTTP bodies. A proxy remains an
+  open question on the roadmap, not a committed design.
 
 ## Using the Rust crate
 
@@ -268,6 +273,28 @@ Adding one means: a validated non-secret config variant, an adapter implementing
 `Provider`, a capability row, fixture tests, and a doc update. There is no plugin
 ABI, dynamic loading, or network fallback; an unsupported `kind` is rejected at
 configuration parse time.
+
+Backup import and export are also not implemented. A later increment may add
+one common encrypted file format, using [age](https://age-encryption.org/), so
+a store can be backed up and moved between machines. That work is not started.
+This build has no `import` command, no `export` command, no age recipient or
+identity field, and no age dependency. An age file created elsewhere is not a
+nsvault backup and cannot be loaded.
+
+A local proxy that replaces secret placeholders in agent requests is a future
+consideration, not a design this project has accepted. One sketch, still
+uncommitted, is a separate executable that shares crates with `nsvault`
+instead of growing the `nsvault` binary. Nothing here chooses that split,
+a placeholder syntax, a listen address, or a wire format.
+
+If that work is ever started, the trust boundary has to be explicit: the
+process would see secret values and the request bodies it rewrites, so it is
+not a transparent hop and not a reason to log either. It would also need
+injection and egress controls before it could be used: which hosts it may
+contact, which placeholders it may expand, and a refusal to send a value to
+an unexpected URL. None of that exists today. There is no proxy binary, no
+placeholder syntax, and no local listener. `nsvault exec` only exports names
+into a child environment; it does not rewrite request bodies.
 
 ## Verification in this change
 
