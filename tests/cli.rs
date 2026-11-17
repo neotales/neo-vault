@@ -3,7 +3,7 @@
 //! No real provider credential or remote service is used. The HTTP fixture is
 //! loopback-only, and the CLI fixtures are temporary scripts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -199,6 +199,10 @@ fn vault_response(request: &Request) -> String {
         ("404 Not Found", String::new())
     };
     let (status, body) = status_and_body;
+    simple_response(status, &body)
+}
+
+fn simple_response(status: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -280,6 +284,7 @@ struct VaultMergeFixture {
     port: u16,
     requests: Arc<Mutex<Vec<Request>>>,
     state: Arc<Mutex<BTreeMap<String, Map<String, Value>>>>,
+    patch_404: Arc<Mutex<BTreeSet<String>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -290,6 +295,7 @@ impl VaultMergeFixture {
         let port = listener.local_addr().expect("address").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(Mutex::new(BTreeMap::new()));
+        let patch_404 = Arc::new(Mutex::new(BTreeSet::new()));
         state.lock().expect("state").insert(
             "apps/prod/db".to_owned(),
             serde_json::from_value(json!({"user": "alice", "value": "old"}))
@@ -298,6 +304,7 @@ impl VaultMergeFixture {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_requests = Arc::clone(&requests);
         let thread_state = Arc::clone(&state);
+        let thread_patch_404 = Arc::clone(&patch_404);
         let thread_stop = Arc::clone(&stop);
         thread::spawn(move || {
             while !thread_stop.load(Ordering::Relaxed) {
@@ -309,7 +316,8 @@ impl VaultMergeFixture {
                                 .lock()
                                 .expect("requests")
                                 .push(request.clone());
-                            let response = vault_merge_response(&request, &thread_state);
+                            let response =
+                                vault_merge_response(&request, &thread_state, &thread_patch_404);
                             let _ = stream.write_all(response.as_bytes());
                         }
                     }
@@ -324,8 +332,16 @@ impl VaultMergeFixture {
             port,
             requests,
             state,
+            patch_404,
             stop,
         }
+    }
+
+    fn force_patch_404(&self, path: &str) {
+        self.patch_404
+            .lock()
+            .expect("patch 404 state")
+            .insert(path.to_owned());
     }
 }
 
@@ -343,6 +359,7 @@ fn request_data(body: &[u8]) -> Option<Map<String, Value>> {
 fn vault_merge_response(
     request: &Request,
     state: &Arc<Mutex<BTreeMap<String, Map<String, Value>>>>,
+    patch_404: &Arc<Mutex<BTreeSet<String>>>,
 ) -> String {
     let (status, body) = if let Some(path) = request.path.strip_prefix("/v1/secret/data/") {
         let path = path.split('?').next().unwrap_or(path);
@@ -352,29 +369,78 @@ fn vault_merge_response(
                 Some(data) => ("200 OK", json!({"data": {"data": data}}).to_string()),
                 None => ("404 Not Found", String::new()),
             },
-            "PATCH" => match (state.get_mut(path), request_data(&request.body)) {
-                (Some(existing), Some(changes)) => {
-                    existing.extend(changes);
-                    ("204 No Content", String::new())
+            "PATCH" => {
+                if patch_404.lock().expect("patch 404 state").remove(path) {
+                    ("404 Not Found", String::new())
+                } else {
+                    match (state.get_mut(path), request_data(&request.body)) {
+                        (Some(existing), Some(changes)) => {
+                            existing.extend(changes);
+                            ("204 No Content", String::new())
+                        }
+                        _ => ("404 Not Found", String::new()),
+                    }
                 }
-                _ => ("404 Not Found", String::new()),
-            },
-            "POST" => match request_data(&request.body) {
-                Some(data) => {
-                    state.insert(path.to_owned(), data);
-                    ("204 No Content", String::new())
+            }
+            "POST" => {
+                let parsed: Value = match serde_json::from_slice(&request.body) {
+                    Ok(parsed) => parsed,
+                    Err(_) => return simple_response("400 Bad Request", ""),
+                };
+                let Some(data) = request_data(&request.body) else {
+                    return simple_response("400 Bad Request", "");
+                };
+                let cas = parsed.pointer("/options/cas").and_then(Value::as_u64);
+                if cas == Some(0) && state.contains_key(path) {
+                    // Simulate a concurrent creator winning between PATCH 404
+                    // and the CAS 0 create attempt.
+                    return simple_response("400 Bad Request", "");
                 }
-                None => ("400 Bad Request", String::new()),
-            },
+                state.insert(path.to_owned(), data);
+                ("204 No Content", String::new())
+            }
             _ => ("405 Method Not Allowed", String::new()),
         }
     } else {
         ("404 Not Found", String::new())
     };
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
+    simple_response(status, &body)
+}
+
+#[test]
+fn vault_create_cas_conflict_does_not_destroy_existing_fields() {
+    let fixture = VaultMergeFixture::start();
+    fixture.force_patch_404("apps/prod/db");
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let environment = [("TEST_VAULT_TOKEN", "test-token")];
+
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &environment,
+        Some(b"must-not-win\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("concurrently"));
+
+    let state = fixture.state.lock().expect("state");
+    let data = state.get("apps/prod/db").expect("db state");
+    assert_eq!(data.get("user").and_then(Value::as_str), Some("alice"));
+    assert_eq!(data.get("value").and_then(Value::as_str), Some("old"));
+    drop(state);
+
+    let requests = fixture.requests.lock().expect("requests");
+    let create = requests
+        .iter()
+        .find(|request| request.method == "POST")
+        .expect("CAS create request");
+    let body: Value = serde_json::from_slice(&create.body).expect("create body");
+    assert_eq!(
+        body.pointer("/options/cas").and_then(Value::as_u64),
+        Some(0)
+    );
+    assert!(requests.iter().any(|request| request.method == "PATCH"));
 }
 
 #[test]

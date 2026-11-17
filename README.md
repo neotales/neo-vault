@@ -108,9 +108,10 @@ Collisions and invalid names fail rather than guessing.
 `nsvault hook bash` (or `zsh`, `fish`) prints a shell function that tracks the
 working directory and sets `NSVAULT_DIR`. It does **not** fetch secrets just
 because you changed directory. Set `NSVAULT_AUTOLOAD=1` to opt into
-`nsvault env` on directory change; previously exported names are unset through
-`NSVAULT_LOADED_KEYS` first. A child process or a shell history still sees
-exported values, so autoload is a deliberate trade.
+`nsvault env` on directory change. On every directory change, names recorded in
+`NSVAULT_LOADED_KEYS` are unset first, even if autoload is now disabled; only
+fetching new values is gated by `NSVAULT_AUTOLOAD`. A child process or a shell
+history still sees exported values, so autoload is a deliberate trade.
 
 ## Providers
 

@@ -252,7 +252,21 @@ impl Provider for VaultProvider {
         // used only to create a path that does not exist yet.
         let response = self.request("PATCH", &url, Some(body.as_bytes()))?;
         if response.status == 404 && key.field().is_none() {
-            let response = self.request("POST", &url, Some(body.as_bytes()))?;
+            // CAS 0 means "create only if this path still does not exist".
+            // Without it, a concurrent creator could lose its fields to this
+            // unconditional overwrite.
+            let create = json!({
+                "data": { "value": text },
+                "options": { "cas": 0 }
+            })
+            .to_string();
+            let response = self.request("POST", &url, Some(create.as_bytes()))?;
+            if matches!(response.status, 400 | 409) {
+                return Err(Error::new(format!(
+                    "Vault refused to create {:?} with CAS 0; the secret may have been created concurrently",
+                    key.path()
+                )));
+            }
             return self.map_status(response.status, key.path());
         }
         self.map_status(response.status, key.path())

@@ -155,12 +155,12 @@ fn bash_hook() -> String {
   else
     unset NSVAULT_DIR
   fi
-  if [ "${NSVAULT_AUTOLOAD:-0}" = "1" ]; then
-    if [ -n "${NSVAULT_LOADED_KEYS:-}" ]; then
-      for key in $NSVAULT_LOADED_KEYS; do unset "$key"; done
-      unset NSVAULT_LOADED_KEYS
-    fi
-    [ -n "$root" ] && eval "$(nsvault env --shell bash 2>/dev/null)"
+  if [ -n "${NSVAULT_LOADED_KEYS:-}" ]; then
+    for key in $NSVAULT_LOADED_KEYS; do unset "$key"; done
+    unset NSVAULT_LOADED_KEYS
+  fi
+  if [ "${NSVAULT_AUTOLOAD:-0}" = "1" ] && [ -n "$root" ]; then
+    eval "$(nsvault env --shell bash 2>/dev/null)"
   fi
 }
 case ";${PROMPT_COMMAND:-};" in
@@ -181,12 +181,12 @@ fn zsh_hook() -> String {
   else
     unset NSVAULT_DIR
   fi
-  if [ "${NSVAULT_AUTOLOAD:-0}" = "1" ]; then
-    if [ -n "${NSVAULT_LOADED_KEYS:-}" ]; then
-      for key in ${(z)NSVAULT_LOADED_KEYS}; do unset "$key"; done
-      unset NSVAULT_LOADED_KEYS
-    fi
-    [ -n "$root" ] && eval "$(nsvault env --shell zsh 2>/dev/null)"
+  if [ -n "${NSVAULT_LOADED_KEYS:-}" ]; then
+    for key in ${(z)NSVAULT_LOADED_KEYS}; do unset "$key"; done
+    unset NSVAULT_LOADED_KEYS
+  fi
+  if [ "${NSVAULT_AUTOLOAD:-0}" = "1" ] && [ -n "$root" ]; then
+    eval "$(nsvault env --shell zsh 2>/dev/null)"
   fi
 }
 autoload -Uz add-zsh-hook
@@ -204,16 +204,14 @@ fn fish_hook() -> String {
     else
         set -e NSVAULT_DIR
     end
-    if test "$NSVAULT_AUTOLOAD" = "1"
-        if set -q NSVAULT_LOADED_KEYS
-            for key in (string split ' ' -- $NSVAULT_LOADED_KEYS)
-                set -e $key
-            end
-            set -e NSVAULT_LOADED_KEYS
+    if set -q NSVAULT_LOADED_KEYS
+        for key in (string split ' ' -- $NSVAULT_LOADED_KEYS)
+            set -e $key
         end
-        if test -n "$root"
-            nsvault env --shell fish 2>/dev/null | source
-        end
+        set -e NSVAULT_LOADED_KEYS
+    end
+    if test "$NSVAULT_AUTOLOAD" = "1"; and test -n "$root"
+        nsvault env --shell fish 2>/dev/null | source
     end
 end
 _nsvault_hook
@@ -223,8 +221,8 @@ _nsvault_hook
 
 #[cfg(test)]
 mod tests {
-    use super::{Export, quote_fish, quote_posix, render_env};
-    use crate::cli::EnvShell;
+    use super::{Export, hook, quote_fish, quote_posix, render_env};
+    use crate::cli::{EnvShell, HookShell};
     use crate::secret::Secret;
 
     #[test]
@@ -238,6 +236,100 @@ mod tests {
         assert_eq!(quote_fish("a'b\\c"), "'a\\'b\\\\c'");
     }
 
+    #[test]
+    fn hooks_clean_loaded_names_before_considering_autoload() {
+        for shell in [HookShell::Bash, HookShell::Zsh, HookShell::Fish] {
+            let script = hook(shell);
+            let cleanup = script
+                .find("NSVAULT_LOADED_KEYS")
+                .expect("cleanup bookkeeping");
+            let autoload = script.find("NSVAULT_AUTOLOAD").expect("autoload check");
+            assert!(
+                cleanup < autoload,
+                "{shell:?} hook checks autoload before cleanup"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_hook_cleans_exports_when_autoload_is_disabled() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let base = std::env::temp_dir().join(format!(
+            "nsvault-hook-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let bin = base.join("bin");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&other).expect("other");
+
+        let fake = bin.join("nsvault");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+case "$1" in
+  dir) printf '%s\n' "$FAKE_NSVAULT_DIR" ;;
+  env) printf '%s\n' "export FAKE_SECRET='loaded'" "export NSVAULT_LOADED_KEYS='FAKE_SECRET'" ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .expect("fake nsvault");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake nsvault");
+
+        let hook_file = base.join("hook.bash");
+        std::fs::write(&hook_file, hook(HookShell::Bash)).expect("hook file");
+        let script = base.join("test.bash");
+        std::fs::write(
+            &script,
+            format!(
+                r#"export PATH="{}:$PATH"
+export FAKE_NSVAULT_DIR="{}"
+export NSVAULT_AUTOLOAD=1
+source "{}"
+_nsvault_hook
+[ "${{FAKE_SECRET:-}}" = "loaded" ] || exit 20
+[ "${{NSVAULT_LOADED_KEYS:-}}" = "FAKE_SECRET" ] || exit 21
+export NSVAULT_AUTOLOAD=0
+cd "{}"
+_nsvault_hook
+[ -z "${{FAKE_SECRET+x}}" ] || exit 22
+[ -z "${{NSVAULT_LOADED_KEYS+x}}" ] || exit 23
+"#,
+                bin.display(),
+                root.display(),
+                hook_file.display(),
+                other.display(),
+            ),
+        )
+        .expect("test script");
+
+        let output = Command::new("bash")
+            .arg("--noprofile")
+            .arg("--norc")
+            .arg(&script)
+            .output()
+            .expect("bash is required for the hook regression test");
+        let mut stderr = std::io::stderr();
+        stderr.write_all(&output.stderr).expect("write bash stderr");
+        assert!(
+            output.status.success(),
+            "bash hook transition failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
     #[test]
     fn fish_bookkeeping_never_uses_posix_export_syntax() {
         let exports = vec![Export {

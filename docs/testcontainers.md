@@ -14,10 +14,11 @@ cleanup or remove unrelated containers, volumes, networks, or images.
 - dummy root token: `nsvault-test-root-token` (not a real credential)
 - only its own mapped port and container
 
-The test covers the security fix directly: after writing `value` and a sibling
-`user` field, it replaces `value` without `#field` and asserts that `user`
-survives. This proves the adapter uses a merge patch for an existing secret,
-not a whole-secret POST replacement.
+The test covers the security fixes directly: after writing `value` and a
+sibling `user` field, it replaces `value` without `#field` and asserts that
+`user` survives. This proves the adapter uses a merge patch for an existing
+secret, not a whole-secret POST replacement. The initial create also exercises
+the Vault KV v2 CAS 0 create body on a real server.
 
 Run it explicitly:
 
