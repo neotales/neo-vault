@@ -13,7 +13,7 @@ These are product limits, not temporary bugs.
 - KeePass, Proton, and Vaultwarden cannot `set` or `ensure`. Proton stays read-only because the documented update takes the value in `argv`.
 - Vaultwarden list uses `bw list items`, which returns full items. The adapter keeps names and must not return the password from `ls`.
 - GitHub cannot `get` or `ensure`. Repository Actions secrets only.
-- The same-user write lock is Linux `flock` in `$XDG_STATE_HOME/nsvault/locks` or `NSVAULT_LOCK_DIR`. An existing directory is never chmodded; a symlink, foreign owner, or group/world-accessible directory is refused. It does not stop the Vault CLI, another host, or another OS user. Windows and macOS were not exercised.
+- The same-user write lock is Linux `flock` in `$XDG_STATE_HOME/nsvault/locks` or `NSVAULT_LOCK_DIR`. An existing directory is never chmodded; a symlink, foreign owner, group/world-accessible directory, or a parent other users can modify is refused. It does not stop the Vault CLI, another host, or another OS user. Windows and macOS were not exercised.
 - No `remove`. No daemon, cache, keyring, or local encrypted store.
 - No `import` and no `export`. An age file is not a nsvault backup.
 - No request-rewriting proxy and no placeholder syntax. `exec` does not edit HTTP bodies. A separate proxy executable is an open question, not a design this project has accepted.

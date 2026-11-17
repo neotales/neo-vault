@@ -289,13 +289,20 @@ fn lists_reads_writes_and_injects_through_the_cli() {
     assert!(stdout(&exports).contains("NSVAULT_LOADED_KEYS='DB'"));
 }
 
+#[derive(Default)]
+struct VaultMergeHooks {
+    race_fields: Mutex<BTreeMap<String, String>>,
+    stale_cas: Mutex<BTreeSet<String>>,
+    malformed_subkeys: Mutex<BTreeSet<String>>,
+    patch_404: Mutex<BTreeSet<String>>,
+    lie_absent: Mutex<BTreeSet<String>>,
+}
+
 struct VaultMergeFixture {
     port: u16,
     requests: Arc<Mutex<Vec<Request>>>,
     state: Arc<Mutex<BTreeMap<String, Map<String, Value>>>>,
-    race_fields: Arc<Mutex<BTreeMap<String, String>>>,
-    patch_404: Arc<Mutex<BTreeSet<String>>>,
-    lie_absent: Arc<Mutex<BTreeSet<String>>>,
+    hooks: Arc<VaultMergeHooks>,
     stop: Arc<AtomicBool>,
 }
 
@@ -307,9 +314,7 @@ impl VaultMergeFixture {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(Mutex::new(BTreeMap::new()));
         let versions = Arc::new(Mutex::new(BTreeMap::new()));
-        let race_fields = Arc::new(Mutex::new(BTreeMap::new()));
-        let patch_404 = Arc::new(Mutex::new(BTreeSet::new()));
-        let lie_absent = Arc::new(Mutex::new(BTreeSet::new()));
+        let hooks = Arc::new(VaultMergeHooks::default());
         state.lock().expect("state").insert(
             "apps/prod/db".to_owned(),
             serde_json::from_value(json!({"user": "alice", "value": "old"}))
@@ -323,9 +328,7 @@ impl VaultMergeFixture {
         let thread_requests = Arc::clone(&requests);
         let thread_state = Arc::clone(&state);
         let thread_versions = Arc::clone(&versions);
-        let thread_race_fields = Arc::clone(&race_fields);
-        let thread_patch_404 = Arc::clone(&patch_404);
-        let thread_lie_absent = Arc::clone(&lie_absent);
+        let thread_hooks = Arc::clone(&hooks);
         let thread_stop = Arc::clone(&stop);
         thread::spawn(move || {
             while !thread_stop.load(Ordering::Relaxed) {
@@ -341,9 +344,7 @@ impl VaultMergeFixture {
                                 &request,
                                 &thread_state,
                                 &thread_versions,
-                                &thread_race_fields,
-                                &thread_patch_404,
-                                &thread_lie_absent,
+                                &thread_hooks,
                             );
                             let _ = stream.write_all(response.as_bytes());
                         }
@@ -359,22 +360,22 @@ impl VaultMergeFixture {
             port,
             requests,
             state,
-            race_fields,
-            patch_404,
-            lie_absent,
+            hooks,
             stop,
         }
     }
 
     fn lie_absent_once(&self, path: &str) {
-        self.lie_absent
+        self.hooks
+            .lie_absent
             .lock()
             .expect("lie absent")
             .insert(path.to_owned());
     }
 
     fn force_patch_404(&self, path: &str) {
-        self.patch_404
+        self.hooks
+            .patch_404
             .lock()
             .expect("patch 404 state")
             .insert(path.to_owned());
@@ -384,10 +385,30 @@ impl VaultMergeFixture {
     /// concurrent writer's creation. The response was computed first, so the
     /// client sees absence while the fixture's version has already advanced.
     fn race_field_creation(&self, path: &str, field: &str) {
-        self.race_fields
+        self.hooks
+            .race_fields
             .lock()
             .expect("race fields")
             .insert(path.to_owned(), field.to_owned());
+    }
+
+    /// Makes the next conditional patch lose: another writer's update lands
+    /// just before it, so the version read by the client is stale.
+    fn stale_cas_once(&self, path: &str) {
+        self.hooks
+            .stale_cas
+            .lock()
+            .expect("stale cas")
+            .insert(path.to_owned());
+    }
+
+    /// Returns a 200 subkeys body without the documented `data.subkeys` map.
+    fn malformed_subkeys_once(&self, path: &str) {
+        self.hooks
+            .malformed_subkeys
+            .lock()
+            .expect("malformed subkeys")
+            .insert(path.to_owned());
     }
 }
 
@@ -406,9 +427,7 @@ fn vault_merge_response(
     request: &Request,
     state: &Arc<Mutex<BTreeMap<String, Map<String, Value>>>>,
     versions: &Arc<Mutex<BTreeMap<String, u64>>>,
-    race_fields: &Arc<Mutex<BTreeMap<String, String>>>,
-    patch_404: &Arc<Mutex<BTreeSet<String>>>,
-    lie_absent: &Arc<Mutex<BTreeSet<String>>>,
+    hooks: &VaultMergeHooks,
 ) -> String {
     let current_version = |path: &str| {
         versions
@@ -424,7 +443,7 @@ fn vault_merge_response(
         .filter(|_| !request.path.contains("list=true"))
     {
         let path = path.split('?').next().unwrap_or(path);
-        if lie_absent.lock().expect("lie absent").remove(path) {
+        if hooks.lie_absent.lock().expect("lie absent").remove(path) {
             ("404 Not Found", String::new())
         } else if state.lock().expect("state").contains_key(path) {
             let version = current_version(path);
@@ -437,6 +456,14 @@ fn vault_merge_response(
         }
     } else if let Some(path) = request.path.strip_prefix("/v1/secret/subkeys/") {
         let path = path.split('?').next().unwrap_or(path);
+        if hooks
+            .malformed_subkeys
+            .lock()
+            .expect("malformed subkeys")
+            .remove(path)
+        {
+            return simple_response("200 OK", r#"{"data":{}}"#);
+        }
         // Compute the response before the simulated concurrent write, so the
         // client is told the field is absent while the version already moved.
         let response = {
@@ -447,12 +474,12 @@ fn vault_merge_response(
                     for key in data.keys() {
                         subkeys.insert(key.clone(), Value::Null);
                     }
-                    ("200 OK", json!({ "subkeys": subkeys }).to_string())
+                    ("200 OK", json!({"data": {"subkeys": subkeys}}).to_string())
                 }
                 None => ("404 Not Found", String::new()),
             }
         };
-        if let Some(field) = race_fields.lock().expect("race fields").remove(path) {
+        if let Some(field) = hooks.race_fields.lock().expect("race fields").remove(path) {
             {
                 let mut state = state.lock().expect("state");
                 if let Some(data) = state.get_mut(path) {
@@ -477,23 +504,57 @@ fn vault_merge_response(
                 }
             }
             "PATCH" => {
-                if patch_404.lock().expect("patch 404 state").remove(path) {
+                if hooks
+                    .patch_404
+                    .lock()
+                    .expect("patch 404 state")
+                    .remove(path)
+                {
                     ("404 Not Found", String::new())
                 } else {
+                    if hooks.stale_cas.lock().expect("stale cas").remove(path) {
+                        // Another writer's update lands after the client read
+                        // the version and before this patch is evaluated.
+                        {
+                            let mut state = state.lock().expect("state");
+                            if let Some(data) = state.get_mut(path) {
+                                data.insert("stale-writer".to_owned(), json!("won"));
+                            }
+                        }
+                        *versions
+                            .lock()
+                            .expect("versions")
+                            .entry(path.to_owned())
+                            .or_insert(1) += 1;
+                    }
                     let parsed: Value =
                         serde_json::from_slice(&request.body).unwrap_or(Value::Null);
                     let cas = parsed.pointer("/options/cas").and_then(Value::as_u64);
                     let version = current_version(path);
-                    let mut state = state.lock().expect("state");
-                    if cas.is_some_and(|cas| cas != version) && state.contains_key(path) {
-                        return simple_response("400 Bad Request", "");
-                    }
-                    match (state.get_mut(path), request_data(&request.body)) {
-                        (Some(existing), Some(changes)) => {
-                            existing.extend(changes);
-                            ("204 No Content", String::new())
+                    let merged = {
+                        let mut state = state.lock().expect("state");
+                        if cas.is_some_and(|cas| cas != version) && state.contains_key(path) {
+                            return simple_response("400 Bad Request", "");
                         }
-                        _ => ("404 Not Found", String::new()),
+                        match (state.get_mut(path), request_data(&request.body)) {
+                            (Some(existing), Some(changes)) => {
+                                existing.extend(changes);
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if merged {
+                        // Vault advances current_version for every successful
+                        // data write.
+                        *versions
+                            .lock()
+                            .expect("versions")
+                            .entry(path.to_owned())
+                            .or_insert(1) += 1;
+                        ("204 No Content", String::new())
+                    } else {
+                        ("404 Not Found", String::new())
                     }
                 }
             }
@@ -781,6 +842,155 @@ fn vault_field_ensure_does_not_overwrite_a_concurrently_created_field() {
         body.pointer("/options/cas").and_then(Value::as_u64),
         Some(1),
         "the patch must use the version read before the absence check"
+    );
+}
+
+#[test]
+fn vault_field_ensure_refuses_a_malformed_subkeys_response() {
+    let fixture = VaultMergeFixture::start();
+    fixture.malformed_subkeys_once("apps/prod/db");
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let environment = [("TEST_VAULT_TOKEN", "test-token")];
+
+    let ensured = run(
+        &directory,
+        &["ensure", "--json", "apps/prod/db#token"],
+        &environment,
+        Some(b"must-not-land\n"),
+    );
+    assert!(!ensured.status.success());
+    assert!(
+        stderr(&ensured).contains("no subkeys map"),
+        "{}",
+        stderr(&ensured)
+    );
+    assert!(!stderr(&ensured).contains("must-not-land"));
+
+    let state = fixture.state.lock().expect("state");
+    let data = state.get("apps/prod/db").expect("db state");
+    assert!(data.get("token").is_none());
+    assert_eq!(data.get("user").and_then(Value::as_str), Some("alice"));
+    assert_eq!(data.get("value").and_then(Value::as_str), Some("old"));
+    drop(state);
+
+    let requests = fixture.requests.lock().expect("requests");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method == "PATCH" || request.method == "POST"),
+        "a malformed subkeys body must not lead to a write"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path.contains("/subkeys/"))
+    );
+}
+
+#[test]
+fn vault_field_ensure_fails_closed_on_a_stale_cas_version() {
+    let fixture = VaultMergeFixture::start();
+    fixture.stale_cas_once("apps/prod/db");
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let environment = [("TEST_VAULT_TOKEN", "test-token")];
+
+    let ensured = run(
+        &directory,
+        &["ensure", "--json", "apps/prod/db#token"],
+        &environment,
+        Some(b"must-not-land\n"),
+    );
+    assert!(!ensured.status.success());
+    assert!(
+        stderr(&ensured).contains("still absent"),
+        "{}",
+        stderr(&ensured)
+    );
+    assert!(!stderr(&ensured).contains("must-not-land"));
+
+    let state = fixture.state.lock().expect("state");
+    let data = state.get("apps/prod/db").expect("db state");
+    assert!(
+        data.get("token").is_none(),
+        "the stale patch must not write"
+    );
+    assert_eq!(
+        data.get("stale-writer").and_then(Value::as_str),
+        Some("won"),
+        "the concurrent write must survive"
+    );
+    assert_eq!(data.get("user").and_then(Value::as_str), Some("alice"));
+    assert_eq!(data.get("value").and_then(Value::as_str), Some("old"));
+    drop(state);
+
+    let requests = fixture.requests.lock().expect("requests");
+    let patches: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .collect();
+    assert_eq!(patches.len(), 1, "a lost CAS race is not retried");
+    let body: Value = serde_json::from_slice(&patches[0].body).expect("patch body");
+    assert_eq!(
+        body.pointer("/options/cas").and_then(Value::as_u64),
+        Some(1),
+        "the patch used the version read before the concurrent write"
+    );
+    assert!(!requests.iter().any(|request| request.method == "POST"));
+}
+
+#[test]
+fn vault_field_ensure_reads_the_version_after_a_previous_write() {
+    let fixture = VaultMergeFixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let environment = [("TEST_VAULT_TOKEN", "test-token")];
+
+    let first = run(
+        &directory,
+        &["ensure", "--json", "apps/prod/db#token"],
+        &environment,
+        Some(b"first-field\n"),
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+    let second = run(
+        &directory,
+        &["ensure", "--json", "apps/prod/db#note"],
+        &environment,
+        Some(b"second-field\n"),
+    );
+    assert!(second.status.success(), "{}", stderr(&second));
+
+    let state = fixture.state.lock().expect("state");
+    let data = state.get("apps/prod/db").expect("db state");
+    assert_eq!(
+        data.get("token").and_then(Value::as_str),
+        Some("first-field")
+    );
+    assert_eq!(
+        data.get("note").and_then(Value::as_str),
+        Some("second-field")
+    );
+    assert_eq!(data.get("user").and_then(Value::as_str), Some("alice"));
+    assert_eq!(data.get("value").and_then(Value::as_str), Some("old"));
+    drop(state);
+
+    let requests = fixture.requests.lock().expect("requests");
+    let cas: Vec<u64> = requests
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .map(|request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("patch body");
+            body.pointer("/options/cas")
+                .and_then(Value::as_u64)
+                .expect("cas")
+        })
+        .collect();
+    assert_eq!(
+        cas,
+        vec![1, 2],
+        "the fixture increments the version after every successful patch"
     );
 }
 

@@ -13,21 +13,41 @@
 //! does not stop the Vault CLI, a provider UI, another host, or a different OS
 //! user; provider CAS remains the control for those writers.
 //!
+//! Coordination also assumes the writers resolve the *same* lock directory.
+//! Two nsvault processes with different `NSVAULT_LOCK_DIR` values, or different
+//! `XDG_STATE_HOME`/`HOME` when it is unset, use different lock files even for
+//! the same provider identity and are not serialized by this mechanism.
+//!
+//! # Filesystem safety
+//!
+//! The lock directory is opened one component at a time with `openat`, each
+//! component is checked for group/other write access (sticky world-writable
+//! directories such as `/tmp` are allowed), and the verified directory
+//! descriptor is retained. The lock file is then created with `openat`
+//! relative to that descriptor, so a path lookup cannot redirect the write
+//! after validation. A missing directory is created with `mkdirat` relative to
+//! its verified parent. No existing directory is ever chmodded, including one
+//! that appears between the `mkdirat` attempt and the open. Creation respects
+//! the process umask: if that leaves a directory that is not exactly
+//! owner-only, acquisition fails instead of repairing it with a chmod.
+//!
 //! # Failure behavior
 //!
-//! Acquisition fails closed. A missing directory is created private; an
-//! existing directory is never chmodded. A directory that is a symbolic link,
-//! is not a directory, is not owned by this user, or is accessible by group or
-//! others is refused. So is a lock file that is not a regular, single-link,
-//! owner-only file, or a platform where the advisory lock cannot be taken.
-//! There is no unlocked fallback and no timeout: a call can wait until the
-//! other nsvault writer exits.
+//! Acquisition fails closed. A directory that is a symbolic link, is not a
+//! directory, is not owned by this user, is accessible by group or others, or
+//! sits under a parent that other users can modify is refused. So is a lock
+//! file that is not a regular, single-link, owner-only file, or a platform
+//! where the advisory lock cannot be taken. There is no unlocked fallback and
+//! no timeout: a call can wait until the other nsvault writer exits.
 
-use std::fs::{self, File, OpenOptions};
+use std::ffi::CString;
+use std::fs::File;
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -91,19 +111,37 @@ pub fn identity(kind: &str, origin: &str, scope: &[&str]) -> String {
 ///
 /// Blocks until this user's other nsvault process releases it. The identity
 /// is hashed into the file name and is not written into the file or the error.
+/// Writers are serialized only when they resolve the same lock directory: the
+/// same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+/// `XDG_STATE_HOME`/`HOME` when it is unset.
 ///
 /// # Errors
 ///
-/// Returns an error when the lock directory cannot be created, is a symbolic
-/// link, is not owned by this user, or is accessible by group or others; when
-/// the lock file is not a regular, single-link, owner-only file; or when the
-/// platform cannot take an advisory lock. It never falls back to an unlocked
-/// write and never changes the mode of an existing directory.
+/// Returns an error when the lock directory cannot be created or opened, is a
+/// symbolic link, is not owned by this user, is accessible by group or others,
+/// or sits under a parent that other users can modify; when the lock file is
+/// not a regular, single-link, owner-only file; or when the platform cannot
+/// take an advisory lock. It never falls back to an unlocked write and never
+/// changes the mode of an existing directory.
 pub fn acquire(identity: &str) -> Result<WriteGuard> {
-    let (dir, create_parents) = lock_dir()?;
-    prepare_dir(&dir, create_parents)?;
-    let path = dir.join(file_name(identity));
-    let (file, created) = open_lock_file(&path)?;
+    #[cfg(unix)]
+    {
+        acquire_unix(identity)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = identity;
+        Err(Error::new(
+            "provider write locks are not implemented on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn acquire_unix(identity: &str) -> Result<WriteGuard> {
+    let (dir, allow_create_ancestors) = lock_spec()?;
+    let directory = LockDirectory::open(&dir, allow_create_ancestors)?;
+    let (file, created) = directory.open_lock(identity)?;
     if created {
         set_file_private(&file)?;
     }
@@ -117,7 +155,7 @@ pub fn acquire(identity: &str) -> Result<WriteGuard> {
 /// Only the default location may create parents. An explicitly configured
 /// `NSVAULT_LOCK_DIR` must have an existing parent; its parent chain is not
 /// created, so a stale or mistyped path fails instead of creating directories.
-fn lock_dir() -> Result<(PathBuf, bool)> {
+fn lock_spec() -> Result<(PathBuf, bool)> {
     if let Some(dir) = std::env::var_os("NSVAULT_LOCK_DIR") {
         if dir.is_empty() {
             return Err(Error::new("NSVAULT_LOCK_DIR is empty"));
@@ -140,121 +178,272 @@ fn lock_dir() -> Result<(PathBuf, bool)> {
     Ok((state.join("nsvault/locks"), true))
 }
 
-/// Creates the directory with `0700` if it is missing. It never chmods an
-/// existing directory: that directory belongs to the caller.
-fn prepare_dir(dir: &Path, create_parents: bool) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let created = match create_private_dir(dir, create_parents) {
-            Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-            Err(_) => {
+/// A resolved, verified lock directory.
+///
+/// Every lock file is opened with `openat` relative to this descriptor, so
+/// replacing the path after validation cannot redirect a write to a different
+/// directory. The descriptor is also the object whose mode and owner were
+/// checked.
+#[cfg(unix)]
+#[derive(Debug)]
+struct LockDirectory {
+    fd: OwnedFd,
+}
+
+#[cfg(unix)]
+impl LockDirectory {
+    /// Resolves `dir` one component at a time and retains the verified
+    /// descriptor. Missing components are created only when
+    /// `allow_create_ancestors` is set (the default state location); otherwise
+    /// only the final component may be created.
+    fn open(dir: &Path, allow_create_ancestors: bool) -> Result<Self> {
+        let names = directory_components(dir)?;
+        Ok(Self {
+            fd: resolve(&names, dir.is_absolute(), allow_create_ancestors)?,
+        })
+    }
+
+    fn open_lock(&self, identity: &str) -> Result<(File, bool)> {
+        open_lock_file(&self.fd, identity)
+    }
+}
+
+/// Splits a lock directory path into plain component names. `..` is refused
+/// rather than resolved, so the walk never leaves the anchor.
+#[cfg(unix)]
+fn directory_components(path: &Path) -> Result<Vec<CString>> {
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => names.push(CString::new(name.as_bytes()).map_err(|_| {
+                Error::new("provider write lock path contains an invalid component")
+            })?),
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
                 return Err(Error::new(
-                    "could not create the provider write lock directory",
+                    "provider write lock path must not contain '..' or a prefix",
                 ));
             }
+        }
+    }
+    if names.is_empty() {
+        return Err(Error::new(
+            "provider write lock path is not a usable directory",
+        ));
+    }
+    Ok(names)
+}
+
+/// Walks `names` from a trusted anchor, opening one descriptor per component
+/// and retaining it for the next lookup. Each intermediate directory must not
+/// be modifiable by other users (a sticky directory is allowed). A missing
+/// component is created with `mkdirat` only when allowed; its mode is then
+/// validated, never repaired with a chmod.
+#[cfg(unix)]
+fn resolve(names: &[CString], absolute: bool, allow_create_ancestors: bool) -> Result<OwnedFd> {
+    let mut fd = open_anchor(absolute)?;
+    if !absolute {
+        inspect_ancestor(&fd)?;
+    }
+    let total = names.len();
+    for (index, name) in names.iter().enumerate() {
+        let last = index + 1 == total;
+        let next = match open_at(&fd, name, last) {
+            Ok(next) => next,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && (last || allow_create_ancestors) =>
+            {
+                create_at(&fd, name)?;
+                open_at(&fd, name, last).map_err(|error| map_open_error(&error))?
+            }
+            Err(error) => return Err(map_open_error(&error)),
         };
-        let handle = open_dir(dir)?;
-        if created {
-            handle
-                .set_permissions(fs::Permissions::from_mode(0o700))
-                .map_err(|_| Error::new("could not restrict the provider write lock directory"))?;
+        fd = next;
+        if !last {
+            inspect_ancestor(&fd)?;
         }
-        // Check the opened handle, not the path: that is the object the
-        // directory was resolved to and no later lookup can swap it.
-        let metadata = handle
-            .metadata()
-            .map_err(|_| Error::new("could not inspect the provider write lock directory"))?;
-        if !metadata.is_dir() {
-            return Err(Error::new("provider write lock path is not a directory"));
-        }
-        if metadata.uid() != effective_uid() {
-            return Err(Error::new(
-                "provider write lock directory is not owned by this user",
-            ));
-        }
-        let mode = metadata.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(Error::new("provider write lock directory is not private"));
-        }
-        if mode & 0o700 != 0o700 {
-            return Err(Error::new(
-                "provider write lock directory is not accessible only to this user",
-            ));
-        }
-        Ok(())
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (dir, create_parents);
-        Err(Error::new(
-            "provider write locks are not implemented on this platform",
-        ))
-    }
+    inspect_lock_dir(&fd)?;
+    Ok(fd)
 }
 
+/// Opens the anchor for an absolute or relative path. For an absolute path the
+/// anchor is `/`; for a relative path it is the process working directory.
 #[cfg(unix)]
-fn create_private_dir(dir: &Path, create_parents: bool) -> io::Result<()> {
-    if create_parents
-        && let Some(parent) = dir.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
+fn open_anchor(absolute: bool) -> Result<OwnedFd> {
+    let path: &std::ffi::CStr = if absolute { c"/" } else { c"." };
+    // SAFETY: `path` is a valid NUL-terminated string and no memory owned by
+    // the caller is retained.
+    let raw = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(Error::new("could not open the provider write lock path"));
     }
-    fs::DirBuilder::new().mode(0o700).create(dir)
+    // SAFETY: open returned a new descriptor that this function owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// Opens the directory without following a final symbolic link.
+/// Opens one path component relative to `parent`.
 ///
-/// `O_DIRECTORY` is deliberately not set: on Linux a symbolic link combined
-/// with it can report `ENOTDIR` instead of `ELOOP`, which hides the real
-/// reason. The caller checks `is_dir` on the opened handle instead.
-/// `O_NONBLOCK` only prevents a FIFO or device node at that path from blocking
-/// the open; it has no effect on a directory.
+/// Intermediate components may be ordinary symlinks (the kernel resolves them
+/// as part of this open, and later lookups are relative to the result). The
+/// final component must not be a symlink: `O_NOFOLLOW` makes that `ELOOP`, and
+/// the type is checked on the descriptor rather than the path.
 #[cfg(unix)]
-fn open_dir(dir: &Path) -> Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(dir)
-        .map_err(|error| match error.raw_os_error() {
-            Some(libc::ELOOP) => Error::new("provider write lock directory is a symbolic link"),
-            Some(libc::ENOTDIR) => Error::new("provider write lock path is not a directory"),
-            _ => Error::new("could not open the provider write lock directory"),
-        })
+fn open_at(parent: &OwnedFd, name: &CString, final_component: bool) -> io::Result<OwnedFd> {
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    if final_component {
+        flags |= libc::O_NOFOLLOW;
+    } else {
+        flags |= libc::O_DIRECTORY;
+    }
+    // SAFETY: `parent` is a live descriptor and `name` is NUL-terminated.
+    let raw = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new descriptor that this function owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// Opens the lock file without following a symbolic link. The `created` flag
-/// tells the caller whether it may restrict the mode; an existing file is
+/// Creates one component with `mkdirat` relative to the verified parent. It
+/// never chmods: if a different entry appeared first (`EEXIST`), the caller
+/// opens and validates that object instead of changing it.
+#[cfg(unix)]
+fn create_at(parent: &OwnedFd, name: &CString) -> Result<()> {
+    // SAFETY: `parent` is live, `name` is NUL-terminated, and 0700 is a valid
+    // mode. mkdirat does not return a descriptor, so nothing is chmodded here.
+    let raw = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+    if raw == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        return Ok(());
+    }
+    Err(Error::new(
+        "could not create the provider write lock directory",
+    ))
+}
+
+#[cfg(unix)]
+fn map_open_error(error: &io::Error) -> Error {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) => Error::new("provider write lock directory is a symbolic link"),
+        Some(libc::ENOENT) => Error::new("provider write lock directory does not exist"),
+        Some(libc::ENOTDIR) => Error::new("provider write lock path is not a directory"),
+        _ => Error::new("could not open the provider write lock directory"),
+    }
+}
+
+#[cfg(unix)]
+fn fd_stat(fd: &OwnedFd) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the struct on success; the descriptor is live.
+    let raw = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
+    if raw != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded and initialized the struct.
+    Ok(unsafe { stat.assume_init() })
+}
+
+/// A parent directory that other users can modify could have its entries
+/// renamed or replaced during resolution. Sticky directories such as `/tmp` are
+/// allowed: other users cannot rename an entry they do not own there.
+#[cfg(unix)]
+fn inspect_ancestor(fd: &OwnedFd) -> Result<()> {
+    let stat =
+        fd_stat(fd).map_err(|_| Error::new("could not inspect the provider write lock path"))?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(Error::new("provider write lock path is not a directory"));
+    }
+    let mode = stat.st_mode & 0o777;
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(Error::new(
+            "provider write lock path has a parent that other users can modify",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn inspect_lock_dir(fd: &OwnedFd) -> Result<()> {
+    let stat = fd_stat(fd)
+        .map_err(|_| Error::new("could not inspect the provider write lock directory"))?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(Error::new("provider write lock path is not a directory"));
+    }
+    if stat.st_uid != effective_uid() {
+        return Err(Error::new(
+            "provider write lock directory is not owned by this user",
+        ));
+    }
+    let mode = stat.st_mode & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::new("provider write lock directory is not private"));
+    }
+    if mode & 0o700 != 0o700 {
+        return Err(Error::new(
+            "provider write lock directory is not accessible only to this user",
+        ));
+    }
+    Ok(())
+}
+
+/// Opens the lock file with `openat` in the verified directory. The `created`
+/// flag tells the caller whether it may restrict the mode; an existing file is
 /// inspected, not changed.
 #[cfg(unix)]
-fn open_lock_file(path: &Path) -> Result<(File, bool)> {
-    fn options(create_new: bool) -> OpenOptions {
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .create_new(create_new);
-        options
+fn open_lock_file(dir: &OwnedFd, identity: &str) -> Result<(File, bool)> {
+    let name = CString::new(file_name(identity)).expect("lock file name has no NUL");
+    // SAFETY: `dir` is live, `name` is NUL-terminated, and 0600 is a valid
+    // mode. O_EXCL returns the descriptor of the file this call created, so a
+    // later chmod acts on that inode and not on a substituted path.
+    let raw = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if raw >= 0 {
+        // SAFETY: openat returned a new descriptor that this function owns.
+        return Ok((unsafe { File::from_raw_fd(raw) }, true));
     }
-    match options(true).open(path) {
-        Ok(file) => Ok((file, true)),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => options(false)
-            .open(path)
-            .map(|file| (file, false))
-            .map_err(|_| Error::new("could not open the provider write lock")),
-        Err(_) => Err(Error::new("could not open the provider write lock")),
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::AlreadyExists {
+        return Err(Error::new("could not open the provider write lock"));
     }
+    // SAFETY: `dir` is live and `name` is NUL-terminated. No create flag is
+    // set, so this opens only an existing entry and O_NOFOLLOW rejects a link.
+    let raw = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(Error::new("could not open the provider write lock"));
+    }
+    // SAFETY: openat returned a new descriptor that this function owns.
+    Ok((unsafe { File::from_raw_fd(raw) }, false))
 }
 
 /// Removes mode bits a restrictive umask may have added. Only called for a
-/// file this process just created.
+/// file this process just created with `O_EXCL`.
 fn set_file_private(file: &File) -> Result<()> {
     #[cfg(unix)]
     {
-        file.set_permissions(fs::Permissions::from_mode(0o600))
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|_| Error::new("could not restrict the provider write lock"))?;
         Ok(())
     }
@@ -272,6 +461,8 @@ fn set_file_private(file: &File) -> Result<()> {
 /// refused instead of repaired.
 #[cfg(unix)]
 fn inspect_lock_file(file: &File) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     let metadata = file
         .metadata()
         .map_err(|_| Error::new("could not inspect the provider write lock"))?;
@@ -344,7 +535,7 @@ mod tests {
     use super::{canonical_origin, identity};
 
     #[cfg(unix)]
-    use super::{inspect_lock_file, open_dir, open_lock_file};
+    use super::{LockDirectory, directory_components, file_name, inspect_lock_file};
 
     #[test]
     fn origin_folds_case_default_port_and_trailing_slash() {
@@ -436,12 +627,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir("file-symlink");
+        let locks = dir.join("locks");
+        std::fs::create_dir(&locks).expect("lock dir");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod dir");
         let target = dir.join("target");
         std::fs::write(&target, b"").expect("target fixture");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        let link = dir.join("write.lock");
+        let link = locks.join(file_name("symlink-test"));
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        assert!(open_lock_file(&link).is_err());
+        let directory = LockDirectory::open(&locks, false).expect("open lock directory");
+        assert!(directory.open_lock("symlink-test").is_err());
         let mode = std::fs::metadata(&target)
             .expect("target metadata")
             .permissions()
@@ -459,12 +655,182 @@ mod tests {
         std::fs::create_dir(&target).expect("target dir");
         let link = dir.join("locks");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        let error = open_dir(&link).expect_err("must reject a symlinked lock directory");
+        let error =
+            LockDirectory::open(&link, false).expect_err("must reject a symlinked lock directory");
         assert!(
             error.message().contains("symbolic link"),
             "{}",
             error.message()
         );
         std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_directory_is_never_chmodded_when_it_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_dir("preserve-mode");
+        let locks = base.join("locks");
+        std::fs::create_dir(&locks).expect("existing lock dir");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let error = LockDirectory::open(&locks, false).expect_err("must reject a non-private dir");
+        assert!(
+            error.message().contains("not private"),
+            "{}",
+            error.message()
+        );
+        let mode = std::fs::metadata(&locks)
+            .expect("lock dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "an existing directory must keep its mode");
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_other_users_can_modify_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_dir("writable-parent");
+        let shared = base.join("shared");
+        std::fs::create_dir(&shared).expect("shared dir");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let locks = shared.join("locks");
+        std::fs::create_dir(&locks).expect("lock dir");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let error = LockDirectory::open(&locks, false).expect_err("must reject a writable parent");
+        assert!(error.message().contains("parent"), "{}", error.message());
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_components_are_rejected() {
+        let error = directory_components(std::path::Path::new("a/../b"))
+            .expect_err("must reject a parent component");
+        assert!(error.message().contains("'..'"), "{}", error.message());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_parent_is_not_created_for_an_explicit_directory() {
+        let base = scratch_dir("missing-parent");
+        let target = base.join("missing/locks");
+        let error =
+            LockDirectory::open(&target, false).expect_err("must not create a missing parent");
+        assert!(
+            error.message().contains("does not exist"),
+            "{}",
+            error.message()
+        );
+        assert!(!base.join("missing").exists());
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_creation_makes_missing_parents_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_dir("create-parents");
+        let target = base.join("state/nsvault/locks");
+        let directory = LockDirectory::open(&target, true).expect("create lock path");
+        for path in [
+            base.join("state"),
+            base.join("state/nsvault"),
+            target.clone(),
+        ] {
+            let mode = std::fs::metadata(&path)
+                .expect("created directory")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{} is not 0700", path.display());
+        }
+        drop(directory);
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_handle_ignores_a_replaced_directory_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_dir("entry-swap");
+        let locks = base.join("locks");
+        std::fs::create_dir(&locks).expect("lock dir");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let directory = LockDirectory::open(&locks, false).expect("open lock directory");
+        // Move the verified directory away and put another directory at the
+        // same path. A path-based open after validation would land in the
+        // replacement.
+        let moved = base.join("moved");
+        std::fs::rename(&locks, &moved).expect("move verified directory");
+        std::fs::create_dir(&locks).expect("replacement directory");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o755))
+            .expect("replacement mode");
+
+        let (file, created) = directory
+            .open_lock("entry-swap")
+            .expect("lock via retained handle");
+        assert!(created);
+        drop(file);
+        assert!(
+            moved.join(file_name("entry-swap")).exists(),
+            "the lock must land in the verified directory"
+        );
+        assert!(
+            !locks.join(file_name("entry-swap")).exists(),
+            "the replacement directory must stay unused"
+        );
+        let mode = std::fs::metadata(&locks)
+            .expect("replacement metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "the replacement must not be chmodded");
+        std::fs::remove_dir_all(base).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_handle_ignores_a_replaced_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_dir("ancestor-swap");
+        let parent = base.join("parent");
+        let locks = parent.join("locks");
+        std::fs::create_dir(&parent).expect("parent dir");
+        std::fs::create_dir(&locks).expect("lock dir");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let directory = LockDirectory::open(&locks, false).expect("open lock directory");
+        let moved = base.join("moved-parent");
+        std::fs::rename(&parent, &moved).expect("move parent");
+        std::fs::create_dir(&parent).expect("replacement parent");
+        std::fs::create_dir(&locks).expect("replacement lock dir");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        let (file, created) = directory
+            .open_lock("ancestor-swap")
+            .expect("lock via retained handle");
+        assert!(created);
+        drop(file);
+        assert!(
+            moved
+                .join("locks")
+                .join(file_name("ancestor-swap"))
+                .exists(),
+            "the lock must land under the verified ancestor"
+        );
+        assert!(
+            !locks.join(file_name("ancestor-swap")).exists(),
+            "the replacement tree must stay unused"
+        );
+        std::fs::remove_dir_all(base).expect("cleanup");
     }
 }

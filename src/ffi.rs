@@ -15,7 +15,9 @@
 //!   write lock as the CLI and the Rust API, keyed by the provider's canonical
 //!   origin and non-secret scope. A call can block behind another nsvault
 //!   writer. A lock failure is returned as an error; there is no unlocked
-//!   write, and no timeout is imposed by this library.
+//!   write, and no timeout is imposed by this library. Writers coordinate only
+//!   when they resolve the same lock directory: the same OS user and the same
+//!   `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME` when it is unset.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int};

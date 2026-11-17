@@ -20,7 +20,9 @@
  *     block until the other nsvault writer exits. Lock failures are returned
  *     as errors (status 1); there is no unlocked fallback and no timeout. The
  *     lock does not exclude writers that are not nsvault, another host, or
- *     another OS user.
+ *     another OS user. Coordination requires the same lock directory on every
+ *     writer: the same NSVAULT_LOCK_DIR, or the same XDG_STATE_HOME/HOME when
+ *     it is unset. Different values are different locks.
  *
  * Status: 0 = success, 1 = error (or, for nsvault_last_error, 1 = message).
  * Build:  cargo build --release --lib

@@ -193,13 +193,29 @@ impl VaultProvider {
         let response = self.request("GET", &url, None)?;
         match response.status {
             200 => {
+                // The documented KV v2 subkeys response nests the map under
+                // `data`. A body that lacks it is malformed, not absence: a
+                // PATCH based on a missing map could overwrite a field this
+                // call never confirmed was absent.
                 #[derive(Deserialize)]
                 struct Envelope {
-                    #[serde(default)]
-                    subkeys: serde_json::Map<String, Value>,
+                    data: Option<Payload>,
+                }
+                #[derive(Deserialize)]
+                struct Payload {
+                    subkeys: Option<serde_json::Map<String, Value>>,
                 }
                 let envelope: Envelope = HttpClient::json(&response)?;
-                Ok(envelope.subkeys.contains_key(field))
+                let subkeys = envelope
+                    .data
+                    .and_then(|payload| payload.subkeys)
+                    .ok_or_else(|| {
+                        Error::new(format!(
+                            "{} subkeys response for {path:?} has no subkeys map; refusing to treat that as field absence",
+                            self.flavor.kind()
+                        ))
+                    })?;
+                Ok(subkeys.contains_key(field))
             }
             401 | 403 => Err(Error::new(format!(
                 "{} denied access to {path:?}",

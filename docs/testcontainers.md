@@ -21,7 +21,10 @@ secret, not a whole-secret POST replacement. The initial create also exercises
 the Vault KV v2 CAS 0 create body on a real server. The same run then calls
 `ensure` for a missing path and again with a different value, and asserts the
 second call leaves the first value in place. It also ensures a missing field
-on the existing secret and checks the sibling field is still there.
+on the existing secret, checks the sibling field is still there, and then
+ensures that same field a second time with a different value. That second call
+must report `present` and leave the value unchanged; it is the check that the
+adapter reads the documented `data.subkeys` response on a real server.
 
 Run it explicitly:
 

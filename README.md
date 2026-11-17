@@ -175,7 +175,9 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   adds a missing field with `cas` set to that earlier version. A writer that
   creates the field between those two reads also advances the version, so the
   CAS fails and the field is re-checked instead of replaced. A lost CAS race is
-  not retried with an unconditional write.
+  not retried with an unconditional write. A subkeys response without the
+  documented `data.subkeys` map is an error, not field absence, and no patch is
+  sent.
 - Infisical `ensure` is disabled. The adapter returns "does not support
   ensure" and sends no request. The v4 Create (`POST`) has not been proven to
   reject a duplicate rather than upsert it against a live server; until that is
@@ -215,7 +217,9 @@ created per operation from the configuration, so a token read at process start
 is not cached by the client. `set` and `ensure` take the same same-user write
 lock as the CLI, so two threads or processes that write the same provider scope
 serialize; the call can block, and a lock failure is returned as an error
-rather than performed unlocked.
+rather than performed unlocked. This requires both writers to resolve the same
+lock directory: the same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+`XDG_STATE_HOME`/`HOME` when it is unset.
 
 ## C ABI
 
@@ -233,7 +237,9 @@ per-thread. `nsvault_client_close` must not race another call using the same
 handle. There is no callback, async, or streaming API. `nsvault_set` and
 `nsvault_ensure` take the same same-user write lock as the CLI; they may block
 behind another nsvault writer, and a lock failure is returned as status `1`
-instead of writing unlocked.
+instead of writing unlocked. Coordination requires the same lock directory:
+the same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+`XDG_STATE_HOME`/`HOME` when it is unset. Different values are different locks.
 
 Smoke test:
 
@@ -265,14 +271,21 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   `$XDG_STATE_HOME/nsvault/locks` or `~/.local/state/nsvault/locks`. A missing
   directory is created `0700`; lock files are created `0600` and must be
   regular, single-link, owner-only files. `NSVAULT_LOCK_DIR` overrides the
-  directory. An existing directory is never chmodded: it must already be owned
-  by this user and inaccessible to group and others, and a symbolic link is
-  refused. Acquisition fails closed, with no unlocked fallback and no timeout,
-  and a lock failure is an error instead of a write. The kernel releases the
-  lock when the process exits, including a crash. This does not stop the Vault
-  CLI, another host, or another OS user. Provider CAS is still required for
-  those writers. Linux `flock` is what this workspace can exercise; Windows and
-  macOS are not.
+  directory. The path is resolved one component at a time and the verified
+  directory handle is retained, so the lock file is opened relative to it;
+  every parent must not be writable by other users (a sticky directory such as
+  `/tmp` is allowed). An existing directory is never chmodded: it must already
+  be owned by this user and inaccessible to group and others, and the
+  directory itself must not be a symbolic link. Creation respects the process
+  umask: a directory that does not end up exactly owner-only is an error, not
+  something that is chmodded. Writers coordinate only when they resolve the
+  same lock directory: the same OS user and the same `NSVAULT_LOCK_DIR`, or the
+  same `XDG_STATE_HOME`/`HOME` when it is unset. Acquisition fails closed, with
+  no unlocked fallback and no timeout, and a lock failure is an error instead
+  of a write. The kernel releases the lock when the process exits, including a
+  crash. This does not stop the Vault CLI, another host, or another OS user.
+  Provider CAS is still required for those writers. Linux `flock` is what this
+  workspace can exercise; Windows and macOS are not.
 - `Secret` has no `Display`; `Debug` prints `Secret([REDACTED])`.
 - The C ABI zeroes output buffers on free.
 

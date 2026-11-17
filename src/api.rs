@@ -12,6 +12,14 @@
 //! block until the other writer exits. Lock failures are returned as errors;
 //! there is no unlocked write. The lock does not cover other clients, other
 //! hosts, or other OS users.
+//!
+//! Serialization assumes every writer resolves the same lock directory: the
+//! same OS user and the same `NSVAULT_LOCK_DIR` value, or the same
+//! `XDG_STATE_HOME`/`HOME` when it is unset. Two processes with different
+//! values use different lock files even for one provider identity and are not
+//! serialized by this mechanism. The directory is created `0700` if missing and
+//! must not be a symlink, be group/other-accessible, or sit under a parent that
+//! other users can modify.
 
 use std::path::Path;
 
