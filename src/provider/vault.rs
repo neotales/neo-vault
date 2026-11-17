@@ -258,20 +258,28 @@ impl VaultProvider {
                 self.flavor.kind()
             ))),
             (Some(_), None) => Ok(EnsureStatus::Present),
-            (Some(_), Some(field)) => self.ensure_missing_field(path, field, text),
+            (Some(version), Some(field)) => self.ensure_missing_field(path, field, text, version),
         }
     }
 
-    fn ensure_missing_field(&self, path: &str, field: &str, text: &str) -> Result<EnsureStatus> {
+    /// Adds `field` with a CAS write against `version`.
+    ///
+    /// `version` must have been read before the field-presence check. That
+    /// order is the safety property: a writer that adds the field between the
+    /// version read and the check also advances the version, so the CAS below
+    /// fails instead of replacing the field this call reported absent. Reading
+    /// the version after the check would adopt the concurrent writer's version
+    /// and let this call overwrite the field.
+    fn ensure_missing_field(
+        &self,
+        path: &str,
+        field: &str,
+        text: &str,
+        version: u64,
+    ) -> Result<EnsureStatus> {
         if self.field_present(path, field)? {
             return Ok(EnsureStatus::Present);
         }
-        let Some(version) = self.metadata_version(path)? else {
-            return Err(Error::new(format!(
-                "{} key {path:?} disappeared before a conditional field write",
-                self.flavor.kind()
-            )));
-        };
         if version == 0 {
             return Err(Error::new(format!(
                 "{} has no current version for {path:?}; refusing an unconditional field write",
@@ -463,12 +471,15 @@ impl Provider for VaultProvider {
         }
         // A path with no `#field` is the secret itself. Metadata existence is
         // enough; this does not add a missing `value` field to an existing
-        // secret, because that would be a write. `#field` uses the subkeys
-        // API so the check does not fetch values, then a CAS patch.
+        // secret, because that would be a write. `#field` uses the version read
+        // here, then the subkeys API so the check does not fetch values, then a
+        // CAS patch against that earlier version.
         match (self.metadata_version(key.path())?, key.field()) {
             (None, field) => self.create_if_absent(key.path(), field, text),
             (Some(_), None) => Ok(EnsureStatus::Present),
-            (Some(_), Some(field)) => self.ensure_missing_field(key.path(), field, text),
+            (Some(version), Some(field)) => {
+                self.ensure_missing_field(key.path(), field, text, version)
+            }
         }
     }
 }

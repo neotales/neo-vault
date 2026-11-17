@@ -4,6 +4,14 @@
 //! reading, and writing without going through the command line. It is a thin
 //! wrapper over the provider boundary; it does not implement a daemon, cache,
 //! or credential store of its own.
+//!
+//! `set` and `ensure` take the same per-machine, same-user write lock the CLI
+//! uses, keyed by the provider's canonical origin and non-secret scope. A
+//! `Client` shared across threads serializes writes for the same scope, and it
+//! serializes with other nsvault processes of the same OS user. A call can
+//! block until the other writer exits. Lock failures are returned as errors;
+//! there is no unlocked write. The lock does not cover other clients, other
+//! hosts, or other OS users.
 
 use std::path::Path;
 
@@ -56,9 +64,13 @@ impl Client {
 
     /// Writes one secret.
     ///
+    /// Takes the same-user write lock for this provider scope and may block
+    /// behind another nsvault writer on this machine. A lock failure is an
+    /// error, not an unlocked write.
+    ///
     /// # Errors
     ///
-    /// Returns a configuration or provider error.
+    /// Returns a configuration, provider, or lock error.
     pub fn set(&self, selected: Option<&str>, key: &str, value: &Secret) -> Result<()> {
         let provider = provider::select(&self.config, selected)?;
         provider.provider.set(key, value)
@@ -66,9 +78,16 @@ impl Client {
 
     /// Creates a secret when it is absent and leaves an existing secret unchanged.
     ///
+    /// Takes the same-user write lock for this provider scope and may block
+    /// behind another nsvault writer on this machine. The lock excludes only
+    /// nsvault writers of the same OS user; the provider's own conditional
+    /// write is what protects against a concurrent external writer.
+    ///
     /// # Errors
     ///
-    /// Returns a configuration or provider error. An error is not absence.
+    /// Returns a configuration, provider, or lock error, or an unsupported
+    /// error for a provider without a race-safe create path. An error is not
+    /// absence.
     pub fn ensure(
         &self,
         selected: Option<&str>,

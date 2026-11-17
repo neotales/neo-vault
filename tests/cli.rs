@@ -293,6 +293,7 @@ struct VaultMergeFixture {
     port: u16,
     requests: Arc<Mutex<Vec<Request>>>,
     state: Arc<Mutex<BTreeMap<String, Map<String, Value>>>>,
+    race_fields: Arc<Mutex<BTreeMap<String, String>>>,
     patch_404: Arc<Mutex<BTreeSet<String>>>,
     lie_absent: Arc<Mutex<BTreeSet<String>>>,
     stop: Arc<AtomicBool>,
@@ -305,6 +306,8 @@ impl VaultMergeFixture {
         let port = listener.local_addr().expect("address").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(Mutex::new(BTreeMap::new()));
+        let versions = Arc::new(Mutex::new(BTreeMap::new()));
+        let race_fields = Arc::new(Mutex::new(BTreeMap::new()));
         let patch_404 = Arc::new(Mutex::new(BTreeSet::new()));
         let lie_absent = Arc::new(Mutex::new(BTreeSet::new()));
         state.lock().expect("state").insert(
@@ -312,9 +315,15 @@ impl VaultMergeFixture {
             serde_json::from_value(json!({"user": "alice", "value": "old"}))
                 .expect("initial state"),
         );
+        versions
+            .lock()
+            .expect("versions")
+            .insert("apps/prod/db".to_owned(), 1);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_requests = Arc::clone(&requests);
         let thread_state = Arc::clone(&state);
+        let thread_versions = Arc::clone(&versions);
+        let thread_race_fields = Arc::clone(&race_fields);
         let thread_patch_404 = Arc::clone(&patch_404);
         let thread_lie_absent = Arc::clone(&lie_absent);
         let thread_stop = Arc::clone(&stop);
@@ -331,6 +340,8 @@ impl VaultMergeFixture {
                             let response = vault_merge_response(
                                 &request,
                                 &thread_state,
+                                &thread_versions,
+                                &thread_race_fields,
                                 &thread_patch_404,
                                 &thread_lie_absent,
                             );
@@ -348,6 +359,7 @@ impl VaultMergeFixture {
             port,
             requests,
             state,
+            race_fields,
             patch_404,
             lie_absent,
             stop,
@@ -367,6 +379,16 @@ impl VaultMergeFixture {
             .expect("patch 404 state")
             .insert(path.to_owned());
     }
+
+    /// Makes the next subkeys read report the field as absent and then apply a
+    /// concurrent writer's creation. The response was computed first, so the
+    /// client sees absence while the fixture's version has already advanced.
+    fn race_field_creation(&self, path: &str, field: &str) {
+        self.race_fields
+            .lock()
+            .expect("race fields")
+            .insert(path.to_owned(), field.to_owned());
+    }
 }
 
 impl Drop for VaultMergeFixture {
@@ -383,9 +405,19 @@ fn request_data(body: &[u8]) -> Option<Map<String, Value>> {
 fn vault_merge_response(
     request: &Request,
     state: &Arc<Mutex<BTreeMap<String, Map<String, Value>>>>,
+    versions: &Arc<Mutex<BTreeMap<String, u64>>>,
+    race_fields: &Arc<Mutex<BTreeMap<String, String>>>,
     patch_404: &Arc<Mutex<BTreeSet<String>>>,
     lie_absent: &Arc<Mutex<BTreeSet<String>>>,
 ) -> String {
+    let current_version = |path: &str| {
+        versions
+            .lock()
+            .expect("versions")
+            .get(path)
+            .copied()
+            .unwrap_or(1)
+    };
     let (status, body) = if let Some(path) = request
         .path
         .strip_prefix("/v1/secret/metadata/")
@@ -394,35 +426,56 @@ fn vault_merge_response(
         let path = path.split('?').next().unwrap_or(path);
         if lie_absent.lock().expect("lie absent").remove(path) {
             ("404 Not Found", String::new())
+        } else if state.lock().expect("state").contains_key(path) {
+            let version = current_version(path);
+            (
+                "200 OK",
+                json!({"data": {"current_version": version}}).to_string(),
+            )
         } else {
-            let state = state.lock().expect("state");
-            if state.contains_key(path) {
-                ("200 OK", r#"{"data":{"current_version":1}}"#.to_owned())
-            } else {
-                ("404 Not Found", String::new())
-            }
+            ("404 Not Found", String::new())
         }
     } else if let Some(path) = request.path.strip_prefix("/v1/secret/subkeys/") {
         let path = path.split('?').next().unwrap_or(path);
-        let state = state.lock().expect("state");
-        match state.get(path) {
-            Some(data) => {
-                let mut subkeys = serde_json::Map::new();
-                for key in data.keys() {
-                    subkeys.insert(key.clone(), Value::Null);
+        // Compute the response before the simulated concurrent write, so the
+        // client is told the field is absent while the version already moved.
+        let response = {
+            let state = state.lock().expect("state");
+            match state.get(path) {
+                Some(data) => {
+                    let mut subkeys = serde_json::Map::new();
+                    for key in data.keys() {
+                        subkeys.insert(key.clone(), Value::Null);
+                    }
+                    ("200 OK", json!({ "subkeys": subkeys }).to_string())
                 }
-                ("200 OK", json!({ "subkeys": subkeys }).to_string())
+                None => ("404 Not Found", String::new()),
             }
-            None => ("404 Not Found", String::new()),
+        };
+        if let Some(field) = race_fields.lock().expect("race fields").remove(path) {
+            {
+                let mut state = state.lock().expect("state");
+                if let Some(data) = state.get_mut(path) {
+                    data.insert(field, json!("concurrent-writer"));
+                }
+            }
+            *versions
+                .lock()
+                .expect("versions")
+                .entry(path.to_owned())
+                .or_insert(1) += 1;
         }
+        response
     } else if let Some(path) = request.path.strip_prefix("/v1/secret/data/") {
         let path = path.split('?').next().unwrap_or(path);
-        let mut state = state.lock().expect("state");
         match request.method.as_str() {
-            "GET" => match state.get(path) {
-                Some(data) => ("200 OK", json!({"data": {"data": data}}).to_string()),
-                None => ("404 Not Found", String::new()),
-            },
+            "GET" => {
+                let state = state.lock().expect("state");
+                match state.get(path) {
+                    Some(data) => ("200 OK", json!({"data": {"data": data}}).to_string()),
+                    None => ("404 Not Found", String::new()),
+                }
+            }
             "PATCH" => {
                 if patch_404.lock().expect("patch 404 state").remove(path) {
                     ("404 Not Found", String::new())
@@ -430,7 +483,9 @@ fn vault_merge_response(
                     let parsed: Value =
                         serde_json::from_slice(&request.body).unwrap_or(Value::Null);
                     let cas = parsed.pointer("/options/cas").and_then(Value::as_u64);
-                    if cas.is_some_and(|cas| cas != 1) && state.contains_key(path) {
+                    let version = current_version(path);
+                    let mut state = state.lock().expect("state");
+                    if cas.is_some_and(|cas| cas != version) && state.contains_key(path) {
                         return simple_response("400 Bad Request", "");
                     }
                     match (state.get_mut(path), request_data(&request.body)) {
@@ -451,12 +506,19 @@ fn vault_merge_response(
                     return simple_response("400 Bad Request", "");
                 };
                 let cas = parsed.pointer("/options/cas").and_then(Value::as_u64);
-                if cas == Some(0) && state.contains_key(path) {
-                    // Simulate a concurrent creator winning between PATCH 404
-                    // and the CAS 0 create attempt.
-                    return simple_response("400 Bad Request", "");
+                {
+                    let mut state = state.lock().expect("state");
+                    if cas == Some(0) && state.contains_key(path) {
+                        // Simulate a concurrent creator winning between PATCH
+                        // 404 and the CAS 0 create attempt.
+                        return simple_response("400 Bad Request", "");
+                    }
+                    state.insert(path.to_owned(), data);
                 }
-                state.insert(path.to_owned(), data);
+                versions
+                    .lock()
+                    .expect("versions")
+                    .insert(path.to_owned(), 1);
                 ("204 No Content", String::new())
             }
             _ => ("405 Method Not Allowed", String::new()),
@@ -662,6 +724,64 @@ fn ensure_cas_conflict_does_not_overwrite() {
     let requests = fixture.requests.lock().expect("requests");
     assert!(requests.iter().any(|request| request.method == "POST"));
     assert!(!requests.iter().any(|request| request.method == "PATCH"));
+}
+
+#[test]
+fn vault_field_ensure_does_not_overwrite_a_concurrently_created_field() {
+    let fixture = VaultMergeFixture::start();
+    fixture.race_field_creation("apps/prod/db", "token");
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let environment = [("TEST_VAULT_TOKEN", "test-token")];
+
+    let ensured = run(
+        &directory,
+        &["ensure", "--json", "apps/prod/db#token"],
+        &environment,
+        Some(b"must-not-overwrite\n"),
+    );
+    assert!(ensured.status.success(), "{}", stderr(&ensured));
+    assert_eq!(stdout(&ensured), "{\"status\":\"present\"}\n");
+    assert!(!stderr(&ensured).contains("must-not-overwrite"));
+
+    let state = fixture.state.lock().expect("state");
+    let data = state.get("apps/prod/db").expect("db state");
+    assert_eq!(
+        data.get("token").and_then(Value::as_str),
+        Some("concurrent-writer"),
+        "the concurrent writer's field was replaced"
+    );
+    assert_eq!(data.get("user").and_then(Value::as_str), Some("alice"));
+    assert_eq!(data.get("value").and_then(Value::as_str), Some("old"));
+    drop(state);
+
+    let requests = fixture.requests.lock().expect("requests");
+    let version_read = requests
+        .iter()
+        .rposition(|request| {
+            request.method == "GET" && request.path.starts_with("/v1/secret/metadata/")
+        })
+        .expect("metadata read");
+    let subkeys = requests
+        .iter()
+        .position(|request| {
+            request.method == "GET" && request.path.starts_with("/v1/secret/subkeys/")
+        })
+        .expect("subkeys read");
+    assert!(
+        version_read < subkeys,
+        "the CAS version must be read before the field-absence check"
+    );
+    let patch = requests
+        .iter()
+        .find(|request| request.method == "PATCH")
+        .expect("conditional field patch");
+    let body: Value = serde_json::from_slice(&patch.body).expect("patch body");
+    assert_eq!(
+        body.pointer("/options/cas").and_then(Value::as_u64),
+        Some(1),
+        "the patch must use the version read before the absence check"
+    );
 }
 
 #[test]
@@ -944,6 +1064,60 @@ password_env = "KP_PW"
     assert_eq!(stdout(&list), "Entry\n");
 }
 
+fn infisical_config(directory: &Path, port: u16) {
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "i"
+[providers.i]
+kind = "infisical"
+address = "http://127.0.0.1:{port}"
+project_id = "test-project"
+environment = "test"
+path = "/apps"
+token_env = "TEST_INFISICAL_TOKEN"
+allow_http_loopback = true
+"#
+        ),
+    )
+    .expect("write infisical config");
+}
+
+#[test]
+fn infisical_ensure_is_refused_without_contacting_the_provider() {
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    infisical_config(&directory, fixture.port);
+    let environment = [("TEST_INFISICAL_TOKEN", "test-token")];
+
+    let providers = run(&directory, &["providers"], &environment, None);
+    assert!(providers.status.success(), "{}", stderr(&providers));
+    assert!(
+        stdout(&providers).contains("ensure=false"),
+        "{}",
+        stdout(&providers)
+    );
+
+    let ensured = run(
+        &directory,
+        &["ensure", "DB"],
+        &environment,
+        Some(b"must-not-run\n"),
+    );
+    assert!(!ensured.status.success());
+    assert!(
+        stderr(&ensured).contains("does not support ensure"),
+        "{}",
+        stderr(&ensured)
+    );
+    assert!(!stderr(&ensured).contains("must-not-run"));
+    assert!(
+        fixture.requests().is_empty(),
+        "a disabled ensure must not reach the provider"
+    );
+}
+
 fn make_executable(path: &Path) {
     #[cfg(unix)]
     {
@@ -1071,6 +1245,151 @@ fn two_profiles_do_not_overlap_writes_to_the_same_vault() {
     assert!(!stderr(&first).contains("from-alpha"));
     assert!(!stderr(&second).contains("from-beta"));
     assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+}
+
+fn private_dir() -> std::path::PathBuf {
+    let path = tempfile_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("private directory");
+    }
+    path
+}
+
+#[test]
+fn write_lock_refuses_a_non_private_directory_without_changing_it() {
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let lock_dir = tempfile_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("caller directory mode");
+    }
+    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+        ],
+        Some(b"must-not-land\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("not private"), "{}", stderr(&set));
+    assert!(!stderr(&set).contains("must-not-land"));
+    assert!(
+        fixture.requests().is_empty(),
+        "the provider must not be contacted before the lock is held"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&lock_dir)
+            .expect("lock directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "an existing caller-supplied lock directory must not be chmodded"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn write_lock_rejects_a_symlinked_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let target = private_dir();
+    let link = tempfile_dir().join("locks");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let link = link.to_str().expect("lock link").to_owned();
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", link.as_str()),
+        ],
+        Some(b"must-not-land\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("symbolic link"), "{}", stderr(&set));
+    assert!(!stderr(&set).contains("must-not-land"));
+    assert!(fixture.requests().is_empty());
+    let mode = std::fs::metadata(&target)
+        .expect("target metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "the symlink target must not be used or changed"
+    );
+    assert!(
+        std::fs::read_dir(&target)
+            .expect("target entries")
+            .next()
+            .is_none(),
+        "no lock file may be written through the symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_lock_creates_a_missing_private_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::start();
+    let directory = tempfile_dir();
+    vault_config(&directory, fixture.port);
+    let lock_dir = private_dir().join("locks");
+    let lock_dir = lock_dir.to_str().expect("lock directory").to_owned();
+    let set = run(
+        &directory,
+        &["set", "apps/prod/db"],
+        &[
+            ("TEST_VAULT_TOKEN", "test-token"),
+            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+        ],
+        Some(b"new-value\n"),
+    );
+    assert!(set.status.success(), "{}", stderr(&set));
+    let mode = std::fs::metadata(&lock_dir)
+        .expect("lock directory metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "a missing lock directory is created 0700");
+    let entries: Vec<_> = std::fs::read_dir(&lock_dir)
+        .expect("lock directory entries")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    assert_eq!(entries.len(), 1, "one lock file for one identity");
+    assert!(
+        entries[0]
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .starts_with("write-")
+    );
+    let file_mode = std::fs::metadata(&entries[0])
+        .expect("lock file metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600, "lock files are created 0600");
+    assert!(!stderr(&set).contains("new-value"));
 }
 
 fn tempfile_dir() -> std::path::PathBuf {

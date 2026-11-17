@@ -11,6 +11,11 @@
 //! * Strings are NUL-terminated UTF-8. Optional strings may be null.
 //! * Errors are retrieved with `nsvault_last_error`; the message is redacted
 //!   and is valid on the calling thread until the next FFI call.
+//! * `nsvault_set` and `nsvault_ensure` take the same per-machine, same-user
+//!   write lock as the CLI and the Rust API, keyed by the provider's canonical
+//!   origin and non-secret scope. A call can block behind another nsvault
+//!   writer. A lock failure is returned as an error; there is no unlocked
+//!   write, and no timeout is imposed by this library.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int};

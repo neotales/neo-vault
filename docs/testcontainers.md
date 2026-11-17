@@ -75,7 +75,11 @@ A future test must:
    credential may appear in source, logs, or output.
 3. Create a project, environment, and a fixture secret with an obviously fake
    value, then run `nsvault ls/get/set` against a loopback endpoint.
-4. Tear down only those three containers and the test network.
+4. Prove the Create (`POST`) behavior for a duplicate secret name: the second
+   create must be rejected rather than upserted. Record the exact status and
+   evidence. Until that is written down here, the adapter's `ensure` stays
+   disabled and this test must not enable it.
+5. Tear down only those three containers and the test network.
 
 Reason for deferral: this is a multi-service harness and its startup contract
 needs its own documented verification. Running a half-configured container
