@@ -1,0 +1,41 @@
+---
+title: nsvault
+description: Resolve a secret without putting the value in argv, a log line, or a checked-in file.
+template: splash
+hero:
+  tagline: 🤫 Names in the terminal. Values on stdout or in the child. Nowhere else.
+  actions:
+    - text: First config
+      link: /guides/first-config/
+      icon: right-arrow
+    - text: Agent cheat sheet
+      link: /guides/agents/
+      icon: document
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+nsvault is a small secrets proxy. A directory owns the provider config. A
+command reads one key. The value does not ride in `argv`.
+
+This site is the human guide and the agent lookup. Reference pages stay
+literal. The emoji stay on this page.
+
+<CardGrid>
+	<Card title="No value flag" icon="warning">
+		`set` and `ensure` read stdin or a hidden prompt. A `--value` flag does
+		not exist, on purpose.
+	</Card>
+	<Card title="Names only" icon="list-format">
+		`ls` and `search` return names. They do not fetch values.
+	</Card>
+	<Card title="No remove" icon="close">
+		There is no delete command. `ensure` creates when absence is confirmed
+		and otherwise leaves the key alone.
+	</Card>
+	<Card title="Not a meme host" icon="star">
+		No third-party gif is embedded here. A hotlinked meme is someone else's
+		file, and this page does not need one.
+	</Card>
+</CardGrid>
