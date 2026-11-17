@@ -1252,6 +1252,335 @@ vault = "Work"
 }
 
 #[test]
+fn proton_token_mode_isolates_the_session_and_uses_the_token_from_env() {
+    let directory = tempfile_dir();
+    let trace = directory.join("trace");
+    let ambient = directory.join("ambient-session");
+    let script = directory.join("pass-cli");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$PROTON_TRACE"
+printf 'session=%s\n' "${PROTON_PASS_SESSION_DIR:-}" >> "$PROTON_TRACE"
+printf 'key=%s\n' "${PROTON_PASS_KEY_PROVIDER:-}" >> "$PROTON_TRACE"
+printf 'token=%s\n' "${PROTON_PASS_PERSONAL_ACCESS_TOKEN:+set}" >> "$PROTON_TRACE"
+case "$*" in
+  "info --output json")
+    if [ -f "${PROTON_PASS_SESSION_DIR:-/nonexistent}/.session/session.json" ]; then
+      printf '%s\n' '{"personal_access_token_name":"fixture-pat"}'
+      exit 0
+    fi
+    exit 1
+    ;;
+  "login")
+    [ -n "${PROTON_PASS_PERSONAL_ACCESS_TOKEN:-}" ] || exit 3
+    mkdir -p "${PROTON_PASS_SESSION_DIR}/.session" || exit 4
+    : > "${PROTON_PASS_SESSION_DIR}/.session/session.json" || exit 4
+    exit 0
+    ;;
+  *"item list"*)
+    printf '%s' '{"items":[{"id":"i","title":"DB","share_id":"s","content":{"password":"pw"}}]}'
+    ;;
+  *"item view"*)
+    printf '%s\n' 'pw'
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("write fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "p"
+[providers.p]
+kind = "proton"
+command = "{}"
+vault = "Work"
+token_env = "PROTON_TEST_PAT"
+"#,
+            script.display()
+        ),
+    )
+    .expect("write config");
+    let get = run(
+        &directory,
+        &["get", "DB#password"],
+        &[
+            ("PROTON_TEST_PAT", "not-a-real-token"),
+            ("PROTON_TRACE", trace.to_str().expect("trace path")),
+            (
+                "PROTON_PASS_SESSION_DIR",
+                ambient.to_str().expect("ambient path"),
+            ),
+        ],
+        None,
+    );
+    assert!(get.status.success(), "{}", stderr(&get));
+    assert_eq!(stdout(&get), "pw");
+    assert!(!stderr(&get).contains("not-a-real-token"));
+
+    let trace = std::fs::read_to_string(&trace).expect("trace");
+    assert!(!trace.contains("not-a-real-token"));
+    let sessions: Vec<&str> = trace
+        .lines()
+        .filter_map(|line| line.strip_prefix("session="))
+        .collect();
+    assert!(!sessions.is_empty(), "no session directory recorded");
+    let session = sessions[0];
+    assert!(!session.is_empty());
+    assert!(sessions.iter().all(|recorded| *recorded == session));
+    assert_ne!(session, ambient.to_str().expect("ambient path"));
+    assert!(session.contains("nsvault-proton-"));
+    assert!(
+        !Path::new(session).exists(),
+        "isolated session directory was not removed"
+    );
+    assert!(
+        trace
+            .lines()
+            .filter_map(|line| line.strip_prefix("key="))
+            .all(|key| key == "fs")
+    );
+    assert!(trace.lines().any(|line| line == "token=set"));
+    assert_eq!(trace.lines().filter(|line| *line == "login").count(), 1);
+    assert!(trace.contains("info --output json"));
+    assert!(trace.contains("item list"));
+    assert!(trace.contains("item view"));
+}
+
+#[test]
+fn proton_token_mode_rejects_a_session_that_is_not_a_pat() {
+    let directory = tempfile_dir();
+    let trace = directory.join("trace");
+    let script = directory.join("pass-cli");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+case "$*" in
+  "info --output json") printf '%s\n' '{"id":"user","username":"fixture"}' ;;
+  "login")
+    mkdir -p "${PROTON_PASS_SESSION_DIR}/.session" || exit 4
+    : > "${PROTON_PASS_SESSION_DIR}/.session/session.json" || exit 4
+    exit 0
+    ;;
+  *) printf 'item\n' >> "$PROTON_TRACE"; printf 'leaked\n' ;;
+esac
+"#,
+    )
+    .expect("write fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "p"
+[providers.p]
+kind = "proton"
+command = "{}"
+vault = "Work"
+token_env = "PROTON_TEST_PAT"
+"#,
+            script.display()
+        ),
+    )
+    .expect("write config");
+    let get = run(
+        &directory,
+        &["get", "DB#password"],
+        &[
+            ("PROTON_TEST_PAT", "not-a-real-token"),
+            ("PROTON_TRACE", trace.to_str().expect("trace path")),
+        ],
+        None,
+    );
+    assert!(!get.status.success());
+    assert!(stdout(&get).is_empty());
+    assert!(stderr(&get).contains("pass-cli"));
+    let trace = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        !trace.lines().any(|line| line == "item"),
+        "an item command ran for a non-PAT session"
+    );
+}
+
+#[test]
+fn proton_token_mode_refuses_a_session_outside_the_isolated_directory() {
+    let directory = tempfile_dir();
+    let trace = directory.join("trace");
+    let script = directory.join("pass-cli");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+case "$*" in
+  "info --output json") printf '%s\n' '{"personal_access_token_name":"other-pat"}' ;;
+  "login") exit 0 ;;
+  *) printf 'item\n' >> "$PROTON_TRACE"; printf 'leaked\n' ;;
+esac
+"#,
+    )
+    .expect("write fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "p"
+[providers.p]
+kind = "proton"
+command = "{}"
+vault = "Work"
+token_env = "PROTON_TEST_PAT"
+"#,
+            script.display()
+        ),
+    )
+    .expect("write config");
+    let get = run(
+        &directory,
+        &["get", "DB#password"],
+        &[
+            ("PROTON_TEST_PAT", "not-a-real-token"),
+            ("PROTON_TRACE", trace.to_str().expect("trace path")),
+        ],
+        None,
+    );
+    assert!(!get.status.success());
+    assert!(stdout(&get).is_empty());
+    assert!(stderr(&get).contains("did not create"));
+    let trace = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        !trace.lines().any(|line| line == "item"),
+        "an item command ran against a session outside the isolated directory"
+    );
+}
+
+#[test]
+fn proton_session_mode_keeps_the_configured_session_directory() {
+    let directory = tempfile_dir();
+    let trace = directory.join("trace");
+    let ambient = directory.join("ambient-session");
+    let script = directory.join("pass-cli");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$PROTON_TRACE"
+printf 'session=%s\n' "${PROTON_PASS_SESSION_DIR:-}" >> "$PROTON_TRACE"
+printf 'key=%s\n' "${PROTON_PASS_KEY_PROVIDER:-}" >> "$PROTON_TRACE"
+case "$*" in
+  *"item list"*)
+    printf '%s' '{"items":[{"id":"i","title":"DB","share_id":"s","content":{"password":"hidden-value"}}]}'
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("write fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "p"
+[providers.p]
+kind = "proton"
+command = "{}"
+vault = "Work"
+token_env = "PROTON_TEST_UNSET_PAT"
+"#,
+            script.display()
+        ),
+    )
+    .expect("write config");
+    let listing = run(
+        &directory,
+        &["ls"],
+        &[
+            ("PROTON_TRACE", trace.to_str().expect("trace path")),
+            (
+                "PROTON_PASS_SESSION_DIR",
+                ambient.to_str().expect("ambient path"),
+            ),
+        ],
+        None,
+    );
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    assert_eq!(stdout(&listing), "DB\n");
+    assert!(!stdout(&listing).contains("hidden-value"));
+    let trace = std::fs::read_to_string(&trace).expect("trace");
+    let sessions: Vec<&str> = trace
+        .lines()
+        .filter_map(|line| line.strip_prefix("session="))
+        .collect();
+    assert!(!sessions.is_empty(), "no session directory recorded");
+    assert!(
+        sessions
+            .iter()
+            .all(|session| *session == ambient.to_str().expect("ambient path"))
+    );
+    assert!(
+        trace
+            .lines()
+            .filter_map(|line| line.strip_prefix("key="))
+            .all(str::is_empty)
+    );
+    assert!(!trace.contains("info --output json"));
+}
+
+#[test]
+fn proton_refuses_set_and_ensure_without_running_the_cli() {
+    let directory = tempfile_dir();
+    let marker = directory.join("invoked");
+    let script = directory.join("pass-cli");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+: > "$PROTON_MARKER"
+exit 0
+"#,
+    )
+    .expect("write fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "p"
+[providers.p]
+kind = "proton"
+command = "{}"
+vault = "Work"
+token_env = "PROTON_TEST_UNSET_PAT"
+"#,
+            script.display()
+        ),
+    )
+    .expect("write config");
+    let environment = [("PROTON_MARKER", marker.to_str().expect("marker path"))];
+    let set = run(
+        &directory,
+        &["set", "DB"],
+        &environment,
+        Some(b"must-not-run\n"),
+    );
+    assert!(!set.status.success());
+    assert!(stderr(&set).contains("does not support set"));
+    assert!(!stderr(&set).contains("must-not-run"));
+    let ensured = run(
+        &directory,
+        &["ensure", "DB"],
+        &environment,
+        Some(b"must-not-run\n"),
+    );
+    assert!(!ensured.status.success());
+    assert!(stderr(&ensured).contains("does not support ensure"));
+    assert!(!stderr(&ensured).contains("must-not-run"));
+    assert!(!marker.exists(), "pass-cli ran for a refused operation");
+}
+
+#[test]
 fn keepass_fixture_uses_the_documented_command_shape() {
     let directory = tempfile_dir();
     let script = directory.join("keepassxc-cli");

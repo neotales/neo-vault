@@ -30,7 +30,7 @@ const MAX_CREDENTIAL_BYTES: u64 = 64 * 1024;
 /// Maximum bytes accepted in one HTTP response.
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// One key returned by a metadata-only listing.
+/// One key returned by a listing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListedKey {
     /// Provider-native key, including an optional `#field`.
@@ -64,7 +64,7 @@ pub struct Capabilities {
     pub read: bool,
     /// Values can be written, including over an existing key.
     pub write: bool,
-    /// Names can be enumerated without reading values.
+    /// Names can be enumerated. `list` never returns values.
     pub list: bool,
     /// Create-if-absent is implemented and will not overwrite.
     pub ensure: bool,
@@ -101,7 +101,9 @@ pub trait Provider: Send + Sync {
     /// Capabilities implemented by this adapter.
     fn capabilities(&self) -> Capabilities;
 
-    /// Lists key names under a prefix. Must not fetch or return values.
+    /// Lists key names under a prefix. Must not return values. A backend that
+    /// fetches item bodies internally, such as the Proton Pass CLI, must
+    /// discard them and must not expose them here.
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>>;
 
     /// Reads one value.
