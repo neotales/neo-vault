@@ -15,12 +15,25 @@ hero:
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
+import SecretFlow from '../../components/SecretFlow.astro';
+import ArgvMeme from '../../components/ArgvMeme.astro';
 
 nsvault is a small secrets proxy. A directory owns the provider config. A
 command reads one key. The value does not ride in `argv`.
 
 This site is the human guide and the agent lookup. Reference pages stay
 literal. The emoji stay on this page.
+
+## Where the value goes
+
+`exec` maps a key name to an environment variable in the child. The process
+table sees the name. It does not see the value.
+
+<SecretFlow />
+
+<ArgvMeme />
+
+## The short rules
 
 <CardGrid>
 	<Card title="No value flag" icon="warning">
@@ -34,8 +47,10 @@ literal. The emoji stay on this page.
 		There is no delete command. `ensure` creates when absence is confirmed
 		and otherwise leaves the key alone.
 	</Card>
-	<Card title="Not a meme host" icon="star">
-		No third-party gif is embedded here. A hotlinked meme is someone else's
-		file, and this page does not need one.
+	<Card title="Original jokes only" icon="star">
+		The terminal panels on this page are HTML written here. No third-party
+		gif is embedded, hotlinked, or redistributed.
 	</Card>
 </CardGrid>
+
+The full command surface, with every flag, is in the [CLI reference](/reference/cli/).
