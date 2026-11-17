@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use base64::Engine;
 use serde_json::{Map, Value, json};
 
 fn binary() -> &'static str {
@@ -85,6 +86,7 @@ fn stderr(output: &Output) -> String {
 struct Request {
     method: String,
     path: String,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -168,10 +170,14 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Request> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_owned();
     let path = parts.next()?.to_owned();
-    let content_length = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .collect();
+    let content_length = headers
+        .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .and_then(|(_, value)| value.parse::<usize>().ok())
         .unwrap_or(0);
     let mut body = buffer[header_end..].to_vec();
     while body.len() < content_length {
@@ -182,7 +188,12 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Request> {
         body.extend_from_slice(&chunk[..count]);
     }
     body.truncate(content_length);
-    Some(Request { method, path, body })
+    Some(Request {
+        method,
+        path,
+        headers,
+        body,
+    })
 }
 
 fn vault_response(request: &Request) -> String {
@@ -1071,6 +1082,278 @@ fn two_profiles_do_not_overlap_writes_to_the_same_vault() {
     assert!(!stderr(&first).contains("from-alpha"));
     assert!(!stderr(&second).contains("from-beta"));
     assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+}
+
+struct InfisicalFixture {
+    port: u16,
+    requests: Arc<Mutex<Vec<Request>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl InfisicalFixture {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind infisical fixture");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking infisical fixture");
+        let port = listener.local_addr().expect("address").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_requests = Arc::clone(&requests);
+        let thread_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        if let Some(request) = read_request(&mut stream) {
+                            let response = infisical_response(&request);
+                            thread_requests.lock().expect("requests").push(request);
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            port,
+            requests,
+            stop,
+        }
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
+
+impl Drop for InfisicalFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn infisical_response(request: &Request) -> String {
+    let path = request.path.split('?').next().unwrap_or_default();
+    match (request.method.as_str(), path) {
+        ("GET", "/api/v4/secrets") => {
+            simple_response("200 OK", r#"{"secrets":[{"secretKey":"APP_DB"}]}"#)
+        }
+        ("GET", "/api/v4/secrets/APP_DB") => simple_response(
+            "200 OK",
+            r#"{"secret":{"secretKey":"APP_DB","secretValue":"stored-value","secretValueHidden":false}}"#,
+        ),
+        ("GET", _) => simple_response("404 Not Found", r#"{"message":"not found"}"#),
+        ("POST" | "PATCH", _) => simple_response("200 OK", r#"{"secret":{"secretKey":"written"}}"#),
+        _ => simple_response("405 Method Not Allowed", "{}"),
+    }
+}
+
+#[test]
+fn infisical_fixture_sends_bearer_auth_and_writes() {
+    let fixture = InfisicalFixture::start();
+    let directory = tempfile_dir();
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "i"
+[providers.i]
+kind = "infisical"
+address = "http://127.0.0.1:{}"
+project_id = "test-project"
+environment = "dev"
+path = "/"
+token_env = "TEST_INFISICAL_TOKEN"
+allow_http_loopback = true
+"#,
+            fixture.port
+        ),
+    )
+    .expect("write config");
+    let environment = [("TEST_INFISICAL_TOKEN", "test-token")];
+
+    let listing = run(&directory, &["ls"], &environment, None);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    assert_eq!(stdout(&listing), "APP_DB\n");
+
+    let get = run(&directory, &["get", "APP_DB"], &environment, None);
+    assert!(get.status.success(), "{}", stderr(&get));
+    assert_eq!(stdout(&get), "stored-value");
+
+    let set = run(
+        &directory,
+        &["set", "APP_DB"],
+        &environment,
+        Some(b"replacement"),
+    );
+    assert!(set.status.success(), "{}", stderr(&set));
+    assert!(!stdout(&set).contains("replacement"));
+    assert!(!stderr(&set).contains("replacement"));
+
+    let set_new = run(
+        &directory,
+        &["set", "APP_NEW"],
+        &environment,
+        Some(b"replacement"),
+    );
+    assert!(set_new.status.success(), "{}", stderr(&set_new));
+
+    let present = run(
+        &directory,
+        &["ensure", "APP_DB", "--json"],
+        &environment,
+        Some(b"ignored"),
+    );
+    assert!(present.status.success(), "{}", stderr(&present));
+    assert!(stdout(&present).contains("present"));
+
+    let created = run(
+        &directory,
+        &["ensure", "APP_NEW2", "--json"],
+        &environment,
+        Some(b"once"),
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    assert!(stdout(&created).contains("created"));
+
+    let requests = fixture.requests();
+    assert!(requests.len() >= 8, "expected several requests");
+    for request in &requests {
+        let authorization = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(authorization, Some("Bearer test-token"));
+        assert!(!request.path.contains("stored-value"));
+    }
+    assert!(requests.iter().any(|request| {
+        request.method == "GET" && request.path.starts_with("/api/v4/secrets?")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.method == "GET"
+            && request.path.starts_with("/api/v4/secrets/APP_DB?")
+            && !request.path.contains("viewSecretValue=true")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.method == "PATCH" && request.path.starts_with("/api/v4/secrets/APP_DB?")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.method == "POST" && request.path.starts_with("/api/v4/secrets/APP_NEW?")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.method == "POST" && request.path.starts_with("/api/v4/secrets/APP_NEW2?")
+    }));
+}
+
+fn decode_recorded_item(path: &Path) -> Value {
+    let encoded = std::fs::read_to_string(path).expect("recorded stdin");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .expect("base64 item");
+    serde_json::from_slice(&bytes).expect("item json")
+}
+
+#[test]
+fn vaultwarden_set_writes_through_stdin_and_keeps_sibling_fields() {
+    let directory = tempfile_dir();
+    let script = directory.join("bw");
+    let item = r#"{"id":"123e4567-e89b-12d3-a456-426614174000","type":1,"name":"DB","notes":"","login":{"username":"alice","password":"old-password"},"fields":[{"name":"api","value":"api-key"}]}"#;
+    std::fs::write(directory.join("item.json"), item).expect("item fixture");
+    std::fs::write(directory.join("items.json"), format!("[{item}]")).expect("items fixture");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{dir}/argv.log"
+case "$*" in
+  *"list items"*) cat "{dir}/items.json" ;;
+  *"get item"*) cat "{dir}/item.json" ;;
+  *"create item"*|*"edit item"*)
+    cat > "{dir}/stdin.b64"
+    cat "{dir}/stdin.b64"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+            dir = directory.display()
+        ),
+    )
+    .expect("write fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nsvault.toml"),
+        format!(
+            r#"version = 1
+provider = "v"
+[providers.v]
+kind = "vaultwarden"
+command = "{}"
+session_env = "BW_SESSION"
+"#,
+            script.display()
+        ),
+    )
+    .expect("write config");
+    let environment = [("BW_SESSION", "test-session")];
+
+    let providers = run(&directory, &["providers"], &environment, None);
+    assert!(providers.status.success(), "{}", stderr(&providers));
+    assert!(stdout(&providers).contains("vaultwarden\tread=true\twrite=true\tensure=false"));
+
+    let set = run(
+        &directory,
+        &["set", "DB#password"],
+        &environment,
+        Some(b"new-password"),
+    );
+    assert!(set.status.success(), "{}", stderr(&set));
+    assert!(!stdout(&set).contains("new-password"));
+    assert!(!stderr(&set).contains("new-password"));
+    let argv = std::fs::read_to_string(directory.join("argv.log")).expect("argv log");
+    assert_eq!(
+        argv.lines().last(),
+        Some("--nointeraction edit item 123e4567-e89b-12d3-a456-426614174000")
+    );
+    assert!(!argv.contains("new-password"));
+    let written = decode_recorded_item(&directory.join("stdin.b64"));
+    assert_eq!(written["name"], "DB");
+    assert_eq!(written["login"]["password"], "new-password");
+    assert_eq!(written["login"]["username"], "alice");
+    assert_eq!(written["fields"][0]["value"], "api-key");
+
+    let created = run(
+        &directory,
+        &["set", "FRESH"],
+        &environment,
+        Some(b"fresh-secret"),
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let argv = std::fs::read_to_string(directory.join("argv.log")).expect("argv log");
+    assert_eq!(argv.lines().last(), Some("--nointeraction create item"));
+    assert!(!argv.contains("fresh-secret"));
+    let written = decode_recorded_item(&directory.join("stdin.b64"));
+    assert_eq!(written["name"], "FRESH");
+    assert_eq!(written["type"], 1);
+    assert_eq!(written["login"]["password"], "fresh-secret");
+
+    let invoked = argv.lines().count();
+    let refused = run(
+        &directory,
+        &["set", "DB#id"],
+        &environment,
+        Some(b"not-written"),
+    );
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("ids cannot be set"));
+    assert!(!stderr(&refused).contains("not-written"));
+    let argv = std::fs::read_to_string(directory.join("argv.log")).expect("argv log");
+    assert_eq!(argv.lines().count(), invoked, "refusal reached the CLI");
 }
 
 fn tempfile_dir() -> std::path::PathBuf {

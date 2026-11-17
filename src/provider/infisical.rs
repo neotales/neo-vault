@@ -63,6 +63,19 @@ impl InfisicalProvider {
         })
     }
 
+    /// Returns the `Authorization` header value for the secrets API.
+    ///
+    /// The API requires the `Bearer` scheme; a bare access token is rejected
+    /// with `401` or `403`. The raw token never leaves this type without the
+    /// scheme, and the result is zeroized like any other secret.
+    fn authorization(&self) -> Result<Secret> {
+        let token = self.token()?;
+        let mut header = Vec::with_capacity(7 + token.expose().len());
+        header.extend_from_slice(b"Bearer ");
+        header.extend_from_slice(token.expose());
+        Ok(Secret::new(header))
+    }
+
     fn token(&self) -> Result<Secret> {
         if let Some(token) = &self.direct_token {
             return Ok(Secret::new(token.expose().to_vec()));
@@ -179,7 +192,7 @@ impl Provider for InfisicalProvider {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>> {
-        let token = self.token()?;
+        let authorization = self.authorization()?;
         let mut url = endpoint(&self.base, &["api", "v4", "secrets"])?;
         url.query_pairs_mut()
             .append_pair("projectId", &self.project_id)
@@ -193,7 +206,7 @@ impl Provider for InfisicalProvider {
         let response = self.client.request(
             "GET",
             &url,
-            Some(("Authorization", &token)),
+            Some(("Authorization", &authorization)),
             &[],
             "application/json",
             None,
@@ -229,12 +242,12 @@ impl Provider for InfisicalProvider {
                 "Infisical keys do not have fields; use the secret name directly",
             ));
         }
-        let token = self.token()?;
+        let authorization = self.authorization()?;
         let url = self.secret_url(key.path())?;
         let response = self.client.request(
             "GET",
             &url,
-            Some(("Authorization", &token)),
+            Some(("Authorization", &authorization)),
             &[],
             "application/json",
             None,
@@ -277,7 +290,7 @@ impl Provider for InfisicalProvider {
         }
         let value = std::str::from_utf8(value.expose())
             .map_err(|_| Error::new("Infisical values must be UTF-8 text"))?;
-        let token = self.token()?;
+        let authorization = self.authorization()?;
         let url = self.secret_url(key.path())?;
         let body = json!({
             "projectId": &self.project_id,
@@ -291,7 +304,7 @@ impl Provider for InfisicalProvider {
         let existing = self.client.request(
             "GET",
             &url,
-            Some(("Authorization", &token)),
+            Some(("Authorization", &authorization)),
             &[],
             "application/json",
             None,
@@ -304,7 +317,7 @@ impl Provider for InfisicalProvider {
         let response = self.client.request(
             method,
             &url,
-            Some(("Authorization", &token)),
+            Some(("Authorization", &authorization)),
             &[],
             "application/json",
             Some(body.as_bytes()),
@@ -325,13 +338,13 @@ impl Provider for InfisicalProvider {
         if text.is_empty() {
             return Err(Error::new("refusing to store an empty secret"));
         }
-        let token = self.token()?;
+        let authorization = self.authorization()?;
         let url = self.secret_url(key.path())?;
         // Status only. The body may contain a value and is not parsed or logged.
         let existing = self.client.request(
             "GET",
             &url,
-            Some(("Authorization", &token)),
+            Some(("Authorization", &authorization)),
             &[],
             "application/json",
             None,
@@ -352,9 +365,11 @@ impl Provider for InfisicalProvider {
                 )));
             }
         }
-        // Documented Create, not the Update PATCH. A duplicate is expected to
-        // fail rather than upsert. This repository has not verified that
-        // against a live Infisical server.
+        // Documented Create, not the Update PATCH. The pinned container
+        // rejects a duplicate Create with 400 rather than upserting, and
+        // rejects an Update PATCH for a missing name with 404, so neither call
+        // can silently replace an existing value. The GET-then-POST race is
+        // still not atomic.
         let body = json!({
             "projectId": &self.project_id,
             "environment": &self.environment,
@@ -367,7 +382,7 @@ impl Provider for InfisicalProvider {
         let created = self.client.request(
             "POST",
             &url,
-            Some(("Authorization", &token)),
+            Some(("Authorization", &authorization)),
             &[],
             "application/json",
             Some(body.as_bytes()),
@@ -378,7 +393,7 @@ impl Provider for InfisicalProvider {
                 let again = self.client.request(
                     "GET",
                     &url,
-                    Some(("Authorization", &token)),
+                    Some(("Authorization", &authorization)),
                     &[],
                     "application/json",
                     None,

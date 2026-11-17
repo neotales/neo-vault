@@ -127,8 +127,8 @@ history still sees exported values, so autoload is a deliberate trade.
 | `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
 | `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
 | `keepass` | yes | no | no | `keepassxc-cli` | Fake-CLI fixture in the suite; a generated local KDBX was also exercised manually with `keepassxc-cli` 2.7.12 |
-| `infisical` | yes | yes | yes | v4 secrets HTTP API; service token or Universal Auth. Ensure uses documented Create (`POST`), never Update (`PATCH`). | Fixture-tested for list/get/set; ensure follows the published Create contract and is not live-verified |
-| `vaultwarden` | yes | no | no | `bw` CLI, existing session | Fake `bw` fixture; `bw` not installed here |
+| `infisical` | yes | yes | yes | v4 secrets HTTP API; service token or Universal Auth. Ensure uses documented Create (`POST`), never Update (`PATCH`). | Fixture-tested for list/get/set/ensure plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis; no production server |
+| `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
 
@@ -158,8 +158,18 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   v4 endpoint is unpaginated by design.
 - KeePass is read-only. Database passwords and key files are the caller's
   responsibility; the password is written to `keepassxc-cli` stdin.
-- Vaultwarden is read-only and never logs in or unlocks. `bw list items`
-  returns full items, which this adapter parses and discards except for names.
+- Vaultwarden never logs in or unlocks; the session must already be unlocked when
+  the adapter runs. `bw list items` returns full items, which this adapter
+  parses and discards except for names. A write reads the whole item, changes
+  one field, and sends the item back through `bw edit item`, so the session
+  needs write access. Writes require UTF-8 text, refuse an empty value, and are
+  capped at 1 MiB. A key without a field writes `login.password` (or `notes` on
+  a secure note); `#password`, `#username`, `#notes`, and `#name` are the named
+  fields, and any other field name updates or appends a custom field. A missing
+  item name is created as a login. There is no `ensure`: a create-then-race
+  cannot be made atomic through this CLI, and two items with the same name are
+  legal in Bitwarden. Writes take the same-user advisory lock; its identity is
+  the configured CLI executable because the configuration has no server address.
 - Proton writes are unsupported because the documented update command takes
   the value in `argv`.
 - GitHub repository secrets only. Organization, environment, Codespaces, and
@@ -175,9 +185,10 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 - Infisical `ensure` is not an atomic server-side conditional write. It GETs
   the name, and only a confirmed 404 is followed by the documented Create
   POST. A 400 or 409 is treated as present only after a second GET shows the
-  name. It never sends the Update PATCH. This has not been run against a live
-  Infisical server. If that server's Create upserts, the race is not closed;
-  do not treat this adapter as live-verified.
+  name. It never sends the Update PATCH. The pinned container rejects a
+  duplicate Create with 400 rather than upserting, and rejects the Update PATCH
+  for a missing name with 404; a concurrent writer can still win between the
+  GET and the POST.
 - There is no remove, delete, or destroy operation.
 - There is no backup import or export. See the roadmap. No age identity,
   recipient, or encrypted backup file is read or written.
@@ -248,7 +259,8 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   before they contact the provider. The lock identity is a hash of the
   canonical address plus non-secret scope (Vault/OpenBao: mount and
   namespace, shared across those two kind labels; Infisical: project,
-  environment, and folder; GitHub: owner and repository). Profile names and
+  environment, and folder; GitHub: owner and repository; Vaultwarden: the
+  configured CLI executable). Profile names and
   config file paths are not part of it. `https://Host:443/path/` and
   `https://host/path` match. `localhost` and `127.0.0.1` do not. The lock
   file lives under `$XDG_STATE_HOME/nsvault/locks` or
@@ -267,17 +279,24 @@ provider may log its own request. This project does not claim to prevent those.
 
 ## Container integration tests
 
-Vault has an opt-in, isolated testcontainers test pinned to
-`hashicorp/vault:1.21.4`:
+Three opt-in, isolated testcontainers tests are pinned to specific images:
 
 ```sh
 cargo test --test container_vault -- --ignored --nocapture
+cargo test --test container_infisical -- --ignored --nocapture
+NSVAULT_TEST_BW=/path/to/pinned/bw \
+  cargo test --test container_vaultwarden -- --ignored --nocapture
 ```
 
-It ran successfully here and removed only its own container. Vaultwarden and
-Infisical container tests are deferred with concrete prerequisites in
-[`docs/testcontainers.md`](docs/testcontainers.md); no test is claimed for them.
-Container tests do not run in the default gate.
+The Vault test ran against `hashicorp/vault:1.21.4`. The Infisical test ran
+against `infisical/infisical:v0.167.11` with `postgres:17-alpine` and
+`redis:7.4-alpine`; it bootstraps the instance, creates a project, and covers
+`list`, `get`, `set`, and `ensure`. The Vaultwarden test ran against
+`vaultwarden/server:1.37.5` with a pinned `@bitwarden/cli` 2025.6.1, creating a
+throwaway account inside the container and covering `list`, `get`, and `set`
+including sibling fields. Every test removed only its own containers. Container
+tests do not run in the default gate; exact evidence and prerequisites are in
+[`docs/testcontainers.md`](docs/testcontainers.md).
 
 ## Floci / cloud emulation
 
