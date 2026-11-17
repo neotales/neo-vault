@@ -192,12 +192,8 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   from `~/.config/nsvault` are not merged into it.
 - Windows and macOS were not exercised. The code avoids Unix-only calls outside
   the `bw`/`keepassxc-cli`/`pass-cli` process boundary, but that is not a
-  portability claim.
-- There is no backup import or export. See the roadmap. No age identity,
-  recipient, or encrypted backup file is read or written.
-- There is no request-rewriting proxy, placeholder syntax, or second
-  executable. `exec` does not edit outbound HTTP bodies. A proxy remains an
-  open question on the roadmap, not a committed design.
+  portability claim. The same-user write lock uses Linux `flock` and was not
+  exercised on those systems.
 
 ## Using the Rust crate
 
