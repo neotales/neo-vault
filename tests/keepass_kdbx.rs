@@ -138,7 +138,7 @@ exec "$NSVAULT_TEST_KEEPASS_REAL" "$@"
 
 #[test]
 #[ignore = "requires keepassxc-cli and generates a temporary KDBX"]
-fn generated_kdbx_round_trip_preserves_fields_and_ensures_are_create_only() {
+fn generated_kdbx_round_trip_preserves_fields_and_refuses_ensure() {
     let real = keepass_cli();
     let directory = scratch_dir();
     let database = directory.join("vault.kdbx");
@@ -237,38 +237,22 @@ password_env = "KP_TEST_PASSWORD"
     );
     assert_eq!(show(&real, &database, "Notes", "Group/DB"), "keep-me");
 
-    let present = run_nsvault(
-        &directory,
-        &["ensure", "Group/DB"],
-        Some(b"must-not-replace\n"),
-        &real,
-    );
+    let argv_before_ensure = std::fs::read_to_string(directory.join("argv.log")).expect("argv log");
+    let refused_ensure = run_nsvault(&directory, &["ensure", "Group/DB"], None, &real);
+    assert!(!refused_ensure.status.success());
     assert!(
-        present.status.success(),
+        String::from_utf8_lossy(&refused_ensure.stderr).contains("does not support ensure"),
         "{}",
-        String::from_utf8_lossy(&present.stderr)
+        String::from_utf8_lossy(&refused_ensure.stderr)
     );
-    assert!(String::from_utf8_lossy(&present.stderr).contains("present"));
     assert_eq!(
         show(&real, &database, "Password", "Group/DB"),
         REPLACEMENT_VALUE
     );
-
-    let ensured = run_nsvault(
-        &directory,
-        &["ensure", "Group/New"],
-        Some(b"created-secret-value\n"),
-        &real,
-    );
-    assert!(
-        ensured.status.success(),
-        "{}",
-        String::from_utf8_lossy(&ensured.stderr)
-    );
-    assert!(String::from_utf8_lossy(&ensured.stderr).contains("created"));
+    let argv_after_ensure = std::fs::read_to_string(directory.join("argv.log")).expect("argv log");
     assert_eq!(
-        show(&real, &database, "Password", "Group/New"),
-        "created-secret-value"
+        argv_before_ensure, argv_after_ensure,
+        "a refused ensure must not invoke keepassxc-cli"
     );
 
     let added = run_nsvault(
@@ -379,7 +363,6 @@ password_env = "KP_TEST_PASSWORD"
         DATABASE_PASSWORD,
         INITIAL_VALUE,
         REPLACEMENT_VALUE,
-        "created-secret-value",
         "second-secret-value",
         "concurrent-0-value",
         "must-not-replace",
@@ -387,6 +370,66 @@ password_env = "KP_TEST_PASSWORD"
     ] {
         assert!(!argv.contains(secret), "argv contained a secret: {secret}");
     }
+
+    std::fs::remove_dir_all(&directory).expect("cleanup");
+}
+
+#[test]
+#[ignore = "requires keepassxc-cli and generates a temporary KDBX"]
+fn duplicate_add_is_refused_and_preserves_the_existing_value() {
+    let real = keepass_cli();
+    let directory = scratch_dir();
+    let database = directory.join("duplicate.kdbx");
+    let database_text = database.to_str().expect("database path is UTF-8");
+
+    let created = run_cli(
+        &real,
+        &["db-create", "-t", "100", "-p", database_text],
+        Some(&format!("{DATABASE_PASSWORD}\n{DATABASE_PASSWORD}\n")),
+    );
+    assert!(
+        created.status.success(),
+        "db-create failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let seeded = run_cli(
+        &real,
+        &["add", "-q", "-p", database_text, "Entry"],
+        Some(&format!("{DATABASE_PASSWORD}\n{INITIAL_VALUE}\n")),
+    );
+    assert!(
+        seeded.status.success(),
+        "first add failed: {}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    let duplicate = run_cli(
+        &real,
+        &["add", "-q", "-p", database_text, "Entry"],
+        Some(&format!("{DATABASE_PASSWORD}\nsecond-value\n")),
+    );
+    assert!(
+        !duplicate.status.success(),
+        "a duplicate add must be refused"
+    );
+    assert_eq!(show(&real, &database, "Password", "Entry"), INITIAL_VALUE);
+
+    let listing = run_cli(
+        &real,
+        &["ls", "-R", "-f", "--", database_text],
+        Some(&format!("{DATABASE_PASSWORD}\n")),
+    );
+    assert!(
+        listing.status.success(),
+        "ls failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let text = String::from_utf8_lossy(&listing.stdout);
+    assert_eq!(
+        text.lines().filter(|line| *line == "Entry").count(),
+        1,
+        "the refused add must not create a second entry"
+    );
 
     std::fs::remove_dir_all(&directory).expect("cleanup");
 }

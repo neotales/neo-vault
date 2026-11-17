@@ -99,9 +99,9 @@ when the provider confirms the key is absent, and it leaves an existing key
 unchanged. It never deletes. Success writes no secret to stdout. `--json`
 prints `{"status":"created"}` or `{"status":"present"}` and nothing else.
 Auth, network, and other ambiguous errors are failures, not absence. A
-provider without a race-safe create path — Infisical, GitHub, and every
-read-only kind in this build — exits with an unsupported error and contacts no
-provider. There is no `remove` command.
+provider without a race-safe create path — Infisical, GitHub, Vaultwarden,
+KeePass, and every read-only kind in this build — exits with an unsupported
+error and contacts no provider. There is no `remove` command.
 `search` and `ls` are name operations. Vault, Infisical, KeePass, Proton, and
 GitHub listings are metadata-only. The Vaultwarden CLI has no metadata-only list
 command, so its adapter fetches full items and keeps only names; see the
@@ -128,7 +128,7 @@ history still sees exported values, so autoload is a deliberate trade.
 | --- | --- | --- | --- | --- | --- |
 | `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
 | `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
-| `keepass` | yes | yes | yes | `keepassxc-cli`; `edit -p`/`add -p` read the database password and the value from stdin, never `argv` | Fake-CLI fixture in the suite plus an opt-in generated local KDBX test (`cargo test --test keepass_kdbx -- --ignored`) with `keepassxc-cli` 2.7.12; no production vault |
+| `keepass` | yes | yes | **no** | `keepassxc-cli`; `edit -p`/`add -p` read the database password and the value from stdin, never `argv`. `ensure` is refused: the CLI's check-and-save is not atomic against an external writer. | Fake-CLI fixture in the suite plus opt-in generated local KDBX tests for the round trip, concurrent writers, and duplicate add (`cargo test --test keepass_kdbx -- --ignored`) with `keepassxc-cli` 2.7.12; no production vault |
 | `infisical` | yes | yes | no | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` is disabled because the Create endpoint's duplicate behavior is unproven. | Fixture-tested for list/get/set and for the `ensure` refusal, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis; no production server |
 | `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
 | `proton` | yes | no | no | official `pass-cli`, existing session or PAT | Fake `pass-cli` fixture; not installed here |
@@ -143,7 +143,8 @@ Key grammar:
   a `value` field wins, otherwise a single-field secret is accepted.
 - KeePass: `Group/Entry` returns the `Password` attribute;
   `Group/Entry#UserName` or another attribute selects one. Writes accept no
-  field or `Password` only; every other attribute is read-only.
+  field or `Password` only; every other attribute is read-only and `ensure` is
+  unsupported.
 - Infisical: `SECRET_NAME`; fields are not part of the API.
 - Vaultwarden: item name or UUID, optionally `#password`, `#username`,
   `#notes`, `#name`, `#id`, or a custom field name. Names must be unique;
@@ -178,21 +179,24 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   cannot end in a newline.
   An existing entry is updated with `edit -p`, which changes only the password
   and preserves the other fields. A missing entry is created with `add -p` only
-  when its parent group already exists; missing groups are not created. `set`
-  and `ensure` hold one same-user advisory lock keyed by the canonical database
-  path, so cooperating nsvault processes (including the Rust `Client` and the C
-  ABI) serialize their read-modify-write. `keepassxc-cli` has no conditional
-  write and does not honor that lock: the KeePassXC GUI, another tool, another
-  host, or a different OS user can change the KDBX between our read and save
-  and lose the other change. `ensure` re-lists under the lock and uses `add`;
-  the tested 2.7.12 `add` refuses an existing path, so a write that appears
-  during a race is
-  reported `present` rather than overwritten, but the CLI can still lose a
-  concurrent external change to another field. The duplicate refusal is
-  observed, not documented: a `keepassxc-cli` that upserts would defeat it.
-  An existing entry is present even when its password is empty: `ensure` never
-  fills or replaces an existing field. Database passwords and key files remain the caller's
-  responsibility; both are written to `keepassxc-cli` stdin, never `argv`.
+  when its parent group already exists; missing groups are not created.
+  `set` holds one same-user advisory lock shared by every KeePass write on this
+  machine, so cooperating nsvault processes (including the Rust `Client` and
+  the C ABI) serialize their read-modify-write. The identity is deliberately
+  one shared value, not a database path or inode: two hard links to one KDBX
+  have different paths, and `keepassxc-cli` may replace the file atomically, so
+  either identity could let two writers bypass each other. This over-serializes
+  every KeePass database, which is coarser than one vault and never finer.
+  `keepassxc-cli` has no conditional write and does not honor that lock: the
+  KeePassXC GUI, another tool, another host, or a different OS user can change
+  the KDBX between our read and save and lose the other change.
+  `ensure` is unsupported and refuses without contacting the database. The
+  CLI's check followed by `add` is not atomic against an external writer, and
+  its observed refusal of a duplicate path is not a documented conditional
+  create. The generated-KDBX test records that duplicate refusal as evidence;
+  it does not make `ensure` safe, so the command is disabled.
+  Database passwords and key files remain the caller's responsibility; both are
+  written to `keepassxc-cli` stdin, never `argv`.
 - Vaultwarden never logs in or unlocks; the session must already be unlocked when
   the adapter runs. `bw list items` returns full items, which this adapter
   parses and discards except for names. A write reads the whole item, changes
@@ -348,17 +352,17 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   restriction. Calling a constructor directly does not bypass the configuration
   checks.
 - Vault/OpenBao `set`/`ensure`, GitHub `set`, Infisical `set`, Vaultwarden
-  `set`, KeePass `set`/`ensure`, and cloud `set` (AWS `ensure` too) take a
-  same-user advisory file lock on this machine before they contact the
-  provider. The CLI, the Rust `Client`, and the C ABI
-  share the mechanism. GCP and Azure `ensure` remain unsupported and send no
-  request, so there is no write to lock. The lock identity is a hash of the
-  canonical address plus non-secret scope (Vault/OpenBao: mount and namespace,
-  shared across those two kind labels; Infisical: project, environment, and
-  folder; GitHub: owner and repository; Vaultwarden: one shared identity for
-  every profile on this machine, because wrapper paths differ; KeePass: the
-  canonical database path, so relative paths and symbolic links to one file
-  share a lock). For the clouds it is deliberately
+  `set`, KeePass `set`, and cloud `set` (AWS `ensure` too) take a same-user
+  advisory file lock on this machine before they contact the provider. The CLI,
+  the Rust `Client`, and the C ABI share the mechanism. KeePass, GCP, and Azure
+  `ensure` remain unsupported and send no request, so there is no write to
+  lock. The lock identity is a hash of the canonical address plus non-secret
+  scope (Vault/OpenBao: mount and namespace, shared across those two kind
+  labels; Infisical: project, environment, and folder; GitHub: owner and
+  repository; Vaultwarden: one shared identity for every profile on this
+  machine, because wrapper paths differ; KeePass: one shared identity for every
+  KDBX write on this machine, because hard links and atomic file replacement
+  make a path or inode identity unsafe). For the clouds it is deliberately
   conservative:
   - AWS recognizes `secretsmanager.{region}` and
     `secretsmanager-fips.{region}` on `amazonaws.com`, `amazonaws.com.cn`,
@@ -553,9 +557,9 @@ cargo fmt --check                         clean
 cargo clippy --all-targets -- -D warnings clean
 cargo test                                90 lib + 1 AWS contract + 36 CLI
                                           + 4 FFI passed;
-                                          0 failed; 7 ignored (3 cloud
+                                          0 failed; 8 ignored (3 cloud
                                           emulator, Vault, Infisical,
-                                          Vaultwarden, KeePass)
+                                          Vaultwarden, 2 KeePass)
 cargo build --release --lib               succeeded
 C ABI smoke                               exit 0, "redacted error received
                                           (34 bytes)"
@@ -565,7 +569,7 @@ The opt-in KeePass test against a real generated KDBX also passed:
 
 ```sh
 cargo test --test keepass_kdbx -- --ignored --nocapture
-# 1 passed; 0 failed
+# 2 passed; 0 failed
 ```
 
 The container and Floci emulator tests were not rerun in this worktree; their

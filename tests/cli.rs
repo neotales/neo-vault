@@ -1260,7 +1260,7 @@ fn keepass_fixture_writes_the_password_on_stdin_and_never_in_argv() {
     let providers = run(&directory, &["providers"], &environment, None);
     assert!(providers.status.success(), "{}", stderr(&providers));
     assert!(
-        stdout(&providers).contains("write=true\tensure=true"),
+        stdout(&providers).contains("write=true\tensure=false"),
         "{}",
         stdout(&providers)
     );
@@ -1301,26 +1301,16 @@ fn keepass_fixture_writes_the_password_on_stdin_and_never_in_argv() {
     assert!(argv.contains("add"), "{argv}");
     assert!(!argv.contains("created-value"), "{argv}");
 
-    let present = run(
-        &directory,
-        &["ensure", "Entry"],
-        &environment,
-        Some(b"must-not-replace\n"),
+    let refused_ensure = run(&directory, &["ensure", "Entry"], &environment, None);
+    assert!(!refused_ensure.status.success());
+    assert!(
+        stderr(&refused_ensure).contains("does not support ensure"),
+        "{}",
+        stderr(&refused_ensure)
     );
-    assert!(present.status.success(), "{}", stderr(&present));
-    assert!(stderr(&present).contains("present"), "{}", stderr(&present));
-    let after_present = read_fixture_log(&directory.join("write-argv.log"));
-    assert_eq!(after_present.matches("add").count(), 1, "{after_present}");
-    assert_eq!(after_present.matches("edit").count(), 1, "{after_present}");
-
-    let ensured = run(
-        &directory,
-        &["ensure", "Group/Ensured"],
-        &environment,
-        Some(b"ensured-value\n"),
-    );
-    assert!(ensured.status.success(), "{}", stderr(&ensured));
-    assert!(stderr(&ensured).contains("created"), "{}", stderr(&ensured));
+    let after_ensure = read_fixture_log(&directory.join("write-argv.log"));
+    assert_eq!(after_ensure.matches("add").count(), 1, "{after_ensure}");
+    assert_eq!(after_ensure.matches("edit").count(), 1, "{after_ensure}");
 
     let refused = run(
         &directory,
@@ -1336,7 +1326,7 @@ fn keepass_fixture_writes_the_password_on_stdin_and_never_in_argv() {
     );
     assert!(!stderr(&refused).contains("must-not-be-written"));
     let after_refusal = read_fixture_log(&directory.join("write-argv.log"));
-    assert_eq!(after_refusal.matches("add").count(), 2, "{after_refusal}");
+    assert_eq!(after_refusal.matches("add").count(), 1, "{after_refusal}");
     assert_eq!(after_refusal.matches("edit").count(), 1, "{after_refusal}");
     assert!(!script.as_os_str().is_empty());
 }
@@ -1435,71 +1425,36 @@ password_env = "KP_PW"
 }
 
 #[test]
-fn keepass_ensure_reports_present_when_an_uncoordinated_writer_creates_the_entry() {
+fn keepass_fixture_serializes_concurrent_writers() {
     let directory = tempfile_dir();
-    let script = directory.join("keepassxc-cli");
-    std::fs::write(
-        &script,
-        r#"#!/bin/sh
-root=$(dirname "$0")
-case "$1" in
-  ls)
-    printf '%s\n' 'Other'
-    if [ -f "$root/created" ]; then printf '%s\n' 'Entry'; fi
-    ;;
-  add)
-    touch "$root/created"
-    exit 1
-    ;;
-  show) printf '%s\n' 'entry-value' ;;
-  *) exit 2 ;;
-esac
-"#,
-    )
-    .expect("write fixture");
-    make_executable(&script);
+    let script = keepass_overlap_script(&directory);
     std::fs::write(directory.join("test.kdbx"), b"not-a-real-database").expect("database fixture");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            directory.join("test.kdbx"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .expect("database mode");
-    }
-    std::fs::write(
-        directory.join(".nsvault.toml"),
-        format!(
-            r#"version = 1
-provider = "k"
-[providers.k]
-kind = "keepass"
-database = "test.kdbx"
-command = "{}"
-password_env = "KP_PW"
-"#,
-            script.display()
-        ),
-    )
-    .expect("write config");
-    let environment = [("KP_PW", "not-a-real-password")];
+    keepass_config(&directory, ".nsvault.toml", "test.kdbx", &script);
+    let lock_dir = keepass_lock_dir();
 
-    let ensured = run(
-        &directory,
-        &["ensure", "Entry"],
-        &environment,
-        Some(b"must-not-be-written\n"),
-    );
-    assert!(ensured.status.success(), "{}", stderr(&ensured));
-    assert!(stderr(&ensured).contains("present"), "{}", stderr(&ensured));
-    assert!(!stderr(&ensured).contains("must-not-be-written"));
-    assert!(directory.join("created").exists());
+    let first = spawn_keepass_set(&directory, None, &lock_dir, b"one-value\n");
+    let second = spawn_keepass_set(&directory, None, &lock_dir, b"two-value\n");
+    assert_keepass_writers_serialized(&directory, first, second);
 }
 
 #[test]
-fn keepass_fixture_serializes_concurrent_writers() {
+fn keepass_fixture_serializes_writers_through_distinct_hardlink_paths() {
     let directory = tempfile_dir();
+    let script = keepass_overlap_script(&directory);
+    std::fs::write(directory.join("one.kdbx"), b"not-a-real-database").expect("database fixture");
+    std::fs::hard_link(directory.join("one.kdbx"), directory.join("two.kdbx")).expect("hard link");
+    keepass_config(&directory, "one.toml", "one.kdbx", &script);
+    keepass_config(&directory, "two.toml", "two.kdbx", &script);
+    let lock_dir = keepass_lock_dir();
+    let one = directory.join("one.toml");
+    let two = directory.join("two.toml");
+
+    let first = spawn_keepass_set(&directory, Some(&one), &lock_dir, b"one-value\n");
+    let second = spawn_keepass_set(&directory, Some(&two), &lock_dir, b"two-value\n");
+    assert_keepass_writers_serialized(&directory, first, second);
+}
+
+fn keepass_overlap_script(directory: &Path) -> std::path::PathBuf {
     let script = directory.join("keepassxc-cli");
     std::fs::write(
         &script,
@@ -1519,24 +1474,18 @@ esac
     )
     .expect("write fixture");
     make_executable(&script);
-    std::fs::write(directory.join("test.kdbx"), b"not-a-real-database").expect("database fixture");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            directory.join("test.kdbx"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .expect("database mode");
-    }
+    script
+}
+
+fn keepass_config(directory: &Path, file: &str, database: &str, script: &Path) {
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(file),
         format!(
             r#"version = 1
 provider = "k"
 [providers.k]
 kind = "keepass"
-database = "test.kdbx"
+database = "{database}"
 command = "{}"
 password_env = "KP_PW"
 "#,
@@ -1544,7 +1493,9 @@ password_env = "KP_PW"
         ),
     )
     .expect("write config");
+}
 
+fn keepass_lock_dir() -> std::path::PathBuf {
     let lock_dir = std::env::temp_dir().join(format!("nsvault-locks-{}", std::process::id()));
     std::fs::create_dir_all(&lock_dir).expect("lock dir");
     #[cfg(unix)]
@@ -1553,28 +1504,43 @@ password_env = "KP_PW"
         std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o700))
             .expect("lock dir mode");
     }
-    let spawn = || {
-        let mut command = Command::new(binary());
-        command
-            .args(["set", "Entry"])
-            .current_dir(&directory)
-            .env("NSVAULT_LOCK_DIR", &lock_dir)
-            .env("KP_PW", "not-a-real-password")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn nsvault");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(b"one-value\n")
-            .expect("write stdin");
-        drop(child.stdin.take());
-        child
-    };
-    let first = spawn();
-    let second = spawn();
+    lock_dir
+}
+
+fn spawn_keepass_set(
+    directory: &Path,
+    config: Option<&Path>,
+    lock_dir: &Path,
+    value: &[u8],
+) -> std::process::Child {
+    let mut command = Command::new(binary());
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    command
+        .args(["set", "Entry"])
+        .current_dir(directory)
+        .env("NSVAULT_LOCK_DIR", lock_dir)
+        .env("KP_PW", "not-a-real-password")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn nsvault");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(value)
+        .expect("write stdin");
+    drop(child.stdin.take());
+    child
+}
+
+fn assert_keepass_writers_serialized(
+    directory: &Path,
+    first: std::process::Child,
+    second: std::process::Child,
+) {
     let first = first.wait_with_output().expect("first writer");
     let second = second.wait_with_output().expect("second writer");
     assert!(first.status.success(), "{}", stderr(&first));

@@ -11,23 +11,29 @@
 //! values in `argv`; this adapter never puts a secret there. `edit` changes
 //! only the password and leaves every other field of the entry intact.
 //!
-//! `set` and `ensure` hold one same-user advisory lock keyed by the canonical
-//! database path, so cooperating nsvault processes do not overlap a
-//! read-modify-write of the KDBX file. The lock does not cover KeePassXC's GUI,
+//! `set` holds one same-user advisory lock shared by every KeePass write on
+//! this machine, so cooperating nsvault processes do not overlap a
+//! read-modify-write of any KDBX file. The lock is deliberately coarser than a
+//! database: two hard links to one KDBX have different paths, and
+//! `keepassxc-cli` may replace the file, so a path or inode identity would let
+//! two writers bypass each other. The lock does not cover KeePassXC's GUI,
 //! `keepassxc-cli` invoked by another tool, or another host: `keepassxc-cli`
 //! has no conditional write, so an external change that lands between our read
-//! and save can be lost. See the provider matrix in `README.md`.
+//! and save can be lost.
+//!
+//! `ensure` is not implemented. A check followed by `add` cannot be made
+//! atomic against a writer that does not take this lock, and the CLI's
+//! observed refusal of a duplicate path is not a documented conditional
+//! create. See the provider matrix in `README.md`.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use sha2::{Digest, Sha256};
-
 use crate::config::KeepassConfig;
 use crate::error::{Error, Result};
 use crate::key::Key;
-use crate::provider::{Capabilities, EnsureStatus, ListedKey, Provider, command_available, lock};
+use crate::provider::{Capabilities, ListedKey, Provider, command_available, lock};
 use crate::secret::Secret;
 
 /// Maximum bytes accepted for one written value.
@@ -182,20 +188,16 @@ impl KeepassProvider {
         Ok(Secret::new(trim_one_newline(output.stdout)))
     }
 
-    /// Returns the lock identity for this database.
+    /// Lock identity for every KeePass writer on this machine.
     ///
-    /// The canonical path, hashed so an unusual non-UTF-8 path stays distinct,
-    /// makes two profiles that name the same KDBX file share one lock even when
-    /// they use different relative paths or symbolic links. Profile names and
-    /// every credential are excluded.
-    fn write_identity(&self) -> Result<String> {
-        let canonical = std::fs::canonicalize(&self.database).map_err(|_| {
-            Error::new(
-                "KeePass database path could not be resolved; the database must exist before a write",
-            )
-        })?;
-        let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-        Ok(lock::identity("keepass", &format!("{digest:x}"), &[]))
+    /// A per-database identity is unsafe. Two hard links to one KDBX have
+    /// different canonical paths, and an atomic replacement changes an inode
+    /// identity, so either spelling lets two cooperating writers take
+    /// different locks for one file. One conservative identity over-serializes
+    /// every KeePass write; it is coarser than any database, never finer.
+    /// Profile names, paths, and every credential are excluded.
+    fn write_identity(&self) -> String {
+        lock::identity("keepass", "shared", &[])
     }
 
     /// Rejects a write whose value cannot travel through the CLI's stdin.
@@ -381,7 +383,7 @@ impl Provider for KeepassProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::READ_WRITE_ENSURE
+        Capabilities::READ_WRITE
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>> {
@@ -416,7 +418,7 @@ impl Provider for KeepassProvider {
         Self::require_password_field(&key)?;
         Self::check_value(value)?;
         self.require_writable()?;
-        let _lock = lock::acquire(&self.write_identity()?)?;
+        let _lock = lock::acquire(&self.write_identity())?;
         let lines = self.listing()?;
         match classify(&lines, key.path())? {
             EntryState::Entry => self.write_entry("edit", key.path(), value),
@@ -427,50 +429,6 @@ impl Provider for KeepassProvider {
             EntryState::Absent => {
                 Self::require_parent_group(&lines, key.path())?;
                 self.write_entry("add", key.path(), value)
-            }
-        }
-    }
-
-    /// Creates an entry only when the database confirms it is absent.
-    ///
-    /// The check and the add run under the same lock, so a second cooperating
-    /// nsvault writer sees the created entry instead of adding a duplicate.
-    /// The tested `keepassxc-cli` 2.7.12 refuses a duplicate path, so an
-    /// uncoordinated writer cannot be overwritten; if the add fails, the
-    /// listing is repeated and a now-present entry is reported as `Present`.
-    /// The duplicate refusal is observed behavior, not a documented contract:
-    /// a CLI version that upserts would defeat this check. A group, an unreadable
-    /// database, or a failed listing is an error, not absence.
-    fn ensure(&self, raw_key: &str, value: &Secret) -> Result<EnsureStatus> {
-        let key = Key::parse(raw_key)?;
-        Self::require_entry_path(key.path())?;
-        Self::require_password_field(&key)?;
-        Self::check_value(value)?;
-        self.require_writable()?;
-        let _lock = lock::acquire(&self.write_identity()?)?;
-        let lines = self.listing()?;
-        match classify(&lines, key.path())? {
-            EntryState::Entry => Ok(EnsureStatus::Present),
-            EntryState::Group => Err(Error::new(format!(
-                "KeePass path {:?} is a group; name an entry",
-                key.path()
-            ))),
-            EntryState::Absent => {
-                Self::require_parent_group(&lines, key.path())?;
-                match self.write_entry("add", key.path(), value) {
-                    Ok(()) => Ok(EnsureStatus::Created),
-                    Err(write_error) => {
-                        // An uncoordinated writer may have added the entry
-                        // between the listing and the add. The CLI refuses the
-                        // duplicate, so re-list rather than retrying a write.
-                        if let Ok(lines) = self.listing()
-                            && matches!(classify(&lines, key.path()), Ok(EntryState::Entry))
-                        {
-                            return Ok(EnsureStatus::Present);
-                        }
-                        Err(write_error)
-                    }
-                }
             }
         }
     }
@@ -623,38 +581,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_identity_is_stable_and_separates_databases() {
+    fn write_identity_is_shared_by_every_database_and_hard_link() {
         let directory = scratch_dir("identity");
         std::fs::write(directory.join("one.kdbx"), b"fixture").expect("one");
-        std::fs::write(directory.join("two.kdbx"), b"fixture").expect("two");
+        std::fs::hard_link(directory.join("one.kdbx"), directory.join("two.kdbx"))
+            .expect("hard link");
 
         let one = provider(&directory, "one.kdbx");
         let one_dotted = provider(&directory, "./one.kdbx");
         let two = provider(&directory, "two.kdbx");
-        assert_eq!(
-            one.write_identity().expect("one"),
-            one_dotted.write_identity().expect("one dotted")
-        );
-        assert_ne!(
-            one.write_identity().expect("one"),
-            two.write_identity().expect("two")
-        );
+        let shared = one.write_identity();
+        assert_eq!(shared, one_dotted.write_identity());
+        assert_eq!(shared, two.write_identity());
+        // Replacing the file changes its inode. The identity is shared and not
+        // derived from a path or inode, so it must not move.
+        std::fs::remove_file(directory.join("one.kdbx")).expect("remove");
+        std::fs::write(directory.join("one.kdbx"), b"replacement").expect("replace");
+        assert_eq!(shared, one.write_identity());
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_write_requires_an_existing_database() {
-        let directory = scratch_dir("missing-database");
+    fn ensure_is_refused_without_contacting_the_database() {
+        let directory = scratch_dir("ensure");
         let provider = provider(&directory, "missing.kdbx");
         let error = provider
-            .set("Entry", &Secret::new(b"not-a-real-secret".to_vec()))
-            .expect_err("a missing database must fail");
+            .ensure("Entry", &Secret::new(b"must-not-be-written".to_vec()))
+            .expect_err("ensure must be refused");
         assert!(
-            error.message().contains("must exist"),
+            error.message().contains("does not support ensure"),
             "{}",
             error.message()
         );
+        assert!(!error.message().contains("must-not-be-written"));
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }

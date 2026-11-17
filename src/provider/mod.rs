@@ -88,14 +88,6 @@ impl Capabilities {
         list: true,
         ensure: false,
     };
-
-    /// Read, write, and create-if-absent capabilities.
-    pub const READ_WRITE_ENSURE: Self = Self {
-        read: true,
-        write: true,
-        list: true,
-        ensure: true,
-    };
 }
 
 /// A configured secret provider.
