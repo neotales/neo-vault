@@ -1407,11 +1407,11 @@ token_env = "PROTON_TEST_PAT"
     std::fs::write(
         directory.join(".nvault.toml"),
         format!(
-            "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\nvault = \"Work\"\n",
+            "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\nvault = \"Work\"\ntoken_env = \"PROTON_PASS_PERSONAL_ACCESS_TOKEN\"\n",
             script.display().to_string()
         ),
     )
-    .expect("implicit-token config");
+    .expect("standard-token config");
     let implicit_trace = directory.join("implicit-trace");
     let implicit = run(
         &directory,
@@ -1578,11 +1578,26 @@ fn proton_explicit_default_token_missing_fails_closed() {
 fn proton_yaml_null_disables_ambient_token() {
     let directory = tempfile_dir();
     let script = directory.join("pass-cli");
-    std::fs::write(&script, "#!/bin/sh\ncase \"$*\" in *'item list'*) printf '%s' '{\"items\":[]}';; *) exit 1;; esac\n").expect("fixture");
+    std::fs::write(&script, "#!/bin/sh\n[ -z \"${PROTON_PASS_PERSONAL_ACCESS_TOKEN+x}\" ] || exit 3\ncase \"$*\" in *'item list'*) printf '%s' '{\"items\":[]}';; *) exit 1;; esac\n").expect("fixture");
     make_executable(&script);
     std::fs::write(directory.join(".nvault.yaml"), format!(
         "version: 1\nprovider: p\nproviders:\n  p:\n    kind: proton\n    command: {:?}\n    token_env: null\n", script.display().to_string()
     )).expect("config");
+    let result = run(
+        &directory,
+        &["ls"],
+        &[("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-token")],
+        None,
+    );
+    assert!(result.status.success(), "{}", stderr(&result));
+    std::fs::write(
+        directory.join(".nvault.yaml"),
+        format!(
+            "version: 1\nprovider: p\nproviders:\n  p:\n    kind: proton\n    command: {:?}\n",
+            script.display().to_string()
+        ),
+    )
+    .expect("config without token_env");
     let result = run(
         &directory,
         &["ls"],

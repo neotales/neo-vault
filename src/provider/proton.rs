@@ -119,18 +119,7 @@ impl ProtonProvider {
                 config.command
             )));
         }
-        let default_env = "PROTON_PASS_PERSONAL_ACCESS_TOKEN";
         let token = match (&config.token_env, &config.token_file) {
-            (Some(variable), Some(path)) if variable == crate::config::IMPLICIT_PROTON_TOKEN => {
-                Some(crate::provider::credential_from_file(&root.join(path))?)
-            }
-            (Some(variable), None) if variable == crate::config::IMPLICIT_PROTON_TOKEN => {
-                if std::env::var_os(default_env).is_some() {
-                    Some(crate::provider::credential_from_env(default_env)?)
-                } else {
-                    None
-                }
-            }
             (Some(variable), _) => Some(crate::provider::credential_from_env(variable)?),
             (None, Some(path)) => Some(crate::provider::credential_from_file(&root.join(path))?),
             (None, None) => None,
@@ -156,6 +145,7 @@ impl ProtonProvider {
         let mut command = Command::new(&self.command);
         command
             .args(arguments)
+            .env_remove("PROTON_PASS_PERSONAL_ACCESS_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -430,7 +420,7 @@ mod tests {
             std::env::temp_dir().join(format!("nvault-proton-none-{}", std::process::id()));
         std::fs::create_dir(&directory).expect("directory");
         let script = directory.join("pass-cli");
-        std::fs::write(&script, "#!/bin/sh\ncase \"$*\" in *'item list'*) printf '%s' '{\"items\":[]}';; *) exit 1;; esac\n").expect("fixture");
+        std::fs::write(&script, "#!/bin/sh\n[ -z \"${PROTON_PASS_PERSONAL_ACCESS_TOKEN+x}\" ] || exit 3\ncase \"$*\" in *'item list'*) printf '%s' '{\"items\":[]}';; *) exit 1;; esac\n").expect("fixture");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("mode");
         let result = std::process::Command::new(std::env::current_exe().expect("executable"))
             .args([

@@ -260,10 +260,11 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 - Proton `vault` filters by vault name, not share ID. Duplicate item titles
   must be renamed or narrowed to a vault where the title is unique.
   An explicitly configured `token_env` must be set; it never falls back to
-  an existing session. If omitted, the standard
-  `token_file` takes priority; otherwise `PROTON_PASS_PERSONAL_ACCESS_TOKEN`
-  is used when present, or the existing session is used. YAML `null` or
-  programmatic `None` disables the implicit environment lookup.
+  an existing session. If omitted, `token_file` is used when configured;
+  otherwise the existing session is used, and the standard token environment
+  variable is removed from the child. To use that variable, explicitly set
+  `token_env = "PROTON_PASS_PERSONAL_ACCESS_TOKEN"`. This is a change from
+  automatic discovery; YAML `null` and programmatic `None` also disable it.
 - GitHub repository secrets only. Organization, environment, Codespaces, and
   Dependabot scopes are future work. `ensure` is unsupported: the secrets API
   has one PUT that creates or updates, and a check-then-PUT race would
