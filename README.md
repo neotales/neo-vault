@@ -476,10 +476,11 @@ It starts `floci/floci:2.5.0`, `floci/floci-gcp:0.13.0`, and
 `floci/floci-az:0.17.0` on random loopback-mapped ports, writes only obviously
 fake fixture values, and lets testcontainers remove only those containers.
 Azure Functions is disabled in the Azure container so no Docker socket is
-needed. Three more container tests cover Vault, Infisical, and Vaultwarden:
+needed. Four more container tests cover Vault, OpenBao, Infisical, and Vaultwarden:
 
 ```sh
 cargo test --test container_vault -- --ignored --nocapture
+cargo test --test container_openbao -- --ignored --nocapture
 cargo test --test container_infisical -- --ignored --nocapture
 NVAULT_TEST_BW=/path/to/pinned/bw \
   cargo test --test container_vaultwarden -- --ignored --nocapture

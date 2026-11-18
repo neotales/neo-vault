@@ -10,6 +10,7 @@ use std::time::Duration;
 use nvault::{Client, Secret};
 use testcontainers::{
     GenericImage, ImageExt,
+    bollard::models::PortBinding,
     core::{IntoContainerPort, WaitFor},
     runners::SyncRunner,
 };
@@ -18,13 +19,27 @@ use testcontainers::{
 #[ignore = "requires Docker; opt in with --ignored"]
 fn openbao_kv_v2_round_trip_preserves_sibling_fields() {
     let token = "nopenbao-test-root-token";
-    let container = GenericImage::new("openbao/openbao", "2.3.1")
-        .with_exposed_port(8200.tcp())
-        .with_wait_for(WaitFor::message_on_stdout("OpenBao server started!"))
-        .with_env_var("BAO_DEV_ROOT_TOKEN_ID", token)
-        .with_cmd(["server", "-dev", "-dev-listen-address=0.0.0.0:8200"])
-        .start()
-        .expect("start OpenBao testcontainer");
+    // GenericImage joins its two arguments with a colon, yielding tag@digest.
+    let container = GenericImage::new(
+        "openbao/openbao:2.3.1@sha256",
+        "41dc3e47da01575e1ffea70aa635180b57ff999264398313334c259a697bf7a2",
+    )
+    .with_exposed_port(8200.tcp())
+    .with_wait_for(WaitFor::message_on_stdout("OpenBao server started!"))
+    .with_env_var("BAO_DEV_ROOT_TOKEN_ID", token)
+    .with_cmd(["server", "-dev", "-dev-listen-address=0.0.0.0:8200"])
+    .with_host_config_modifier(|config| {
+        config.publish_all_ports = Some(false);
+        config.port_bindings = Some(std::collections::HashMap::from([(
+            "8200/tcp".to_owned(),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_owned()),
+                host_port: Some("0".to_owned()),
+            }]),
+        )]));
+    })
+    .start()
+    .expect("start OpenBao testcontainer");
     let port = container
         .get_host_port_ipv4(8200.tcp())
         .expect("OpenBao host port");
