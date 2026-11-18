@@ -1,0 +1,53 @@
+# Windows PowerShell 5.1 shell hook tests.
+#
+# Manual only. GitHub registers a `workflow_dispatch` workflow from the default
+# branch; a copy that exists only on a feature branch cannot be dispatched.
+# Run it from Actions > windows-powershell51 > Run workflow.
+name: windows-powershell51
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  powershell51:
+    name: Windows PowerShell 5.1 shell hook
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Assert Windows PowerShell 5.1 and the pinned toolchain
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -ne 'Desktop' -or
+              $PSVersionTable.PSVersion.Major -ne 5 -or
+              $PSVersionTable.PSVersion.Minor -ne 1) {
+            throw "expected Windows PowerShell 5.1, found $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          }
+          $rustc = (& rustc --version | Out-String).Trim()
+          if ($rustc -notmatch '^rustc 1\.100\.0 ') {
+            throw "expected rustc 1.100.0 from rust-toolchain.toml, found $rustc"
+          }
+          Write-Output "PS51_OK $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          Write-Output $rustc
+          Write-Output ((& cargo --version | Out-String).Trim())
+
+      - name: Run the shell hook tests on 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = & cargo test --lib windows_powershell_51 -- --test-threads=1 --nocapture 2>&1 | Out-String
+          Write-Output $output
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo test failed with exit code $LASTEXITCODE"
+          }
+          if ($output -notmatch 'test result: ok\. 6 passed; 0 failed; 0 ignored') {
+            throw 'the Windows PowerShell 5.1 tests did not all run and pass'
+          }

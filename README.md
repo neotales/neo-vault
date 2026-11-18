@@ -479,7 +479,10 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   portability claim. The same-user write lock uses Linux `flock` and was not
   exercised on those systems. The PowerShell directory hooks target Windows
   PowerShell 5.1 and PowerShell 7 alike, but only PowerShell 7.7.0 on Linux was
-  executed here; 5.1 itself was not. Nushell 0.117.0 was executed; older
+  executed here; 5.1 itself was not. A manual Windows workflow
+  (`.github/workflows/windows-powershell.yml`) runs the hook tests on 5.1; see
+  [`docs/windows-powershell-ci.md`](docs/windows-powershell-ci.md). Until that
+  workflow has run, 5.1 remains unverified. Nushell 0.117.0 was executed; older
   releases were not.
 
 ## Using the Rust crate

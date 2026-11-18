@@ -942,6 +942,13 @@ mod tests {
         base
     }
 
+    /// Writes a hook body for any shell; the Windows tests use it.
+    fn write_hook_file(base: &std::path::Path, shell: HookShell, name: &str) -> std::path::PathBuf {
+        let path = base.join(name);
+        std::fs::write(&path, hook(shell)).expect("hook file");
+        path
+    }
+
     /// Returns whether `name --version` runs.
     ///
     /// Generation tests always run; execution tests skip with an explicit
@@ -1517,6 +1524,421 @@ if ($env:FAKE_SECRET -ne 'loaded') { exit 20 }
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "2");
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    /// The guard every Windows script starts with.
+    ///
+    /// The Rust helper checks the same facts before spawning, so a run cannot
+    /// silently pass under PowerShell 7. The workflow also asserts it.
+    const WINDOWS_PS51_GUARD: &str = r#"$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+    [Console]::Error.WriteLine('test requires Windows PowerShell 5.1')
+    exit 90
+}
+"#;
+
+    /// Returns Windows PowerShell 5.1 and asserts the edition before use.
+    ///
+    /// These tests are compiled on every host so the code is type-checked
+    /// locally, but they are ignored off Windows. On Windows a missing or
+    /// different engine is a failure, not a skip: the workflow requires six
+    /// passed tests and zero ignored.
+    fn windows_powershell_51() -> std::path::PathBuf {
+        let candidate = std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from("powershell.exe"),
+            |root| {
+                std::path::PathBuf::from(root)
+                    .join("System32")
+                    .join("WindowsPowerShell")
+                    .join("v1.0")
+                    .join("powershell.exe")
+            },
+        );
+        let output = std::process::Command::new(&candidate)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSEdition + '|' + $PSVersionTable.PSVersion.Major + '|' + $PSVersionTable.PSVersion.Minor",
+            ])
+            .output()
+            .expect("run Windows PowerShell from SystemRoot");
+        assert!(
+            output.status.success(),
+            "Windows PowerShell version probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        assert_eq!(
+            version, "Desktop|5|1",
+            "these tests require Windows PowerShell 5.1, found {version:?}"
+        );
+        candidate
+    }
+
+    /// Quotes a path as a PowerShell single-quoted literal.
+    fn ps_literal(path: &std::path::Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "''"))
+    }
+
+    /// Writes a fake `nvault.cmd` that answers `dir` and `env` from files.
+    ///
+    /// `dir-fail` and `env-fail` are one-shot sentinels: the matching call
+    /// exits 1 once and deletes the sentinel, so the next call succeeds. The
+    /// fixtures are ASCII (base64 JSON and an ASCII temp path) so the OEM code
+    /// page `cmd.exe` uses cannot change them.
+    fn fake_nvault_cmd(
+        bin: &std::path::Path,
+        env_body: &str,
+        dir_body: &str,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(bin).expect("fake bin");
+        std::fs::write(bin.join("env.json"), env_body.as_bytes()).expect("fake env");
+        std::fs::write(bin.join("dir.txt"), dir_body.as_bytes()).expect("fake dir");
+        let path = bin.join("nvault.cmd");
+        std::fs::write(
+            &path,
+            concat!(
+                "@echo off\r\n",
+                "if /i \"%~1\"==\"dir\" goto :dir\r\n",
+                "if /i \"%~1\"==\"env\" goto :env\r\n",
+                "echo nvault: fake: unexpected arguments 1>&2\r\n",
+                "exit /b 2\r\n",
+                ":dir\r\n",
+                "if exist \"%~dp0dir-fail\" (\r\n",
+                "  del /q \"%~dp0dir-fail\" >nul 2>&1\r\n",
+                "  echo nvault: fake: transient failure 1>&2\r\n",
+                "  exit /b 1\r\n",
+                ")\r\n",
+                "type \"%~dp0dir.txt\"\r\n",
+                "exit /b 0\r\n",
+                ":env\r\n",
+                "type \"%~dp0env.json\"\r\n",
+                "exit /b 0\r\n",
+            ),
+        )
+        .expect("fake nvault.cmd");
+        path
+    }
+
+    /// Runs a generated script with Windows PowerShell 5.1.
+    ///
+    /// `-ExecutionPolicy Bypass` applies to this process only and carries no
+    /// elevated rights; it keeps a host policy from making a local test file
+    /// untrusted.
+    fn run_windows_powershell(
+        script: &std::path::Path,
+        base: &std::path::Path,
+    ) -> std::process::Output {
+        std::process::Command::new(windows_powershell_51())
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(script)
+            .current_dir(base)
+            .output()
+            .expect("run Windows PowerShell 5.1")
+    }
+
+    fn assert_windows_ok(output: &std::process::Output, label: &str) {
+        assert!(
+            output.status.success(),
+            "{label} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg_attr(not(windows), ignore = "requires Windows PowerShell 5.1")]
+    #[test]
+    fn windows_powershell_51_hook_loads_and_cleans_up() {
+        let base = temp_base("win-ps51-hook");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&other).expect("other");
+
+        let marker = base.join("injected");
+        let payload = format!(
+            "x\u{2019} ; New-Item -ItemType File -LiteralPath {} -Force; \u{2018}y",
+            ps_literal(&marker)
+        );
+        let timestamp = "2020-01-01T00:00:00Z";
+        let unicode = "h\u{e9}llo\nline";
+        let rendered = render_env(
+            &[
+                export("FAKE_SECRET", &payload),
+                export("STAMP", timestamp),
+                export("UNICODE", unicode),
+                export("SECOND_KEY", "second"),
+            ],
+            EnvShell::JsonBase64,
+        )
+        .expect("env");
+        fake_nvault_cmd(&bin, &rendered, &format!("{}\r\n", root.display()));
+
+        let payload_file = base.join("payload.txt");
+        std::fs::write(&payload_file, payload.as_bytes()).expect("payload file");
+        let stamp_file = base.join("stamp.txt");
+        std::fs::write(&stamp_file, timestamp.as_bytes()).expect("stamp file");
+        let unicode_file = base.join("unicode.txt");
+        std::fs::write(&unicode_file, unicode.as_bytes()).expect("unicode file");
+        let hook_file = write_hook_file(&base, HookShell::PowerShell, "hook.ps1");
+        let script = base.join("hook.ps1");
+        std::fs::write(
+            &script,
+            WINDOWS_PS51_GUARD.to_owned()
+                + &r#"function global:prompt { 'ORIGINAL> ' }
+$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
+$env:NVAULT_AUTOLOAD = '1'
+. __HOOK__
+if ((prompt) -ne 'ORIGINAL> ') { exit 26 }
+if ($env:FAKE_SECRET -cne [IO.File]::ReadAllText(__PAYLOAD__)) { exit 20 }
+if ($env:STAMP -cne [IO.File]::ReadAllText(__STAMP__)) { exit 27 }
+if ($env:UNICODE -cne [IO.File]::ReadAllText(__UNICODE__)) { exit 28 }
+if ($env:NVAULT_LOADED_KEYS -cne 'FAKE_SECRET STAMP UNICODE SECOND_KEY') { exit 21 }
+if ($env:NVAULT_DIR -cne __ROOTPATH__) { exit 33 }
+if (Test-Path -LiteralPath __MARKER__) { exit 24 }
+. __HOOK__
+if ($env:FAKE_SECRET -cne [IO.File]::ReadAllText(__PAYLOAD__)) { exit 34 }
+if ((prompt) -ne 'ORIGINAL> ') { exit 35 }
+$env:NVAULT_AUTOLOAD = '0'
+Set-Location -LiteralPath __OTHER__
+_nvault_hook
+if (Test-Path Env:\FAKE_SECRET) { exit 22 }
+if (Test-Path Env:\STAMP) { exit 36 }
+if (Test-Path Env:\SECOND_KEY) { exit 37 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 23 }
+"#
+                .replace("__BIN__", &ps_literal(&bin))
+                .replace("__HOOK__", &ps_literal(&hook_file))
+                .replace("__PAYLOAD__", &ps_literal(&payload_file))
+                .replace("__STAMP__", &ps_literal(&stamp_file))
+                .replace("__UNICODE__", &ps_literal(&unicode_file))
+                .replace("__ROOTPATH__", &ps_literal(&root))
+                .replace("__MARKER__", &ps_literal(&marker))
+                .replace("__OTHER__", &ps_literal(&other)),
+        )
+        .expect("test script");
+
+        let output = run_windows_powershell(&script, &base);
+        assert_windows_ok(&output, "Windows PowerShell 5.1 hook");
+        assert!(!marker.exists(), "a hook value executed as code");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("will retry"),
+            "a successful load retried: {stderr}"
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg_attr(not(windows), ignore = "requires Windows PowerShell 5.1")]
+    #[test]
+    fn windows_powershell_51_rendered_values_stay_literal() {
+        let base = temp_base("win-ps51-quote");
+        let marker = base.join("injected");
+        let payload = format!(
+            "a'b\u{2018}c\u{2019}d\u{201A}e\u{201B}f ; New-Item -ItemType File -LiteralPath {} -Force; # $env:X `id`\nline",
+            ps_literal(&marker)
+        );
+        let rendered =
+            render_env(&[export("FAKE_SECRET", &payload)], EnvShell::PowerShell).expect("env");
+        let rendered_file = base.join("rendered.ps1");
+        std::fs::write(&rendered_file, rendered.as_bytes()).expect("rendered file");
+        let payload_file = base.join("payload.txt");
+        std::fs::write(&payload_file, payload.as_bytes()).expect("payload file");
+        let script = base.join("quote.ps1");
+        std::fs::write(
+            &script,
+            WINDOWS_PS51_GUARD.to_owned()
+                + &r#"Invoke-Expression ([IO.File]::ReadAllText(__RENDERED__))
+if ($env:FAKE_SECRET -cne [IO.File]::ReadAllText(__PAYLOAD__)) { exit 20 }
+if ($env:NVAULT_LOADED_KEYS -cne 'FAKE_SECRET') { exit 21 }
+if (Test-Path -LiteralPath __MARKER__) { exit 24 }
+"#
+                .replace("__RENDERED__", &ps_literal(&rendered_file))
+                .replace("__PAYLOAD__", &ps_literal(&payload_file))
+                .replace("__MARKER__", &ps_literal(&marker)),
+        )
+        .expect("test script");
+
+        let output = run_windows_powershell(&script, &base);
+        assert_windows_ok(&output, "Windows PowerShell 5.1 quoting");
+        assert!(!marker.exists(), "a rendered value executed as code");
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg_attr(not(windows), ignore = "requires Windows PowerShell 5.1")]
+    #[test]
+    fn windows_powershell_51_hook_retries_after_a_transient_failure() {
+        let base = temp_base("win-ps51-retry");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let rendered =
+            render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::JsonBase64).expect("env");
+        fake_nvault_cmd(&bin, &rendered, &format!("{}\r\n", root.display()));
+        let sentinel = bin.join("dir-fail");
+        std::fs::write(&sentinel, b"").expect("dir-fail sentinel");
+        let hook_file = write_hook_file(&base, HookShell::PowerShell, "retry.ps1");
+        let script = base.join("retry.ps1");
+        std::fs::write(
+            &script,
+            WINDOWS_PS51_GUARD.to_owned()
+                + &r#"$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
+$env:NVAULT_AUTOLOAD = '1'
+. __HOOK__
+if ($null -ne $global:_nvault_last_dir) { exit 30 }
+if (Test-Path Env:\FAKE_SECRET) { exit 31 }
+_nvault_hook
+if ($env:FAKE_SECRET -cne 'loaded') { exit 20 }
+if ($env:NVAULT_LOADED_KEYS -cne 'FAKE_SECRET') { exit 21 }
+"#
+                .replace("__BIN__", &ps_literal(&bin))
+                .replace("__HOOK__", &ps_literal(&hook_file)),
+        )
+        .expect("test script");
+
+        let output = run_windows_powershell(&script, &base);
+        assert_windows_ok(&output, "Windows PowerShell 5.1 retry");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!sentinel.exists(), "the transient failure was not consumed");
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg_attr(not(windows), ignore = "requires Windows PowerShell 5.1")]
+    #[test]
+    fn windows_powershell_51_retries_a_failed_cleanup() {
+        let base = temp_base("win-ps51-pending");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).expect("root");
+
+        fake_nvault_cmd(&bin, "{}\n", &format!("{}\r\n", root.display()));
+        let hook_file = write_hook_file(&base, HookShell::PowerShell, "pending.ps1");
+        let script = base.join("pending.ps1");
+        std::fs::write(
+            &script,
+            WINDOWS_PS51_GUARD.to_owned()
+                + &r#"$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
+$env:NVAULT_AUTOLOAD = '0'
+. __HOOK__
+# Simulate a record left by an invocation whose restore failed. A failed
+# Set-Item cannot be forced reliably, and this is the documented retry shape.
+$env:PREEXISTING = 'stale'
+$env:ABSENT = 'stale'
+$global:_nvault_pending_cleanup = @{
+    PREEXISTING = @{ Existed = $true; Value = 'original' }
+    ABSENT = @{ Existed = $false; Value = $null }
+}
+_nvault_hook
+if ($env:PREEXISTING -cne 'original') { exit 32 }
+if (Test-Path Env:\ABSENT) { exit 38 }
+if ($global:_nvault_pending_cleanup.Count -ne 0) { exit 39 }
+"#
+                .replace("__BIN__", &ps_literal(&bin))
+                .replace("__HOOK__", &ps_literal(&hook_file)),
+        )
+        .expect("test script");
+
+        let output = run_windows_powershell(&script, &base);
+        assert_windows_ok(&output, "Windows PowerShell 5.1 pending cleanup");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("could not clean up")
+                && !stderr.contains("original")
+                && !stderr.contains("stale"),
+            "a restored value or failure leaked to stderr: {stderr}"
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg_attr(not(windows), ignore = "requires Windows PowerShell 5.1")]
+    #[test]
+    fn windows_powershell_51_refuses_env_that_is_not_json() {
+        let base = temp_base("win-ps51-invalid");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).expect("root");
+
+        fake_nvault_cmd(&bin, "not-json\n", &format!("{}\r\n", root.display()));
+        let hook_file = write_hook_file(&base, HookShell::PowerShell, "invalid.ps1");
+        let script = base.join("invalid.ps1");
+        std::fs::write(
+            &script,
+            WINDOWS_PS51_GUARD.to_owned()
+                + &r#"$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
+$env:NVAULT_AUTOLOAD = '1'
+. __HOOK__
+if ($null -ne $global:_nvault_last_dir) { exit 30 }
+if (Test-Path Env:\FAKE_SECRET) { exit 20 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 21 }
+"#
+                .replace("__BIN__", &ps_literal(&bin))
+                .replace("__HOOK__", &ps_literal(&hook_file)),
+        )
+        .expect("test script");
+
+        let output = run_windows_powershell(&script, &base);
+        assert_windows_ok(&output, "Windows PowerShell 5.1 invalid JSON");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg_attr(not(windows), ignore = "requires Windows PowerShell 5.1")]
+    #[test]
+    fn windows_powershell_51_refuses_mismatched_tracking() {
+        use base64::Engine as _;
+
+        let base = temp_base("win-ps51-tracking");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let encode = |value: &str| base64::engine::general_purpose::STANDARD.encode(value);
+        let body = format!(
+            "{{\"FAKE_SECRET\":\"{}\",\"NVAULT_LOADED_KEYS\":\"{}\"}}\n",
+            encode("loaded"),
+            encode("OTHER_KEY")
+        );
+        fake_nvault_cmd(&bin, &body, &format!("{}\r\n", root.display()));
+        let hook_file = write_hook_file(&base, HookShell::PowerShell, "tracking.ps1");
+        let script = base.join("tracking.ps1");
+        std::fs::write(
+            &script,
+            WINDOWS_PS51_GUARD.to_owned()
+                + &r#"$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
+$env:NVAULT_AUTOLOAD = '1'
+. __HOOK__
+if ($null -ne $global:_nvault_last_dir) { exit 30 }
+if (Test-Path Env:\FAKE_SECRET) { exit 20 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 21 }
+"#
+                .replace("__BIN__", &ps_literal(&bin))
+                .replace("__HOOK__", &ps_literal(&hook_file)),
+        )
+        .expect("test script");
+
+        let output = run_windows_powershell(&script, &base);
+        assert_windows_ok(&output, "Windows PowerShell 5.1 tracking");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         std::fs::remove_dir_all(base).expect("remove temp hook dir");
     }
 
