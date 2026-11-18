@@ -185,6 +185,9 @@ pub struct VaultwardenConfig {
 }
 
 /// Proton Pass configuration backed by `pass-cli`.
+///
+/// A deserialized omitted `token_env` uses an internal marker for the optional
+/// default environment variable. Programmatic `None` disables that lookup.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtonConfig {
@@ -195,10 +198,14 @@ pub struct ProtonConfig {
     /// without a vault-name filter.
     #[serde(default)]
     pub vault: Option<String>,
-    /// Environment variable holding a personal access token. If explicitly
-    /// configured it must be set. When omitted, the standard
-    /// `PROTON_PASS_PERSONAL_ACCESS_TOKEN` is used if present.
-    #[serde(default)]
+    /// Explicit environment variable holding a personal access token; it must
+    /// be set. `None` disables the default environment lookup. When omitted
+    /// in serialized config, the standard variable is used if present and no
+    /// token file was configured.
+    #[serde(
+        default = "implicit_proton_token_env",
+        deserialize_with = "explicit_proton_token_env"
+    )]
     pub token_env: Option<String>,
     /// Owner-only file holding the personal access token.
     #[serde(default)]
@@ -207,6 +214,27 @@ pub struct ProtonConfig {
     /// `PROTON_PASS_AGENT_REASON`. Required by agent tokens, harmless otherwise.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+// An invalid environment variable name distinguishes omission from both
+// explicit strings and None without changing the public struct's fields.
+pub(crate) const IMPLICIT_PROTON_TOKEN: &str = "\0nvault implicit proton token";
+
+fn implicit_proton_token_env() -> Option<String> {
+    Some(IMPLICIT_PROTON_TOKEN.to_owned())
+}
+
+fn explicit_proton_token_env<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value.as_deref() == Some(IMPLICIT_PROTON_TOKEN) {
+        return Err(serde::de::Error::custom("invalid token_env"));
+    }
+    Ok(value)
 }
 
 /// GitHub Actions repository secret configuration.
@@ -537,8 +565,10 @@ fn validate_provider(name: &str, provider: &ProviderConfig) -> Result<()> {
             if config.command.trim().is_empty() {
                 return Err(invalid("command must not be empty".to_owned()));
             }
-            validate_env_optional(config.token_env.as_deref(), "token_env")
-                .map_err(|error| invalid(error.message().to_owned()))?;
+            if config.token_env.as_deref() != Some(IMPLICIT_PROTON_TOKEN) {
+                validate_env_optional(config.token_env.as_deref(), "token_env")
+                    .map_err(|error| invalid(error.message().to_owned()))?;
+            }
         }
         ProviderConfig::Github(config) => {
             validate_http_base(&config.api_url, false)

@@ -121,10 +121,17 @@ impl ProtonProvider {
         }
         let default_env = "PROTON_PASS_PERSONAL_ACCESS_TOKEN";
         let token = match (&config.token_env, &config.token_file) {
-            (Some(variable), _) => Some(crate::provider::credential_from_env(variable)?),
-            (None, _) if std::env::var_os(default_env).is_some() => {
-                Some(crate::provider::credential_from_env(default_env)?)
+            (Some(variable), Some(path)) if variable == crate::config::IMPLICIT_PROTON_TOKEN => {
+                Some(crate::provider::credential_from_file(&root.join(path))?)
             }
+            (Some(variable), None) if variable == crate::config::IMPLICIT_PROTON_TOKEN => {
+                if std::env::var_os(default_env).is_some() {
+                    Some(crate::provider::credential_from_env(default_env)?)
+                } else {
+                    None
+                }
+            }
+            (Some(variable), _) => Some(crate::provider::credential_from_env(variable)?),
             (None, Some(path)) => Some(crate::provider::credential_from_file(&root.join(path))?),
             (None, None) => None,
         };
@@ -399,6 +406,44 @@ fn trim_one_newline(mut bytes: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{ProtonProvider, SessionDir, trim_one_newline};
+
+    #[cfg(unix)]
+    #[test]
+    fn programmatic_none_disables_ambient_token() {
+        use crate::config::ProtonConfig;
+        use crate::provider::Provider;
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(script) = std::env::var_os("NVAULT_TEST_PROTON_SCRIPT") {
+            let config = ProtonConfig {
+                command: script.to_string_lossy().into_owned(),
+                vault: None,
+                token_env: None,
+                token_file: None,
+                reason: None,
+            };
+            let provider =
+                ProtonProvider::new("p", &config, std::path::Path::new(".")).expect("provider");
+            assert!(provider.list("").expect("session listing").is_empty());
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("nvault-proton-none-{}", std::process::id()));
+        std::fs::create_dir(&directory).expect("directory");
+        let script = directory.join("pass-cli");
+        std::fs::write(&script, "#!/bin/sh\ncase \"$*\" in *'item list'*) printf '%s' '{\"items\":[]}';; *) exit 1;; esac\n").expect("fixture");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        let result = std::process::Command::new(std::env::current_exe().expect("executable"))
+            .args([
+                "--exact",
+                "provider::proton::tests::programmatic_none_disables_ambient_token",
+            ])
+            .env("NVAULT_TEST_PROTON_SCRIPT", &script)
+            .env("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-token")
+            .output()
+            .expect("child test");
+        assert!(result.status.success(), "child test failed");
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
 
     #[cfg(unix)]
     #[test]

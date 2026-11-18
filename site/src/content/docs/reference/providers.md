@@ -37,8 +37,10 @@ For Proton, `vault` is a vault name, not a share ID. If a title is
 ambiguous, rename the item or configure a vault name where it is unique.
 An explicitly configured `token_env` must be set; otherwise the operation
 fails instead of using an existing session. When `token_env` is omitted, the
-standard `PROTON_PASS_PERSONAL_ACCESS_TOKEN` is used if present; otherwise
-`token_file` or the existing CLI session is used.
+configured `token_file` takes priority; otherwise the standard
+`PROTON_PASS_PERSONAL_ACCESS_TOKEN` is used if present, or the existing CLI
+session is used. YAML `null` or programmatic `None` disables the implicit
+environment lookup.
 - GitHub: `SECRET_NAME`. List and set only.
 - AWS Secrets Manager: `SECRET_NAME`. No field suffix.
 - GCP Secret Manager: `SECRET_ID`. No field suffix; latest version only.
