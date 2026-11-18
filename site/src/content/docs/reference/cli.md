@@ -74,7 +74,11 @@ base64-encoded values and is what the PowerShell hook decodes, because
 `ConvertFrom-Json` can turn a timestamp-looking string into a `DateTime`.
 Export names must be plain identifiers and must not collide with nvault's own
 `NVAULT_*` hook variables; callers of the library's `render_env` get the same
-validation.
+validation. The PowerShell and Nushell hooks check the decoded object before
+changing the environment: values must be strings, names must be identifiers,
+and `NVAULT_LOADED_KEYS` must list exactly the other names. A PowerShell load
+containing an empty value is refused (5.1 and pre-7.5 cannot store one), and a
+failed assignment rolls back what that attempt already set.
 
 ## `completion`
 

@@ -159,13 +159,27 @@ was executed here. The hook restores `[Console]::OutputEncoding` around the
 page, and a sentinel keeps a second source of the hook from nesting `prompt`.
 
 The PowerShell hook does not evaluate provider output. It asks for
-`env --shell json-base64`, validates each property name, decodes the base64
-bytes itself, and copies the values into `Env:` with `Set-Item`, so a value is
-data even if it contains quotes, `$`, or newlines. Values travel encoded
+`env --shell json-base64`, validates the whole object, decodes the base64 bytes
+itself, and only then copies the values into `Env:` with `Set-Item`, so a value
+is data even if it contains quotes, `$`, or newlines. Values travel encoded
 because `ConvertFrom-Json` turns a timestamp-looking string such as
 `2020-01-01T00:00:00Z` into a `DateTime` and would reformat it; decoding the
 bytes preserves the exact value. That coercion was reproduced on PowerShell
-7.7.0 and is why the hook does not parse plain JSON. `env --shell powershell` and `env --shell pwsh` still print
+7.7.0 and is why the hook does not parse plain JSON.
+
+Validation happens before any change: the payload must be one object, every
+value must be a base64 string that decodes to UTF-8, every name must match
+`[A-Za-z_][A-Za-z0-9_]*`, and `NVAULT_LOADED_KEYS` must list exactly the other
+names. A malformed object, a missing or extra tracking entry, a non-string
+value, or a name outside that set is refused with no change. `Set-Item` runs
+with `-ErrorAction Stop`; if one assignment fails, every name already applied
+in that attempt is removed again, so a partial load never leaves an untracked
+export. Windows PowerShell 5.1 and PowerShell before 7.5 cannot store an empty
+environment value, so a load containing an empty value is refused before
+anything is applied and reports the retry line. The refusal applies on every
+edition, so the same payload behaves the same way on 5.1 and 7 and later. A response with no exports and
+an empty `NVAULT_LOADED_KEYS` sets nothing and is accepted. The diagnostic is a
+fixed string and never contains a value or a name. `env --shell powershell` and `env --shell pwsh` still print
 `$env:NAME = 'value'` assignments for direct use. PowerShell reads five
 characters as a single quote — `'`, U+2018, U+2019, U+201A, and U+201B — and a
 value containing U+2019 could otherwise close the string. Every one of the five
@@ -173,9 +187,12 @@ is doubled, matching `CharTraits.IsSingleQuote` in the PowerShell source; the
 runtime tests evaluate a rendered assignment containing all five.
 
 Nushell has no `eval`, so `nvault env --shell nu` (and `--shell json`) prints a
-JSON object and the hook applies it with `load-env`. Malformed JSON, or a JSON
-value that is not an object, is treated as a failed load: it prints the retry
-line and does not record the directory. Save it once and source
+JSON object and the hook applies it with `load-env` only after validation:
+every column must match `[A-Za-z_][A-Za-z0-9_]*`, every value must be a string,
+and `NVAULT_LOADED_KEYS` must list exactly the other columns. Malformed JSON, a
+missing or extra tracking entry, a non-string value, an unsafe name, or a value
+that is not an object prints the retry line and changes nothing. Empty string
+values are accepted because Nushell can store them. Save it once and source
 the file from `config.nu`:
 
 ```nu
@@ -214,13 +231,17 @@ What was executed here on Linux: the bash hook under GNU bash 5.3.20, zsh
 5.9.2, fish 4.9.3, PowerShell 7.7.0, and Nushell 0.117.0, including directory
 transitions, cleanup with autoload disabled, cleanup when the directory probe
 fails, prompt preservation, base64 decoding of a timestamp value, JSON loading,
-malformed and wrong-shaped JSON in Nushell, a transient first failure followed
-by a successful retry, a real zsh prompt retrying a failed load while keeping
-an existing `precmd` hook, a nested Nushell install, and values containing
-`';` or a smart quote plus a command that would create a file if it were
-executed. Windows PowerShell 5.1 and macOS were not available and were not
-executed. Nushell releases older than 0.117.0 were not exercised and may use
-different configuration syntax.
+five rejected PowerShell payloads (non-string value, missing tracking, extra
+tracking, empty value, unsafe name) and four rejected Nushell payloads,
+rollback of a partially applied PowerShell load simulated with a failing
+`Set-Item`, an empty PowerShell export set, malformed and wrong-shaped JSON in
+Nushell, a transient first failure followed by a successful retry, a real zsh
+prompt retrying a failed load while keeping an existing `precmd` hook, a nested
+Nushell install, and values containing `';` or a smart quote plus a command
+that would create a file if it were executed. Windows PowerShell 5.1 and macOS
+were not available and were not executed; the empty-value refusal exists
+because 5.1 cannot store one. Nushell releases older than 0.117.0 were not
+exercised and may use different configuration syntax.
 
 ## Providers
 
