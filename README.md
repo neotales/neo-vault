@@ -228,9 +228,14 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   preserve concurrent external changes. Writes take one conservative same-user
   advisory lock shared by every Vaultwarden profile on this machine, because
   the configuration has no server address and wrapper paths differ.
-- Proton writes are unsupported because the documented update command takes
-  the value in `argv`. `ensure` is unsupported because the CLI has no atomic
-  create-if-absent operation.
+- Proton `set` and `ensure` remain unsupported. The documented `pass-cli`
+  2.7.1 update command takes the value in `argv`, exposing it to process
+  inspection. Its in-memory Rust library API is part of the
+  [GPL-3.0-or-later upstream project](https://github.com/protonpass/pass-cli/blob/2.7.1/LICENSE);
+  compatibility with this MIT project's intended distribution remains
+  unresolved, so it is not linked or copied here. A safe, license-compatible
+  write interface is needed before implementing `set`. Separately, `ensure`
+  requires an atomic create-if-absent operation, which the CLI does not offer.
 - Proton listings are not a metadata-only fetch. In `pass-cli` 2.7.1,
   `item list --output json` downloads and decrypts every `Item` before
   serializing an `ItemSummary` without content. The adapter keeps only titles
