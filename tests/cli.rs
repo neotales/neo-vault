@@ -38,6 +38,8 @@ fn run(
     command
         .args(arguments)
         .current_dir(directory)
+        .env_remove("PROTON_PASS_PERSONAL_ACCESS_TOKEN")
+        .env_remove("NVAULT_TEST_MISSING_PROTON_PAT_87219")
         .env("NVAULT_LOCK_DIR", &lock_dir)
         .envs(environment.iter().copied())
         .stdin(Stdio::piped())
@@ -1263,6 +1265,47 @@ vault = "Work"
 }
 
 #[test]
+fn proton_duplicate_titles_report_supported_guidance_and_filter_by_vault_name() {
+    let directory = tempfile_dir();
+    let trace = directory.join("trace");
+    let script = directory.join("pass-cli");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$TRACE"
+case "$*" in
+  "item list --output json --vault-name Work")
+    printf '%s' '{"items":[{"title":"DB","share_id":"a"},{"title":"DB","share_id":"b"}]}' ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nvault.toml"),
+        format!(
+            "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\nvault = \"Work\"\n",
+            script.display().to_string()
+        ),
+    )
+    .expect("config");
+    let result = run(
+        &directory,
+        &["get", "DB"],
+        &[("TRACE", trace.to_str().expect("trace"))],
+        None,
+    );
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("unique title or configure a vault name"));
+    assert!(!stderr(&result).contains("share id"));
+    assert_eq!(
+        std::fs::read_to_string(trace).expect("trace"),
+        "item list --output json --vault-name Work\n"
+    );
+}
+
+#[test]
 fn proton_token_mode_isolates_the_session_and_uses_the_token_from_env() {
     let directory = tempfile_dir();
     let trace = directory.join("trace");
@@ -1360,6 +1403,30 @@ token_env = "PROTON_TEST_PAT"
     assert!(trace.contains("info --output json"));
     assert!(trace.contains("item list"));
     assert!(trace.contains("item view"));
+
+    std::fs::write(
+        directory.join(".nvault.toml"),
+        format!(
+            "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\nvault = \"Work\"\ntoken_env = \"PROTON_PASS_PERSONAL_ACCESS_TOKEN\"\n",
+            script.display().to_string()
+        ),
+    )
+    .expect("standard-token config");
+    let implicit_trace = directory.join("implicit-trace");
+    let implicit = run(
+        &directory,
+        &["get", "DB#password"],
+        &[
+            ("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "not-a-real-token"),
+            ("PROTON_TRACE", implicit_trace.to_str().expect("trace path")),
+        ],
+        None,
+    );
+    assert!(implicit.status.success(), "{}", stderr(&implicit));
+    let trace = std::fs::read_to_string(implicit_trace).expect("implicit trace");
+    assert!(trace.lines().any(|line| line == "login"));
+    assert!(trace.lines().any(|line| line == "key=fs"));
+    assert!(trace.lines().any(|line| line == "token=set"));
 }
 
 #[test]
@@ -1469,6 +1536,166 @@ token_env = "PROTON_TEST_PAT"
 }
 
 #[test]
+fn proton_missing_explicit_token_refuses_existing_session() {
+    let directory = tempfile_dir();
+    let trace = directory.join("trace");
+    let script = directory.join("pass-cli");
+    std::fs::write(&script, "#!/bin/sh\nprintf invoked > \"$TRACE\"\nexit 0\n").expect("fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nvault.toml"),
+        format!(
+            "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\ntoken_env = \"NVAULT_TEST_MISSING_PROTON_PAT_87219\"\n",
+            script.display().to_string()
+        ),
+    )
+    .expect("config");
+    let result = run(
+        &directory,
+        &["ls"],
+        &[("TRACE", trace.to_str().expect("trace"))],
+        None,
+    );
+    assert!(!result.status.success(), "missing token must fail");
+    assert!(!trace.exists(), "pass-cli must not run");
+}
+
+#[test]
+fn proton_explicit_default_token_missing_fails_closed() {
+    let directory = tempfile_dir();
+    let script = directory.join("pass-cli");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("fixture");
+    make_executable(&script);
+    std::fs::write(directory.join(".nvault.toml"), format!(
+        "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\ntoken_env = \"PROTON_PASS_PERSONAL_ACCESS_TOKEN\"\n",
+        script.display().to_string()
+    )).expect("config");
+    let result = run(&directory, &["ls"], &[], None);
+    assert!(stderr(&result).contains("PROTON_PASS_PERSONAL_ACCESS_TOKEN"));
+}
+
+#[test]
+fn proton_ambient_token_without_source_fails_before_invoking_cli() {
+    let directory = tempfile_dir();
+    let script = directory.join("pass-cli");
+    let trace = directory.join("trace");
+    std::fs::write(&script, "#!/bin/sh\nprintf invoked > \"$TRACE\"\n").expect("fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nvault.toml"),
+        format!(
+            "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\n",
+            script.display().to_string()
+        ),
+    )
+    .expect("config");
+    let result = run(
+        &directory,
+        &["ls"],
+        &[
+            ("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-ambient-token"),
+            ("PROTON_PASS_SESSION_DIR", directory.to_str().expect("path")),
+            ("TRACE", trace.to_str().expect("path")),
+        ],
+        None,
+    );
+    assert!(!result.status.success());
+    assert!(!trace.exists());
+    assert!(!stderr(&result).contains("fake-ambient-token"));
+    assert!(stderr(&result).contains("token_env"));
+}
+
+#[test]
+fn proton_yaml_null_disables_ambient_token() {
+    let directory = tempfile_dir();
+    let script = directory.join("pass-cli");
+    std::fs::write(&script, "#!/bin/sh\n[ -z \"${PROTON_PASS_PERSONAL_ACCESS_TOKEN+x}\" ] || exit 3\ncase \"$*\" in *'item list'*) printf '%s' '{\"items\":[]}';; *) exit 1;; esac\n").expect("fixture");
+    make_executable(&script);
+    std::fs::write(directory.join(".nvault.yaml"), format!(
+        "version: 1\nprovider: p\nproviders:\n  p:\n    kind: proton\n    command: {:?}\n    token_env: null\n", script.display().to_string()
+    )).expect("config");
+    let result = run(
+        &directory,
+        &["ls"],
+        &[("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-token")],
+        None,
+    );
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("token_env"));
+    std::fs::write(
+        directory.join(".nvault.yaml"),
+        format!(
+            "version: 1\nprovider: p\nproviders:\n  p:\n    kind: proton\n    command: {:?}\n",
+            script.display().to_string()
+        ),
+    )
+    .expect("config without token_env");
+    let result = run(
+        &directory,
+        &["ls"],
+        &[("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-token")],
+        None,
+    );
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("token_env"));
+    let result = run(&directory, &["ls"], &[], None);
+    assert!(result.status.success(), "{}", stderr(&result));
+}
+
+#[cfg(unix)]
+#[test]
+fn proton_file_and_ambient_token_require_explicit_selection() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile_dir();
+    let script = directory.join("pass-cli");
+    let token = directory.join("fixture");
+    let trace = directory.join("trace");
+    std::fs::write(&token, "fake-file-token").expect("fixture");
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("permissions");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+printf 'invoked\n' >> "$TRACE"
+case "$*" in
+  login) [ "$PROTON_PASS_PERSONAL_ACCESS_TOKEN" = "fake-file-token" ] || exit 1
+    mkdir -p "$PROTON_PASS_SESSION_DIR/.session"
+    : > "$PROTON_PASS_SESSION_DIR/.session/session.json" ;;
+  "info --output json") printf '%s' '{"personal_access_token_name":"fixture"}' ;;
+  *"item list"*) printf '%s' '{"items":[]}' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )
+    .expect("fixture");
+    make_executable(&script);
+    std::fs::write(directory.join(".nvault.toml"), format!(
+        "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\ntoken_file = \"fixture\"\n", script.display().to_string()
+    )).expect("config");
+    let result = run(
+        &directory,
+        &["ls"],
+        &[
+            ("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-env-token"),
+            ("TRACE", trace.to_str().expect("trace")),
+        ],
+        None,
+    );
+    assert!(!result.status.success());
+    assert!(!trace.exists(), "pass-cli must not run");
+    assert!(stderr(&result).contains("unset"));
+    assert!(stderr(&result).contains("token_env"));
+    assert!(!stderr(&result).contains("fake-env-token"));
+    let result = run(
+        &directory,
+        &["ls"],
+        &[("TRACE", trace.to_str().expect("trace"))],
+        None,
+    );
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert!(trace.exists());
+}
+
+#[test]
 fn proton_session_mode_keeps_the_configured_session_directory() {
     let directory = tempfile_dir();
     let trace = directory.join("trace");
@@ -1499,7 +1726,6 @@ provider = "p"
 kind = "proton"
 command = "{}"
 vault = "Work"
-token_env = "PROTON_TEST_UNSET_PAT"
 "#,
             script.display()
         ),
@@ -1575,7 +1801,6 @@ provider = "p"
 kind = "proton"
 command = "{}"
 vault = "Work"
-token_env = "PROTON_TEST_UNSET_PAT"
 "#,
             script.display()
         ),

@@ -32,6 +32,16 @@ Key shapes:
 - Infisical: secret name. No field suffix.
 - Vaultwarden: item name or UUID, optional `#password`, `#username`, `#notes`, `#name`, `#id`, or a custom field.
 - Proton: title, optional `#password`, `#username`, or another field.
+
+For Proton, `vault` is a vault name, not a share ID. If a title is
+ambiguous, rename the item or configure a vault name where it is unique.
+An explicitly configured `token_env` must be set; otherwise the operation
+fails instead of using an existing session. When `token_env` is omitted and
+`PROTON_PASS_PERSONAL_ACCESS_TOKEN` is present, nvault fails even if a
+`token_file` is configured, instead of silently choosing another account.
+Automatic discovery is no longer supported: explicitly set `token_env` to
+that name to use the environment token, or unset the variable to use the file
+or existing session. YAML `null` and programmatic `None` follow the same rule.
 - GitHub: `SECRET_NAME`. List and set only.
 - AWS Secrets Manager: `SECRET_NAME`. No field suffix.
 - GCP Secret Manager: `SECRET_ID`. No field suffix; latest version only.

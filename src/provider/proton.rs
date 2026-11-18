@@ -110,8 +110,8 @@ impl ProtonProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error when `pass-cli` is unavailable or the token file cannot
-    /// be read.
+    /// Returns an error when `pass-cli` is unavailable or a configured token
+    /// source cannot be read.
     pub fn new(name: &str, config: &ProtonConfig, root: &Path) -> Result<Self> {
         if !command_available(&config.command) && !Path::new(&config.command).is_file() {
             return Err(Error::new(format!(
@@ -119,12 +119,17 @@ impl ProtonProvider {
                 config.command
             )));
         }
+        if config.token_env.is_none()
+            && std::env::var_os("PROTON_PASS_PERSONAL_ACCESS_TOKEN").is_some()
+        {
+            return Err(Error::new(
+                "PROTON_PASS_PERSONAL_ACCESS_TOKEN is present but not configured; set token_env to select it, or unset it to use token_file or an existing session",
+            ));
+        }
         let token = match (&config.token_env, &config.token_file) {
-            (Some(variable), _) if std::env::var_os(variable).is_some() => {
-                Some(crate::provider::credential_from_env(variable)?)
-            }
-            (_, Some(path)) => Some(crate::provider::credential_from_file(&root.join(path))?),
-            _ => None,
+            (Some(variable), _) => Some(crate::provider::credential_from_env(variable)?),
+            (None, Some(path)) => Some(crate::provider::credential_from_file(&root.join(path))?),
+            (None, None) => None,
         };
         Ok(Self {
             name: name.to_owned(),
@@ -147,6 +152,7 @@ impl ProtonProvider {
         let mut command = Command::new(&self.command);
         command
             .args(arguments)
+            .env_remove("PROTON_PASS_PERSONAL_ACCESS_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -268,7 +274,7 @@ impl ProtonProvider {
                 "Proton Pass item {title:?} was not found"
             ))),
             _ => Err(Error::new(format!(
-                "Proton Pass item title {title:?} is ambiguous; use a unique title or share id"
+                "Proton Pass item title {title:?} is ambiguous; use a unique title or configure a vault name that makes it unique"
             ))),
         }
     }
@@ -397,6 +403,43 @@ fn trim_one_newline(mut bytes: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{ProtonProvider, SessionDir, trim_one_newline};
+
+    #[cfg(unix)]
+    #[test]
+    fn programmatic_none_disables_ambient_token() {
+        use crate::config::ProtonConfig;
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(script) = std::env::var_os("NVAULT_TEST_PROTON_SCRIPT") {
+            let config = ProtonConfig {
+                command: script.to_string_lossy().into_owned(),
+                vault: None,
+                token_env: None,
+                token_file: None,
+                reason: None,
+            };
+            let error = ProtonProvider::new("p", &config, std::path::Path::new("."))
+                .expect_err("ambient token must fail closed");
+            assert!(error.message().contains("token_env"));
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("nvault-proton-none-{}", std::process::id()));
+        std::fs::create_dir(&directory).expect("directory");
+        let script = directory.join("pass-cli");
+        std::fs::write(&script, "#!/bin/sh\n[ -z \"${PROTON_PASS_PERSONAL_ACCESS_TOKEN+x}\" ] || exit 3\ncase \"$*\" in *'item list'*) printf '%s' '{\"items\":[]}';; *) exit 1;; esac\n").expect("fixture");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        let result = std::process::Command::new(std::env::current_exe().expect("executable"))
+            .args([
+                "--exact",
+                "provider::proton::tests::programmatic_none_disables_ambient_token",
+            ])
+            .env("NVAULT_TEST_PROTON_SCRIPT", &script)
+            .env("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-token")
+            .output()
+            .expect("child test");
+        assert!(result.status.success(), "child test failed");
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
 
     #[cfg(unix)]
     #[test]
