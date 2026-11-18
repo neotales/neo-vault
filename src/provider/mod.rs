@@ -62,7 +62,7 @@ pub enum EnsureStatus {
 pub struct Capabilities {
     /// Values can be read.
     pub read: bool,
-    /// Values can be written, including over an existing key.
+    /// Some values can be written; individual providers may restrict updates.
     pub write: bool,
     /// Names can be enumerated. `list` never returns values.
     pub list: bool,
@@ -71,15 +71,8 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Read-only capabilities.
-    pub const READ_ONLY: Self = Self {
-        read: true,
-        write: false,
-        list: true,
-        ensure: false,
-    };
-
-    /// Read and write capabilities. `ensure` stays false until the adapter
+    /// Read and write capabilities. Individual writes can be restricted;
+    /// `ensure` stays false until the adapter
     /// has a race-safe create-if-absent path.
     #[allow(dead_code)]
     pub const READ_WRITE: Self = Self {

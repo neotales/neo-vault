@@ -1541,19 +1541,26 @@ token_env = "PROTON_TEST_UNSET_PAT"
 }
 
 #[test]
-fn proton_refuses_set_and_ensure_without_running_the_cli() {
+fn proton_create_uses_stdin_template_and_refuses_existing_items() {
     let directory = tempfile_dir();
-    let marker = directory.join("invoked");
     let script = directory.join("pass-cli");
+    let trace = directory.join("trace");
+    let input = directory.join("input");
+    let listing = directory.join("listing");
     std::fs::write(
         &script,
         r#"#!/bin/sh
-: > "$PROTON_MARKER"
-exit 0
+printf '%s\n' "$*" >> "$TRACE"
+case "$*" in
+  "item list --output json --vault-name Work") cat "$LISTING" ;;
+  "item create login --from-template - --vault-name Work") cat > "$INPUT" ;;
+  *) exit 2 ;;
+esac
 "#,
     )
     .expect("write fixture");
     make_executable(&script);
+    std::fs::write(&listing, r#"{"items":[]}"#).expect("listing");
     std::fs::write(
         directory.join(".nvault.toml"),
         format!(
@@ -1568,27 +1575,50 @@ token_env = "PROTON_TEST_UNSET_PAT"
             script.display()
         ),
     )
-    .expect("write config");
-    let environment = [("PROTON_MARKER", marker.to_str().expect("marker path"))];
-    let set = run(
+    .expect("config");
+    let env = [
+        ("TRACE", trace.to_str().expect("trace")),
+        ("INPUT", input.to_str().expect("input")),
+        ("LISTING", listing.to_str().expect("listing")),
+    ];
+    let result = run(
         &directory,
-        &["set", "DB"],
-        &environment,
-        Some(b"must-not-run\n"),
+        &["set", "DB#username"],
+        &env,
+        Some(b"fake-value\n"),
     );
-    assert!(!set.status.success());
-    assert!(stderr(&set).contains("does not support set"));
-    assert!(!stderr(&set).contains("must-not-run"));
-    let ensured = run(
-        &directory,
-        &["ensure", "DB"],
-        &environment,
-        Some(b"must-not-run\n"),
+    assert!(result.status.success(), "{}", stderr(&result));
+    let args = std::fs::read_to_string(&trace).expect("trace");
+    assert!(args.contains("item create login --from-template - --vault-name Work"));
+    assert!(!args.contains("fake-value"));
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&input).expect("input")).expect("json");
+    assert_eq!(
+        json,
+        serde_json::json!({"title":"DB", "username":"fake-value"})
     );
-    assert!(!ensured.status.success());
-    assert!(stderr(&ensured).contains("does not support ensure"));
-    assert!(!stderr(&ensured).contains("must-not-run"));
-    assert!(!marker.exists(), "pass-cli ran for a refused operation");
+    std::fs::write(&listing, r#"{"items":[{"title":"DB","share_id":"x"}]}"#).expect("listing");
+    std::fs::write(&trace, "").expect("clear trace");
+    let result = run(&directory, &["set", "DB"], &env, Some(b"fake-value\n"));
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("already exists"));
+    assert!(
+        !std::fs::read_to_string(&trace)
+            .expect("trace")
+            .contains("create")
+    );
+    std::fs::write(&listing, "{}").expect("malformed listing");
+    let result = run(&directory, &["set", "DB"], &env, Some(b"fake-value\n"));
+    assert!(!result.status.success());
+    assert!(
+        !std::fs::read_to_string(&trace)
+            .expect("trace")
+            .contains("create")
+    );
+    let result = run(&directory, &["ensure", "DB"], &env, Some(b"fake-value\n"));
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("does not support ensure"));
+    assert!(!stderr(&result).contains("fake-value"));
 }
 
 #[test]

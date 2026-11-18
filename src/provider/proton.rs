@@ -7,8 +7,9 @@
 //! serializes an `ItemSummary` without content. This adapter keeps only the
 //! title and share id and never returns item content.
 //!
-//! Writes are deliberately unsupported: the documented update command takes the
-//! value as an argument, and this project will not put a secret in `argv`.
+//! Creating a missing login uses the stdin template. Existing items cannot be
+//! updated safely by pass-cli 2.7.1 and are refused. The check and create are
+//! not atomic against external writers.
 //!
 //! Authentication can use an existing `pass-cli` session or a personal access
 //! token supplied through the environment/file named in configuration. The
@@ -29,6 +30,7 @@
 //! mode fails closed on platforms without the hardened directory walk, or when
 //! the temporary path is not a trusted, symlink-free location.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -36,7 +38,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use serde::Deserialize;
 
 use crate::config::ProtonConfig;
-use crate::error::{Error, Result, unsupported};
+use crate::error::{Error, Result};
 use crate::key::Key;
 use crate::provider::{Capabilities, ListedKey, Provider, command_available};
 use crate::secret::Secret;
@@ -47,7 +49,7 @@ const OPERATION_POISONED: &str = "Proton Pass provider is unavailable after an i
 /// Redacted failure message for session-directory setup.
 const SESSION_DIR_ERROR: &str = "could not create an isolated pass-cli session directory";
 
-/// Read-only Proton Pass provider.
+/// Proton Pass provider; writes create missing login items only.
 #[derive(Debug)]
 pub struct ProtonProvider {
     name: String,
@@ -247,7 +249,6 @@ impl ProtonProvider {
         let output = self.run(&arguments)?;
         #[derive(Deserialize)]
         struct Envelope {
-            #[serde(default)]
             items: Vec<ItemSummary>,
         }
         let envelope: Envelope = serde_json::from_slice(&output)
@@ -275,7 +276,6 @@ impl ProtonProvider {
 
 #[derive(Clone, Debug, Deserialize)]
 struct ItemSummary {
-    #[serde(default)]
     title: String,
     #[serde(default)]
     share_id: String,
@@ -291,7 +291,7 @@ impl Provider for ProtonProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::READ_ONLY
+        Capabilities::READ_WRITE
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>> {
@@ -322,8 +322,63 @@ impl Provider for ProtonProvider {
         Ok(Secret::new(trim_one_newline(output)))
     }
 
-    fn set(&self, _key: &str, _value: &Secret) -> Result<()> {
-        Err(unsupported("set", &self.name))
+    fn set(&self, raw_key: &str, value: &Secret) -> Result<()> {
+        let key = Key::parse(raw_key)?;
+        let field = key.field().unwrap_or("password");
+        if !matches!(field, "password" | "username" | "email" | "totp_uri") {
+            return Err(Error::new(
+                "Proton create supports only password, username, email, or totp_uri",
+            ));
+        }
+        let text = std::str::from_utf8(value.expose())
+            .map_err(|_| Error::new("Proton login values must be UTF-8"))?;
+        let _operation = self.lock_operation()?;
+        // Serialize all nvault Proton writers, including profiles and wrappers.
+        let identity = super::lock::identity("proton", "shared", &[]);
+        let _write_lock = super::lock::acquire(&identity)?;
+        if self.items()?.iter().any(|item| item.title == key.path()) {
+            return Err(Error::new(
+                "Proton item already exists; safe updates are unavailable",
+            ));
+        }
+        // Serialize directly to a zeroized buffer, without making a secret String.
+        #[derive(serde::Serialize)]
+        struct Template<'a> {
+            title: &'a str,
+            #[serde(flatten)]
+            field: std::collections::BTreeMap<&'a str, &'a str>,
+        }
+        let template = Template {
+            title: key.path(),
+            field: [(field, text)].into_iter().collect(),
+        };
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        serde_json::to_writer(&mut *bytes, &template)
+            .map_err(|_| Error::new("could not encode Proton login template"))?;
+        let mut args = vec!["item", "create", "login", "--from-template", "-"];
+        if let Some(vault) = &self.vault {
+            args.extend(["--vault-name", vault]);
+        }
+        let mut command = self.command(&args)?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|_| Error::new("could not start pass-cli"))?;
+        let result = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::new("could not open pass-cli stdin"))?
+            .write_all(&bytes);
+        let status = child
+            .wait()
+            .map_err(|_| Error::new("pass-cli did not finish"))?;
+        if result.is_err() || !status.success() {
+            return Err(Error::new("pass-cli could not create Proton login"));
+        }
+        Ok(())
     }
 }
 

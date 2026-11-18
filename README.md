@@ -135,7 +135,7 @@ history still sees exported values, so autoload is a deliberate trade.
 | `keepass` | yes | yes | **no** | `keepassxc-cli`; `edit -p`/`add -p` read the database password and the value from stdin, never `argv`. `ensure` is refused: the CLI's check-and-save is not atomic against an external writer. | Fake-CLI fixture in the suite plus opt-in generated local KDBX tests for the round trip, concurrent writers, and duplicate add (`cargo test --test keepass_kdbx -- --ignored`) with `keepassxc-cli` 2.7.12; no production vault |
 | `infisical` | yes | yes | yes | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` sends only Create (`POST`); the pinned server's partial unique index rejects a duplicate with `400`, which the adapter reports present. A create that loses a concurrent insert race is an error. | Fixture-tested for list/get/set/ensure, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis, including concurrent duplicate creates; no production server |
 | `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
-| `proton` | yes | no | no | official `pass-cli`, existing session or PAT; a configured PAT uses a private per-process session directory | Fake `pass-cli` fixture; not installed here |
+| `proton` | yes | create only | no | official `pass-cli` 2.7.1; stdin JSON template creates absent login items, existing items cannot be updated | Fake `pass-cli` fixture; no live Proton service verified |
 | `github` | **no** | yes | **no** | Actions repository secrets REST API | Sealed-box unit test only; no live repository. Ensure is unsupported because PUT creates or updates and would overwrite. |
 | `aws-secrets-manager` | yes | yes | yes | Secrets Manager JSON 1.1 API with local SigV4 signing | Opt-in Floci test against `floci/floci:2.5.0`; signer unit-tested against AWS's published SigV4 vectors; no AWS account |
 | `gcp-secret-manager` | yes | yes | **no** | Secret Manager v1 REST API | Opt-in Floci test against `floci/floci-gcp:0.13.0`; no GCP project. Ensure is refused because create and add-version are separate, non-atomic calls. |
@@ -228,14 +228,14 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   preserve concurrent external changes. Writes take one conservative same-user
   advisory lock shared by every Vaultwarden profile on this machine, because
   the configuration has no server address and wrapper paths differ.
-- Proton `set` and `ensure` remain unsupported. The documented `pass-cli`
-  2.7.1 update command takes the value in `argv`, exposing it to process
-  inspection. Its in-memory Rust library API is part of the
-  [GPL-3.0-or-later upstream project](https://github.com/protonpass/pass-cli/blob/2.7.1/LICENSE);
-  compatibility with this MIT project's intended distribution remains
-  unresolved, so it is not linked or copied here. A safe, license-compatible
-  write interface is needed before implementing `set`. Separately, `ensure`
-  requires an atomic create-if-absent operation, which the CLI does not offer.
+- Proton `set` creates a login only when its title is absent. It supports
+  `#password` (default), `#username`, `#email`, and `#totp_uri`, with UTF-8
+  values sent as a JSON template over stdin. Existing titles and other fields
+  are refused; `pass-cli` 2.7.1 updates expose values in argv. Same-user nvault
+  writers share a conservative lock, but the list-then-create check is **not
+  atomic** against other clients, users, hosts, or differently configured lock
+  directories; concurrent creation can produce duplicate titles. `ensure` is
+  unsupported. This uses the separately installed CLI, not its GPL library.
 - Proton listings are not a metadata-only fetch. In `pass-cli` 2.7.1,
   `item list --output json` downloads and decrypts every `Item` before
   serializing an `ItemSummary` without content. The adapter keeps only titles
