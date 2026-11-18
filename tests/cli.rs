@@ -1644,16 +1644,18 @@ fn proton_yaml_null_disables_ambient_token() {
 
 #[cfg(unix)]
 #[test]
-fn proton_explicit_file_outranks_implicit_environment() {
+fn proton_file_and_ambient_token_require_explicit_selection() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile_dir();
     let script = directory.join("pass-cli");
     let token = directory.join("fixture");
+    let trace = directory.join("trace");
     std::fs::write(&token, "fake-file-token").expect("fixture");
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).expect("permissions");
     std::fs::write(
         &script,
         r#"#!/bin/sh
+printf 'invoked\n' >> "$TRACE"
 case "$*" in
   login) [ "$PROTON_PASS_PERSONAL_ACCESS_TOKEN" = "fake-file-token" ] || exit 1
     mkdir -p "$PROTON_PASS_SESSION_DIR/.session"
@@ -1672,10 +1674,25 @@ esac
     let result = run(
         &directory,
         &["ls"],
-        &[("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-env-token")],
+        &[
+            ("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-env-token"),
+            ("TRACE", trace.to_str().expect("trace")),
+        ],
+        None,
+    );
+    assert!(!result.status.success());
+    assert!(!trace.exists(), "pass-cli must not run");
+    assert!(stderr(&result).contains("unset"));
+    assert!(stderr(&result).contains("token_env"));
+    assert!(!stderr(&result).contains("fake-env-token"));
+    let result = run(
+        &directory,
+        &["ls"],
+        &[("TRACE", trace.to_str().expect("trace"))],
         None,
     );
     assert!(result.status.success(), "{}", stderr(&result));
+    assert!(trace.exists());
 }
 
 #[test]

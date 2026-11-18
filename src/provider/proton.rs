@@ -119,17 +119,17 @@ impl ProtonProvider {
                 config.command
             )));
         }
+        if config.token_env.is_none()
+            && std::env::var_os("PROTON_PASS_PERSONAL_ACCESS_TOKEN").is_some()
+        {
+            return Err(Error::new(
+                "PROTON_PASS_PERSONAL_ACCESS_TOKEN is present but not configured; set token_env to select it, or unset it to use token_file or an existing session",
+            ));
+        }
         let token = match (&config.token_env, &config.token_file) {
             (Some(variable), _) => Some(crate::provider::credential_from_env(variable)?),
             (None, Some(path)) => Some(crate::provider::credential_from_file(&root.join(path))?),
-            (None, None) => {
-                if std::env::var_os("PROTON_PASS_PERSONAL_ACCESS_TOKEN").is_some() {
-                    return Err(Error::new(
-                        "PROTON_PASS_PERSONAL_ACCESS_TOKEN is present but not configured; set token_env to use it, or unset it to use an existing session",
-                    ));
-                }
-                None
-            }
+            (None, None) => None,
         };
         Ok(Self {
             name: name.to_owned(),
