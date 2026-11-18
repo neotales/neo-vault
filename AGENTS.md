@@ -17,6 +17,7 @@ Opt-in container tests (require Docker and do not run by default):
 
 ```sh
 cargo test --test container_vault -- --ignored --nocapture
+cargo test --test container_openbao -- --ignored --nocapture
 cargo test --test container_infisical -- --ignored --nocapture
 NVAULT_TEST_BW=/path/to/pinned/bw \
   cargo test --test container_vaultwarden -- --ignored --nocapture
