@@ -35,7 +35,11 @@ pub struct Cli {
 /// Commands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// List key names under a prefix. Never reads values.
+    /// List key names under a prefix. Prints names only.
+    ///
+    /// Most adapters list metadata. Vaultwarden's `bw list items` returns full
+    /// items and Proton's `pass-cli item list` downloads and decrypts them, but
+    /// both adapters keep only names and never print a value.
     Ls {
         /// Optional key prefix.
         prefix: Option<String>,
@@ -82,7 +86,10 @@ pub enum Command {
         #[arg(long)]
         stdin: bool,
     },
-    /// Search key names only. Values are never fetched.
+    /// Search key names. Prints names only.
+    ///
+    /// Uses the same provider listing as `ls`, so the Vaultwarden and Proton
+    /// item fetches described there apply; no value is printed.
     Search {
         /// Case-insensitive substring for names.
         query: String,

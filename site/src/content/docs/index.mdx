@@ -41,7 +41,9 @@ table sees the name. It does not see the value.
 		not exist, on purpose.
 	</Card>
 	<Card title="Names only" icon="list-format">
-		`ls` and `search` return names. They do not fetch values.
+		`ls` and `search` print names only. Vaultwarden's `bw list items` and
+		Proton's `pass-cli item list` do fetch item bodies to produce them, but
+		neither adapter prints a value.
 	</Card>
 	<Card title="No remove" icon="close">
 		There is no delete command. `ensure` creates through a path that cannot
