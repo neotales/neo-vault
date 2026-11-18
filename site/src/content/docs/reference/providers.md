@@ -9,7 +9,7 @@ No adapter in this repository has been verified against a live production servic
 | --- | --- | --- | --- | --- |
 | `vault` | yes | yes | yes | Fixture plus opt-in container test. Ensure uses metadata, subkeys, and CAS. |
 | `openbao` | yes | yes | yes | Same adapter as `vault`. Not exercised as its own server. |
-| `keepass` | yes | no | no | Fake CLI fixture. Writes are refused. |
+| `keepass` | yes | yes | no | Fake CLI fixture plus an opt-in generated KDBX test for the round trip, concurrent writers, and duplicate add against `keepassxc-cli` 2.7.12. Writes replace or create only an entry's `Password` on stdin. `ensure` is refused because the CLI check-and-save is not atomic against an external writer. |
 | `infisical` | yes | yes | yes | List, get, set, and ensure are fixture-shaped in the library, with an opt-in container run against `infisical/infisical:v0.167.11`. `set` is a GET-then-POST/PATCH write. `ensure` sends only Create (`POST`); the server's partial unique index rejects a duplicate with `400`, which is reported present. The `200` Create body must be the documented secret object and identify the requested key, project, environment, and shared type before the adapter reports created. |
 | `vaultwarden` | yes | yes | no | Fake `bw` fixture plus an opt-in container test against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1. Writes sync the CLI state and send the encoded item on stdin; the server revision check covers the sync-to-edit window. `bw list items` returns full items; the adapter keeps names. |
 | `proton` | yes | no | no | Fake `pass-cli` fixture. A write would put the value in `argv`, so it is refused. A configured PAT uses a private per-process session directory. |
@@ -28,7 +28,7 @@ for pinned image digests and exact commands.
 Key shapes:
 
 - Vault and OpenBao: `path/to/secret` or `path/to/secret#field`.
-- KeePass: `Group/Entry` or `Group/Entry#Attribute`.
+- KeePass: `Group/Entry` or `Group/Entry#Attribute`. Writes accept only `Password` (or no field); other attributes and `ensure` are unsupported.
 - Infisical: secret name. No field suffix.
 - Vaultwarden: item name or UUID, optional `#password`, `#username`, `#notes`, `#name`, `#id`, or a custom field.
 - Proton: title, optional `#password`, `#username`, or another field.

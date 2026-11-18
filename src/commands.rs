@@ -376,7 +376,7 @@ fn describe(profile: &ProviderConfig) -> (&'static str, bool, bool, bool, bool) 
         ProviderConfig::Keepass(config) => (
             "keepass",
             true,
-            false,
+            true,
             false,
             command_available(&config.command),
         ),
