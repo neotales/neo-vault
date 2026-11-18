@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use nsvault::{Client, Secret};
+use nvault::{Client, Secret};
 use testcontainers::{
     GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -17,7 +17,7 @@ use testcontainers::{
 #[test]
 #[ignore = "requires Docker; opt in with --ignored"]
 fn vault_kv_v2_round_trip_preserves_sibling_fields() {
-    let token = "nsvault-test-root-token";
+    let token = "nvault-test-root-token";
     let container = GenericImage::new("hashicorp/vault", "1.21.4")
         .with_exposed_port(8200.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Vault server started!"))
@@ -30,7 +30,7 @@ fn vault_kv_v2_round_trip_preserves_sibling_fields() {
         .expect("Vault host port");
 
     let directory = std::env::temp_dir().join(format!(
-        "nsvault-vault-container-{}-{}",
+        "nvault-vault-container-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -108,7 +108,7 @@ allow_http_loopback = true
     let created = client
         .ensure(Some("v"), "apps/prod/fresh", &Secret::new(b"once".to_vec()))
         .expect("ensure create");
-    assert_eq!(created, nsvault::EnsureStatus::Created);
+    assert_eq!(created, nvault::EnsureStatus::Created);
     let present = client
         .ensure(
             Some("v"),
@@ -116,7 +116,7 @@ allow_http_loopback = true
             &Secret::new(b"twice".to_vec()),
         )
         .expect("ensure present");
-    assert_eq!(present, nsvault::EnsureStatus::Present);
+    assert_eq!(present, nvault::EnsureStatus::Present);
     let fresh = client
         .get(Some("v"), "apps/prod/fresh")
         .expect("read ensured secret");
@@ -128,7 +128,7 @@ allow_http_loopback = true
             &Secret::new(b"kept".to_vec()),
         )
         .expect("ensure field");
-    assert_eq!(note, nsvault::EnsureStatus::Created);
+    assert_eq!(note, nvault::EnsureStatus::Created);
     // A second ensure of the same field must see the real subkeys response and
     // leave the value alone. This is the assertion that would fail if the
     // adapter treated a missing or misplaced subkeys map as absence.
@@ -139,7 +139,7 @@ allow_http_loopback = true
             &Secret::new(b"replaced".to_vec()),
         )
         .expect("ensure existing field");
-    assert_eq!(note_again, nsvault::EnsureStatus::Present);
+    assert_eq!(note_again, nvault::EnsureStatus::Present);
     let note_value = client
         .get(Some("v"), "apps/prod/db#note")
         .expect("read existing field");

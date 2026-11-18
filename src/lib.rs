@@ -1,4 +1,4 @@
-//! `nsvault` library and C ABI.
+//! `nvault` library and C ABI.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

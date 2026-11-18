@@ -46,11 +46,11 @@ docker pull floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be7195
 docker pull floci/floci-gcp:0.13.0@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
 docker pull floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
 
-docker run -d --rm --name nsvault-floci-aws -p 127.0.0.1:4566:4566 \
+docker run -d --rm --name nvault-floci-aws -p 127.0.0.1:4566:4566 \
   floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
-docker run -d --rm --name nsvault-floci-gcp -p 127.0.0.1:4588:4588 \
+docker run -d --rm --name nvault-floci-gcp -p 127.0.0.1:4588:4588 \
   floci/floci-gcp:0.13.0@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
-docker run -d --rm --name nsvault-floci-az \
+docker run -d --rm --name nvault-floci-az \
   -e FLOCI_AZ_SERVICES_FUNCTIONS_ENABLED=false -p 127.0.0.1:4577:4577 \
   floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
 ```
@@ -61,7 +61,7 @@ the Azure emulator needs no Docker socket. Stop only these names if they are
 still running:
 
 ```sh
-docker stop nsvault-floci-aws nsvault-floci-gcp nsvault-floci-az
+docker stop nvault-floci-aws nvault-floci-gcp nvault-floci-az
 ```
 
 Do not run `docker system prune`, `docker volume prune`, or a broad
@@ -131,7 +131,7 @@ live AWS endpoint accepts a request built by this adapter.
 ## Manual CLI run
 
 With the three fixed-port containers running, a manual run used
-`.nsvault.toml` files and owner-only credential files in a private temporary
+`.nvault.toml` files and owner-only credential files in a private temporary
 directory. The values were `not-a-real-secret`, `first-value`, and
 `second-value`. The observed outcomes:
 
@@ -147,14 +147,14 @@ Azure: set ok; get byte-identical; ls and search returned cli-fixture-az;
        the value was not written and was not echoed.
 ```
 
-`nsvault providers` printed:
+`nvault providers` printed:
 
 ```text
 aws	aws-secrets-manager	read=true	write=true	ensure=true
 gcp	gcp-secret-manager	read=true	write=true	ensure=false
 ```
 
-No secret value appeared in an `nsvault` command argument or in error output.
+No secret value appeared in an `nvault` command argument or in error output.
 The `get` comparisons used `cmp` against a fixture file, so values were not
 printed to the session log.
 

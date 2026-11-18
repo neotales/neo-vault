@@ -37,4 +37,4 @@ Key shapes:
 - GCP Secret Manager: `SECRET_ID`. No field suffix; latest version only.
 - Azure Key Vault: `SECRET_NAME`. No field suffix; latest version only.
 
-`nsvault providers` prints `read`, `write`, and `ensure` from the kind. It does not call the provider.
+`nvault providers` prints `read`, `write`, and `ensure` from the kind. It does not call the provider.

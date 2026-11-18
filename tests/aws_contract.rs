@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use nsvault::{Client, EnsureStatus, Secret};
+use nvault::{Client, EnsureStatus, Secret};
 use serde_json::Value;
 
 #[derive(Clone)]
@@ -158,7 +158,7 @@ fn valid_token(value: &str) -> bool {
 fn create_and_put_carry_stable_valid_client_request_tokens() {
     let fixture = Fixture::start();
     let directory = std::env::temp_dir().join(format!(
-        "nsvault-aws-contract-{}-{}",
+        "nvault-aws-contract-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

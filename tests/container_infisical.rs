@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use nsvault::{Client, EnsureStatus, Secret};
+use nvault::{Client, EnsureStatus, Secret};
 use serde_json::{Value, json};
 use testcontainers::{
     GenericImage, ImageExt,
@@ -28,7 +28,7 @@ use testcontainers::{
 };
 
 /// Dummy local database password for the fixture containers.
-const DB_PASSWORD: &str = "nsvault-test-db-password";
+const DB_PASSWORD: &str = "nvault-test-db-password";
 /// Dummy bootstrap password for the fixture administrator.
 const ADMIN_PASSWORD: &str = "not-a-real-password";
 
@@ -152,9 +152,9 @@ fn infisical_reads_writes_and_lists_against_the_pinned_image() {
         &format!("{base}/api/v1/admin/bootstrap"),
         None,
         &json!({
-            "email": "nsvault-container-test@example.invalid",
+            "email": "nvault-container-test@example.invalid",
             "password": ADMIN_PASSWORD,
-            "organization": "nsvault container test",
+            "organization": "nvault container test",
         }),
     );
     assert_eq!(bootstrap_status, 200, "bootstrap failed");
@@ -168,9 +168,9 @@ fn infisical_reads_writes_and_lists_against_the_pinned_image() {
         &format!("{base}/api/v1/projects"),
         Some(&token),
         &json!({
-            "projectName": "nsvault container test",
+            "projectName": "nvault container test",
             "projectDescription": "isolated testcontainers fixture",
-            "slug": "nsvault-container-test",
+            "slug": "nvault-container-test",
             "template": "default",
             "type": "secret-manager",
         }),
@@ -191,7 +191,7 @@ fn infisical_reads_writes_and_lists_against_the_pinned_image() {
     assert!(has_dev, "the default template has no dev environment");
 
     let directory = std::env::temp_dir().join(format!(
-        "nsvault-infisical-container-{}-{}",
+        "nvault-infisical-container-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -230,36 +230,36 @@ allow_http_loopback = true
     client
         .set(
             Some("i"),
-            "NSVAULT_CONTAINER_TEST",
+            "NVAULT_CONTAINER_TEST",
             &Secret::new(b"initial-value".to_vec()),
         )
         .expect("create the secret");
     let initial = client
-        .get(Some("i"), "NSVAULT_CONTAINER_TEST")
+        .get(Some("i"), "NVAULT_CONTAINER_TEST")
         .expect("read the secret");
     assert_eq!(initial.expose(), b"initial-value");
 
     client
         .set(
             Some("i"),
-            "NSVAULT_CONTAINER_TEST",
+            "NVAULT_CONTAINER_TEST",
             &Secret::new(b"replacement-value".to_vec()),
         )
         .expect("update the secret");
     let updated = client
-        .get(Some("i"), "NSVAULT_CONTAINER_TEST")
+        .get(Some("i"), "NVAULT_CONTAINER_TEST")
         .expect("read the updated secret");
     assert_eq!(updated.expose(), b"replacement-value");
 
     let listed = client.list(Some("i"), "").expect("list the folder");
-    assert!(listed.iter().any(|key| key.key == "NSVAULT_CONTAINER_TEST"));
+    assert!(listed.iter().any(|key| key.key == "NVAULT_CONTAINER_TEST"));
 
     // Ensure is an atomic Create request. A sequential duplicate is a 400 and
     // must leave the first value alone.
     let ensured = client
         .ensure(
             Some("i"),
-            "NSVAULT_CONTAINER_ENSURE",
+            "NVAULT_CONTAINER_ENSURE",
             &Secret::new(b"first-ensure-value".to_vec()),
         )
         .expect("ensure creates the secret");
@@ -267,13 +267,13 @@ allow_http_loopback = true
     let ensured_again = client
         .ensure(
             Some("i"),
-            "NSVAULT_CONTAINER_ENSURE",
+            "NVAULT_CONTAINER_ENSURE",
             &Secret::new(b"second-ensure-value".to_vec()),
         )
         .expect("ensure reports the existing secret");
     assert_eq!(ensured_again, EnsureStatus::Present);
     let ensured_value = client
-        .get(Some("i"), "NSVAULT_CONTAINER_ENSURE")
+        .get(Some("i"), "NVAULT_CONTAINER_ENSURE")
         .expect("read the ensured secret");
     assert_eq!(ensured_value.expose(), b"first-ensure-value");
 
@@ -282,7 +282,7 @@ allow_http_loopback = true
     // request may succeed, every loser must fail, and no loser may replace the
     // winner's value.
     let project_query = format!("projectId={project_id}&environment=dev&secretPath=%2F");
-    let concurrent_name = "NSVAULT_CONTAINER_CONCURRENT";
+    let concurrent_name = "NVAULT_CONTAINER_CONCURRENT";
     let workers = 8usize;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
     let results: Vec<(usize, u16, String)> = std::thread::scope(|scope| {

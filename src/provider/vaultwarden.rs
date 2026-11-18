@@ -263,7 +263,7 @@ impl Provider for VaultwardenProvider {
 
     /// Writes one field by syncing, reading the item, changing that field, and
     /// sending the whole item back. The lock is held across the sync and the
-    /// write, so another nsvault writer cannot change the item in between.
+    /// write, so another nvault writer cannot change the item in between.
     /// Sibling fields are preserved within this call. Concurrent external
     /// clients are not coordinated; the server's revision check can reject a
     /// change that lands after the sync, but it is not a guarantee.

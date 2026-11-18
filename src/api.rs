@@ -1,4 +1,4 @@
-//! Shareable Rust client for embedding `nsvault`.
+//! Shareable Rust client for embedding `nvault`.
 //!
 //! The client loads the same configuration as the CLI and exposes listing,
 //! reading, and writing without going through the command line. It is a thin
@@ -11,17 +11,17 @@
 //! aliases are folded onto one conservative service or vault identity; an
 //! arbitrary custom URL alias is not detectable. A `Client` shared across
 //! threads serializes writes for the same identity, and it
-//! serializes with other nsvault processes of the same OS user. A call can
+//! serializes with other nvault processes of the same OS user. A call can
 //! block until the other writer exits. Lock failures are returned as errors;
 //! there is no unlocked write. The lock does not cover other clients, other
 //! hosts, or other OS users.
 //!
 //! Serialization assumes every writer resolves the same lock directory: the
-//! same OS user and the same `NSVAULT_LOCK_DIR` value, or the same
+//! same OS user and the same `NVAULT_LOCK_DIR` value, or the same
 //! `XDG_STATE_HOME`/`HOME` when it is unset. Two processes with different
 //! values use different lock files even for one provider identity and are not
 //! serialized by this mechanism. The lock path must be absolute; a relative
-//! `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected. No component of the path
+//! `NVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected. No component of the path
 //! may be a symbolic link. The directory is created `0700` if missing and must
 //! be owned by this user and inaccessible to group and others. Every ancestor
 //! must be owned by root or this user, because an owner can rename entries even
@@ -33,7 +33,7 @@
 //! `write-*.lock` files: a new inode or directory is a different lock. A
 //! hostile same-user process (or root) can break cooperation this way. The
 //! lock is not a security boundary against that process; it prevents
-//! unintentional overlap between cooperating nsvault writers.
+//! unintentional overlap between cooperating nvault writers.
 
 use std::path::Path;
 
@@ -87,7 +87,7 @@ impl Client {
     /// Writes one secret.
     ///
     /// Takes the same-user write lock for this provider scope and may block
-    /// behind another nsvault writer on this machine. A lock failure is an
+    /// behind another nvault writer on this machine. A lock failure is an
     /// error, not an unlocked write.
     ///
     /// # Errors
@@ -101,8 +101,8 @@ impl Client {
     /// Creates a secret when it is absent and leaves an existing secret unchanged.
     ///
     /// Takes the same-user write lock for this provider scope and may block
-    /// behind another nsvault writer on this machine. The lock excludes only
-    /// nsvault writers of the same OS user; the provider's own conditional
+    /// behind another nvault writer on this machine. The lock excludes only
+    /// nvault writers of the same OS user; the provider's own conditional
     /// write is what protects against a concurrent external writer.
     ///
     /// # Errors

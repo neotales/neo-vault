@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use nsvault::{Client, EnsureStatus, Result as NsvaultResult, Secret};
+use nvault::{Client, EnsureStatus, Result as NsvaultResult, Secret};
 use testcontainers::{
     Container, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -20,7 +20,7 @@ use testcontainers::{
 
 fn temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "nsvault-cloud-{label}-{}-{}",
+        "nvault-cloud-{label}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -111,37 +111,37 @@ allow_http_loopback = true
     let client = Client::open(&config).expect("open AWS client");
 
     let value = Secret::new(b"not-a-real-secret".to_vec());
-    retry(|| client.set(Some("aws"), "nsvault-fixture-aws", &value));
+    retry(|| client.set(Some("aws"), "nvault-fixture-aws", &value));
     assert_eq!(
         client
-            .get(Some("aws"), "nsvault-fixture-aws")
+            .get(Some("aws"), "nvault-fixture-aws")
             .expect("AWS get")
             .expose(),
         value.expose()
     );
     let listed = client
-        .list(Some("aws"), "nsvault-fixture")
+        .list(Some("aws"), "nvault-fixture")
         .expect("AWS list")
         .into_iter()
         .map(|key| key.key)
         .collect::<Vec<_>>();
-    assert!(listed.contains(&"nsvault-fixture-aws".to_owned()));
+    assert!(listed.contains(&"nvault-fixture-aws".to_owned()));
 
     let ensured = client
-        .ensure(Some("aws"), "nsvault-ensure-aws", &value)
+        .ensure(Some("aws"), "nvault-ensure-aws", &value)
         .expect("AWS ensure create");
     assert_eq!(ensured, EnsureStatus::Created);
     let present = client
         .ensure(
             Some("aws"),
-            "nsvault-ensure-aws",
+            "nvault-ensure-aws",
             &Secret::new(b"must-not-win".to_vec()),
         )
         .expect("AWS ensure present");
     assert_eq!(present, EnsureStatus::Present);
     assert_eq!(
         client
-            .get(Some("aws"), "nsvault-ensure-aws")
+            .get(Some("aws"), "nvault-ensure-aws")
             .expect("AWS ensured get")
             .expose(),
         value.expose()
@@ -174,10 +174,10 @@ allow_http_loopback = true
     let client = Client::open(&config).expect("open GCP client");
 
     let first = Secret::new(b"not-a-real-secret".to_vec());
-    retry(|| client.set(Some("gcp"), "nsvault-fixture-gcp", &first));
+    retry(|| client.set(Some("gcp"), "nvault-fixture-gcp", &first));
     assert_eq!(
         client
-            .get(Some("gcp"), "nsvault-fixture-gcp")
+            .get(Some("gcp"), "nvault-fixture-gcp")
             .expect("GCP get")
             .expose(),
         first.expose()
@@ -185,11 +185,11 @@ allow_http_loopback = true
 
     let second = Secret::new(b"not-a-real-secret-either".to_vec());
     client
-        .set(Some("gcp"), "nsvault-fixture-gcp", &second)
+        .set(Some("gcp"), "nvault-fixture-gcp", &second)
         .expect("GCP add version");
     assert_eq!(
         client
-            .get(Some("gcp"), "nsvault-fixture-gcp")
+            .get(Some("gcp"), "nvault-fixture-gcp")
             .expect("GCP latest get")
             .expose(),
         second.expose()
@@ -197,7 +197,7 @@ allow_http_loopback = true
 
     let ensure = client.ensure(
         Some("gcp"),
-        "nsvault-ensure-gcp",
+        "nvault-ensure-gcp",
         &Secret::new(b"must-not-land".to_vec()),
     );
     assert!(
@@ -206,19 +206,19 @@ allow_http_loopback = true
     );
     assert!(
         client
-            .list(Some("gcp"), "nsvault-ensure-gcp")
+            .list(Some("gcp"), "nvault-ensure-gcp")
             .expect("GCP list after refused ensure")
             .is_empty(),
         "refused GCP ensure must not create a secret"
     );
 
     let listed = client
-        .list(Some("gcp"), "nsvault-fixture")
+        .list(Some("gcp"), "nvault-fixture")
         .expect("GCP list")
         .into_iter()
         .map(|key| key.key)
         .collect::<Vec<_>>();
-    assert!(listed.contains(&"nsvault-fixture-gcp".to_owned()));
+    assert!(listed.contains(&"nvault-fixture-gcp".to_owned()));
 
     std::fs::remove_dir_all(directory).expect("remove GCP temp dir");
 }
@@ -252,10 +252,10 @@ allow_http_loopback = true
     let client = Client::open(&config).expect("open Azure client");
 
     let first = Secret::new(b"not-a-real-secret".to_vec());
-    retry(|| client.set(Some("azure"), "nsvault-fixture-az", &first));
+    retry(|| client.set(Some("azure"), "nvault-fixture-az", &first));
     assert_eq!(
         client
-            .get(Some("azure"), "nsvault-fixture-az")
+            .get(Some("azure"), "nvault-fixture-az")
             .expect("Azure get")
             .expose(),
         first.expose()
@@ -263,26 +263,26 @@ allow_http_loopback = true
 
     let second = Secret::new(b"not-a-real-secret-either".to_vec());
     client
-        .set(Some("azure"), "nsvault-fixture-az", &second)
+        .set(Some("azure"), "nvault-fixture-az", &second)
         .expect("Azure set version");
     assert_eq!(
         client
-            .get(Some("azure"), "nsvault-fixture-az")
+            .get(Some("azure"), "nvault-fixture-az")
             .expect("Azure latest get")
             .expose(),
         second.expose()
     );
 
     let listed = client
-        .list(Some("azure"), "nsvault-fixture")
+        .list(Some("azure"), "nvault-fixture")
         .expect("Azure list")
         .into_iter()
         .map(|key| key.key)
         .collect::<Vec<_>>();
-    assert!(listed.contains(&"nsvault-fixture-az".to_owned()));
+    assert!(listed.contains(&"nvault-fixture-az".to_owned()));
 
     for index in 0..27 {
-        let name = format!("nsvault-page-{index:02}");
+        let name = format!("nvault-page-{index:02}");
         client
             .set(
                 Some("azure"),
@@ -292,7 +292,7 @@ allow_http_loopback = true
             .expect("Azure paginated set");
     }
     let pages = client
-        .list(Some("azure"), "nsvault-page-")
+        .list(Some("azure"), "nvault-page-")
         .expect("Azure paginated list")
         .into_iter()
         .map(|key| key.key)
@@ -301,7 +301,7 @@ allow_http_loopback = true
 
     let ensure = client.ensure(
         Some("azure"),
-        "nsvault-ensure-az",
+        "nvault-ensure-az",
         &Secret::new(b"must-not-land".to_vec()),
     );
     assert!(ensure.is_err(), "Azure must not claim a race-safe ensure");

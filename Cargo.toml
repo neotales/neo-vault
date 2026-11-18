@@ -1,21 +1,21 @@
 [package]
-name = "nsvault"
+name = "nvault"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
 description = "Automation-first secrets proxy with directory-scoped configuration and process-safe secret handling"
-repository = "https://github.com/neotales/neo-secrets-vault"
+repository = "https://github.com/neotales/neo-vault"
 readme = "README.md"
 keywords = ["secrets", "vault", "automation", "cli"]
 categories = ["command-line-utilities", "authentication"]
 
 [lib]
-name = "nsvault"
+name = "nvault"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bin]]
-name = "nsvault"
+name = "nvault"
 path = "src/main.rs"
 
 [dependencies]

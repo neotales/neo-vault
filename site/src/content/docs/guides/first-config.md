@@ -1,13 +1,13 @@
 ---
 title: Configure a fake profile
-description: Point nsvault at a loopback-shaped Vault profile and print the profile list.
+description: Point nvault at a loopback-shaped Vault profile and print the profile list.
 ---
 
-You will get a config file that names a token variable and does not contain a token. Then `nsvault providers` prints the profile without reading that variable.
+You will get a config file that names a token variable and does not contain a token. Then `nvault providers` prints the profile without reading that variable.
 
 ## Write the file
 
-Create `.nsvault.toml` in an empty directory:
+Create `.nvault.toml` in an empty directory:
 
 ```toml
 version = 1
@@ -29,15 +29,15 @@ allow_http_loopback = true
 From that directory:
 
 ```sh
-nsvault providers
+nvault providers
 ```
 
 You should see one line for `work`, kind `vault`, with read, write, and ensure marked true. The command does not contact `127.0.0.1` and does not read `VAULT_TOKEN`.
 
 ```sh
-nsvault dir
+nvault dir
 ```
 
-That prints the directory that holds `.nsvault.toml`.
+That prints the directory that holds `.nvault.toml`.
 
 Nothing here started Vault. A later `get` against this file fails until a server is actually listening and the named variable is set in the environment. That failure must not print a token or a response body.

@@ -7,14 +7,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 /// Automation-first secrets proxy.
 #[derive(Debug, Parser)]
 #[command(
-    name = "nsvault",
+    name = "nvault",
     version,
     about = "Resolve secrets from a directory-scoped provider without putting values in argv",
     after_help = "Secrets are read from stdin (never --value) and written to stdout or a child environment. Errors never echo a value."
 )]
 pub struct Cli {
-    /// Configuration file. Defaults to `NSVAULT_CONFIG`, then the nearest
-    /// `.nsvault.toml`/`.nsvault.yaml`, then `~/.config/nsvault/config.toml`
+    /// Configuration file. Defaults to `NVAULT_CONFIG`, then the nearest
+    /// `.nvault.toml`/`.nvault.yaml`, then `~/.config/nvault/config.toml`
     /// (or `config.yaml`).
     #[arg(short, long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,

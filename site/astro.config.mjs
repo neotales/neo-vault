@@ -6,7 +6,7 @@ import tailwindcss from '@tailwindcss/vite';
 export default defineConfig({
 	integrations: [
 		starlight({
-			title: 'nsvault',
+			title: 'nvault',
 			description: 'Directory-scoped secrets proxy. Values stay out of argv.',
 			customCss: ['./src/styles/global.css'],
 			social: [

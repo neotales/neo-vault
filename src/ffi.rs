@@ -1,28 +1,28 @@
-//! Conservative C ABI for embedding `nsvault`.
+//! Conservative C ABI for embedding `nvault`.
 //!
 //! Every function catches panics at the boundary and reports a redacted error.
-//! See `include/nsvault.h` for ownership rules. In short:
+//! See `include/nvault.h` for ownership rules. In short:
 //!
-//! * `nsvault_client_open` returns an owned opaque pointer; close it exactly
-//!   once with `nsvault_client_close`.
+//! * `nvault_client_open` returns an owned opaque pointer; close it exactly
+//!   once with `nvault_client_close`.
 //! * Every `NsvaultBytes` returned by an output parameter is owned by the
-//!   caller and must be released with `nsvault_bytes_free` exactly once.
+//!   caller and must be released with `nvault_bytes_free` exactly once.
 //! * Secret byte buffers are zeroed before they are freed.
 //! * Strings are NUL-terminated UTF-8. Optional strings may be null.
-//! * Errors are retrieved with `nsvault_last_error`; the message is redacted
+//! * Errors are retrieved with `nvault_last_error`; the message is redacted
 //!   and is valid on the calling thread until the next FFI call.
-//! * `nsvault_set` and `nsvault_ensure` take the same per-machine, same-user
+//! * `nvault_set` and `nvault_ensure` take the same per-machine, same-user
 //!   write lock as the CLI and the Rust API, keyed by a provider identity
 //!   built from the canonical service endpoint or custom origin plus
 //!   non-secret scope. Recognized cloud endpoint aliases are folded onto one
 //!   conservative service or vault identity; an arbitrary custom URL alias is
-//!   not detectable. A call can block behind another nsvault
+//!   not detectable. A call can block behind another nvault
 //!   writer. A lock failure is returned as an error; there is no unlocked
 //!   write, and no timeout is imposed by this library. Writers coordinate only
 //!   when they resolve the same lock directory: the same OS user and the same
-//!   `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME` when it is unset.
+//!   `NVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME` when it is unset.
 //!   No component of that path may be a symbolic link. The lock path must be
-//!   absolute; a relative `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected.
+//!   absolute; a relative `NVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected.
 //!   Every ancestor must be owned by root or this user (an owner can rename
 //!   entries even without write permission), and an ancestor writable by group
 //!   or others must also be sticky. The lock is advisory:
@@ -57,7 +57,7 @@ pub struct NsvaultBytes {
     pub data: *mut u8,
     /// Number of bytes.
     pub len: usize,
-    /// Allocation capacity, used by `nsvault_bytes_free`.
+    /// Allocation capacity, used by `nvault_bytes_free`.
     pub capacity: usize,
 }
 
@@ -150,7 +150,7 @@ fn into_bytes(bytes: Vec<u8>) -> NsvaultBytes {
 /// `path` must point at a NUL-terminated UTF-8 string. `out` must be writable
 /// and must not alias `path`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nsvault_client_open(
+pub unsafe extern "C" fn nvault_client_open(
     path: *const c_char,
     out: *mut *mut NsvaultClient,
 ) -> c_int {
@@ -175,10 +175,10 @@ pub unsafe extern "C" fn nsvault_client_open(
 ///
 /// # Safety
 ///
-/// `client` must be a pointer returned by `nsvault_client_open` that has not
+/// `client` must be a pointer returned by `nvault_client_open` that has not
 /// already been closed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nsvault_client_close(client: *mut NsvaultClient) {
+pub unsafe extern "C" fn nvault_client_close(client: *mut NsvaultClient) {
     if client.is_null() {
         return;
     }
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn nsvault_client_close(client: *mut NsvaultClient) {
 /// `client` must be a live handle. `provider` may be null. `prefix` may be
 /// null for the configured default. `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nsvault_list(
+pub unsafe extern "C" fn nvault_list(
     client: *const NsvaultClient,
     provider: *const c_char,
     prefix: *const c_char,
@@ -234,7 +234,7 @@ pub unsafe extern "C" fn nsvault_list(
 /// `client` must be a live handle. `provider` may be null. `key` must be a
 /// NUL-terminated UTF-8 string. `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nsvault_get(
+pub unsafe extern "C" fn nvault_get(
     client: *const NsvaultClient,
     provider: *const c_char,
     key: *const c_char,
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn nsvault_get(
 /// NUL-terminated UTF-8 string. If `len` is non-zero, `value` must point at
 /// `len` readable bytes. The bytes must not overlap `client` or `out`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nsvault_set(
+pub unsafe extern "C" fn nvault_set(
     client: *const NsvaultClient,
     provider: *const c_char,
     key: *const c_char,
@@ -308,7 +308,7 @@ pub unsafe extern "C" fn nsvault_set(
 /// `len` readable bytes. `created` may be null; when it is not, it must be
 /// writable. The bytes must not overlap `client` or `created`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nsvault_ensure(
+pub unsafe extern "C" fn nvault_ensure(
     client: *const NsvaultClient,
     provider: *const c_char,
     key: *const c_char,
@@ -358,7 +358,7 @@ pub unsafe extern "C" fn nsvault_ensure(
 ///
 /// `out` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nsvault_last_error(out: *mut NsvaultBytes) -> c_int {
+pub unsafe extern "C" fn nvault_last_error(out: *mut NsvaultBytes) -> c_int {
     if out.is_null() {
         return 0;
     }
@@ -384,7 +384,7 @@ pub unsafe extern "C" fn nsvault_last_error(out: *mut NsvaultBytes) -> c_int {
 /// `bytes` must be a value returned through an output parameter by this
 /// library and must not be freed more than once.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nsvault_bytes_free(bytes: NsvaultBytes) {
+pub unsafe extern "C" fn nvault_bytes_free(bytes: NsvaultBytes) {
     if bytes.data.is_null() || bytes.capacity == 0 {
         return;
     }

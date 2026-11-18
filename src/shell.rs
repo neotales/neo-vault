@@ -47,20 +47,12 @@ pub fn render_env(exports: &[Export], shell: EnvShell) -> Result<String> {
     let loaded = names.join(" ");
     match shell {
         EnvShell::Bash | EnvShell::Zsh => {
-            writeln!(
-                output,
-                "export NSVAULT_LOADED_KEYS={}",
-                quote_posix(&loaded)
-            )
-            .map_err(|_| Error::new("cannot render shell exports"))?;
+            writeln!(output, "export NVAULT_LOADED_KEYS={}", quote_posix(&loaded))
+                .map_err(|_| Error::new("cannot render shell exports"))?;
         }
         EnvShell::Fish => {
-            writeln!(
-                output,
-                "set -gx NSVAULT_LOADED_KEYS {}",
-                quote_fish(&loaded)
-            )
-            .map_err(|_| Error::new("cannot render shell exports"))?;
+            writeln!(output, "set -gx NVAULT_LOADED_KEYS {}", quote_fish(&loaded))
+                .map_err(|_| Error::new("cannot render shell exports"))?;
         }
     }
     Ok(output)
@@ -131,10 +123,10 @@ pub fn select_keys(keys: &[ListedKey], only: Option<&str>) -> Result<Vec<ListedK
 
 /// Generates a directory hook.
 ///
-/// The hook tracks the working directory and sets `NSVAULT_DIR`. It evaluates
-/// the provider environment only when `NSVAULT_AUTOLOAD=1`, so a shell does not
+/// The hook tracks the working directory and sets `NVAULT_DIR`. It evaluates
+/// the provider environment only when `NVAULT_AUTOLOAD=1`, so a shell does not
 /// fetch secrets merely because it changed directory. Previously exported keys
-/// are unset through `NSVAULT_LOADED_KEYS` before each reload.
+/// are unset through `NVAULT_LOADED_KEYS` before each reload.
 #[must_use]
 pub fn hook(shell: HookShell) -> String {
     match shell {
@@ -145,76 +137,76 @@ pub fn hook(shell: HookShell) -> String {
 }
 
 fn bash_hook() -> String {
-    r#"_nsvault_hook() {
-  [ "${PWD:-}" = "${NSVAULT_LAST_DIR:-}" ] && return 0
-  NSVAULT_LAST_DIR="$PWD"
+    r#"_nvault_hook() {
+  [ "${PWD:-}" = "${NVAULT_LAST_DIR:-}" ] && return 0
+  NVAULT_LAST_DIR="$PWD"
   local root
-  root="$(nsvault dir 2>/dev/null)"
+  root="$(nvault dir 2>/dev/null)"
   if [ -n "$root" ]; then
-    export NSVAULT_DIR="$root"
+    export NVAULT_DIR="$root"
   else
-    unset NSVAULT_DIR
+    unset NVAULT_DIR
   fi
-  if [ -n "${NSVAULT_LOADED_KEYS:-}" ]; then
-    for key in $NSVAULT_LOADED_KEYS; do unset "$key"; done
-    unset NSVAULT_LOADED_KEYS
+  if [ -n "${NVAULT_LOADED_KEYS:-}" ]; then
+    for key in $NVAULT_LOADED_KEYS; do unset "$key"; done
+    unset NVAULT_LOADED_KEYS
   fi
-  if [ "${NSVAULT_AUTOLOAD:-0}" = "1" ] && [ -n "$root" ]; then
-    eval "$(nsvault env --shell bash 2>/dev/null)"
+  if [ "${NVAULT_AUTOLOAD:-0}" = "1" ] && [ -n "$root" ]; then
+    eval "$(nvault env --shell bash 2>/dev/null)"
   fi
 }
 case ";${PROMPT_COMMAND:-};" in
-  *";_nsvault_hook;"*) ;;
-  *) PROMPT_COMMAND="_nsvault_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+  *";_nvault_hook;"*) ;;
+  *) PROMPT_COMMAND="_nvault_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
 esac
-_nsvault_hook
+_nvault_hook
 "#
     .to_owned()
 }
 
 fn zsh_hook() -> String {
-    r#"_nsvault_hook() {
+    r#"_nvault_hook() {
   local root
-  root="$(nsvault dir 2>/dev/null)"
+  root="$(nvault dir 2>/dev/null)"
   if [ -n "$root" ]; then
-    export NSVAULT_DIR="$root"
+    export NVAULT_DIR="$root"
   else
-    unset NSVAULT_DIR
+    unset NVAULT_DIR
   fi
-  if [ -n "${NSVAULT_LOADED_KEYS:-}" ]; then
-    for key in ${(z)NSVAULT_LOADED_KEYS}; do unset "$key"; done
-    unset NSVAULT_LOADED_KEYS
+  if [ -n "${NVAULT_LOADED_KEYS:-}" ]; then
+    for key in ${(z)NVAULT_LOADED_KEYS}; do unset "$key"; done
+    unset NVAULT_LOADED_KEYS
   fi
-  if [ "${NSVAULT_AUTOLOAD:-0}" = "1" ] && [ -n "$root" ]; then
-    eval "$(nsvault env --shell zsh 2>/dev/null)"
+  if [ "${NVAULT_AUTOLOAD:-0}" = "1" ] && [ -n "$root" ]; then
+    eval "$(nvault env --shell zsh 2>/dev/null)"
   fi
 }
 autoload -Uz add-zsh-hook
-add-zsh-hook chpwd _nsvault_hook
-_nsvault_hook
+add-zsh-hook chpwd _nvault_hook
+_nvault_hook
 "#
     .to_owned()
 }
 
 fn fish_hook() -> String {
-    r#"function _nsvault_hook --on-variable PWD
-    set -l root (nsvault dir 2>/dev/null)
+    r#"function _nvault_hook --on-variable PWD
+    set -l root (nvault dir 2>/dev/null)
     if test -n "$root"
-        set -gx NSVAULT_DIR $root
+        set -gx NVAULT_DIR $root
     else
-        set -e NSVAULT_DIR
+        set -e NVAULT_DIR
     end
-    if set -q NSVAULT_LOADED_KEYS
-        for key in (string split ' ' -- $NSVAULT_LOADED_KEYS)
+    if set -q NVAULT_LOADED_KEYS
+        for key in (string split ' ' -- $NVAULT_LOADED_KEYS)
             set -e $key
         end
-        set -e NSVAULT_LOADED_KEYS
+        set -e NVAULT_LOADED_KEYS
     end
-    if test "$NSVAULT_AUTOLOAD" = "1"; and test -n "$root"
-        nsvault env --shell fish 2>/dev/null | source
+    if test "$NVAULT_AUTOLOAD" = "1"; and test -n "$root"
+        nvault env --shell fish 2>/dev/null | source
     end
 end
-_nsvault_hook
+_nvault_hook
 "#
     .to_owned()
 }
@@ -241,9 +233,9 @@ mod tests {
         for shell in [HookShell::Bash, HookShell::Zsh, HookShell::Fish] {
             let script = hook(shell);
             let cleanup = script
-                .find("NSVAULT_LOADED_KEYS")
+                .find("NVAULT_LOADED_KEYS")
                 .expect("cleanup bookkeeping");
-            let autoload = script.find("NSVAULT_AUTOLOAD").expect("autoload check");
+            let autoload = script.find("NVAULT_AUTOLOAD").expect("autoload check");
             assert!(
                 cleanup < autoload,
                 "{shell:?} hook checks autoload before cleanup"
@@ -259,7 +251,7 @@ mod tests {
         use std::process::Command;
 
         let base = std::env::temp_dir().join(format!(
-            "nsvault-hook-{}-{}",
+            "nvault-hook-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -273,20 +265,20 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
         std::fs::create_dir_all(&other).expect("other");
 
-        let fake = bin.join("nsvault");
+        let fake = bin.join("nvault");
         std::fs::write(
             &fake,
             r#"#!/bin/sh
 case "$1" in
-  dir) printf '%s\n' "$FAKE_NSVAULT_DIR" ;;
-  env) printf '%s\n' "export FAKE_SECRET='loaded'" "export NSVAULT_LOADED_KEYS='FAKE_SECRET'" ;;
+  dir) printf '%s\n' "$FAKE_NVAULT_DIR" ;;
+  env) printf '%s\n' "export FAKE_SECRET='loaded'" "export NVAULT_LOADED_KEYS='FAKE_SECRET'" ;;
   *) exit 2 ;;
 esac
 "#,
         )
-        .expect("fake nsvault");
+        .expect("fake nvault");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod fake nsvault");
+            .expect("chmod fake nvault");
 
         let hook_file = base.join("hook.bash");
         std::fs::write(&hook_file, hook(HookShell::Bash)).expect("hook file");
@@ -295,17 +287,17 @@ esac
             &script,
             format!(
                 r#"export PATH="{}:$PATH"
-export FAKE_NSVAULT_DIR="{}"
-export NSVAULT_AUTOLOAD=1
+export FAKE_NVAULT_DIR="{}"
+export NVAULT_AUTOLOAD=1
 source "{}"
-_nsvault_hook
+_nvault_hook
 [ "${{FAKE_SECRET:-}}" = "loaded" ] || exit 20
-[ "${{NSVAULT_LOADED_KEYS:-}}" = "FAKE_SECRET" ] || exit 21
-export NSVAULT_AUTOLOAD=0
+[ "${{NVAULT_LOADED_KEYS:-}}" = "FAKE_SECRET" ] || exit 21
+export NVAULT_AUTOLOAD=0
 cd "{}"
-_nsvault_hook
+_nvault_hook
 [ -z "${{FAKE_SECRET+x}}" ] || exit 22
-[ -z "${{NSVAULT_LOADED_KEYS+x}}" ] || exit 23
+[ -z "${{NVAULT_LOADED_KEYS+x}}" ] || exit 23
 "#,
                 bin.display(),
                 root.display(),
@@ -338,8 +330,8 @@ _nsvault_hook
         }];
         let output = render_env(&exports, EnvShell::Fish).expect("env");
         assert!(output.contains("set -gx TOKEN 'value'"));
-        assert!(output.contains("set -gx NSVAULT_LOADED_KEYS 'TOKEN'"));
-        assert!(!output.contains("export NSVAULT_LOADED_KEYS"));
+        assert!(output.contains("set -gx NVAULT_LOADED_KEYS 'TOKEN'"));
+        assert!(!output.contains("export NVAULT_LOADED_KEYS"));
     }
 
     #[test]
@@ -350,6 +342,6 @@ _nsvault_hook
         }];
         let output = render_env(&exports, EnvShell::Bash).expect("env");
         assert!(output.contains("export TOKEN='value'"));
-        assert!(output.contains("NSVAULT_LOADED_KEYS='TOKEN'"));
+        assert!(output.contains("NVAULT_LOADED_KEYS='TOKEN'"));
     }
 }

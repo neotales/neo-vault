@@ -1,13 +1,15 @@
-# nsvault
+# neo-vault (`nvault`)
 
-An automation-first secrets proxy: resolve a secret from a directory-scoped
-provider without putting the value in `argv`, a log line, or a checked-in file.
+neo-vault (`nvault`) retrieves secrets from configured vault drivers for
+interactive use and automation. Its directory-scoped configuration selects a
+provider; `exec` exposes selected values to a child process without putting them
+in command-line arguments or checked-in configuration.
 
-The first increment is deliberately small. It implements a CLI, a reusable Rust
-client, a conservative C ABI, directory discovery, shell integration, and ten
-provider kinds. **No adapter has been verified against a live production
-service in this repository.** The verification matrix below states exactly what
-was exercised.
+This repository includes a CLI, reusable Rust client, conservative C ABI,
+directory discovery, and shell integration. Provider support varies: some
+adapters are fixture- or emulator-tested, while others have opt-in container
+tests. **No adapter has been verified against a live production service in this
+repository.** The matrix below describes the evidence for each provider.
 
 ## Build
 
@@ -22,20 +24,20 @@ The library and C ABI are built by:
 
 ```sh
 cargo build --release --lib
-# target/release/libnsvault.so
-# target/release/libnsvault.a
+# target/release/libnvault.so
+# target/release/libnvault.a
 ```
 
 ## Configuration
 
 Two scopes are discovered, in this order:
 
-1. The nearest `.nsvault.toml`, `.nsvault.yaml`, or `.nsvault.yml` from the
+1. The nearest `.nvault.toml`, `.nvault.yaml`, or `.nvault.yml` from the
    current directory upwards.
-2. Otherwise `$XDG_CONFIG_HOME/nsvault/config.toml` (or `config.yaml`,
-   `config.yml`), falling back to `~/.config/nsvault/`.
+2. Otherwise `$XDG_CONFIG_HOME/nvault/config.toml` (or `config.yaml`,
+   `config.yml`), falling back to `~/.config/nvault/`.
 
-`NSVAULT_CONFIG` may name a file or a directory and wins over both.
+`NVAULT_CONFIG` may name a file or a directory and wins over both.
 `--config FILE` wins over everything. A directory-scoped file is a complete
 configuration: it is not merged with the user configuration, so put shared
 provider profiles in the file you want to use.
@@ -78,18 +80,18 @@ not accepted; use `token_env`, `token_file`, `password_env`, or
 ## Commands
 
 ```sh
-nsvault ls [PREFIX]                 # names only, no values
-nsvault get KEY [--field FIELD]     # exact bytes to stdout
-nsvault set KEY                     # value from stdin or a hidden prompt
-nsvault ensure KEY                  # create only if the provider confirms absence
-nsvault search QUERY                # names only
-nsvault exec -- CMD [ARGS...]       # secrets in the child environment
-nsvault x -- CMD [ARGS...]          # alias
-nsvault env --shell bash|zsh|fish   # shell exports for this directory
-nsvault hook bash|zsh|fish          # directory hook
-nsvault completion bash|zsh|fish|powershell|elvish
-nsvault providers                   # configured profiles, no credentials read
-nsvault dir                         # nearest configuration directory
+nvault ls [PREFIX]                 # names only, no values
+nvault get KEY [--field FIELD]     # exact bytes to stdout
+nvault set KEY                     # value from stdin or a hidden prompt
+nvault ensure KEY                  # create only if the provider confirms absence
+nvault search QUERY                # names only
+nvault exec -- CMD [ARGS...]       # secrets in the child environment
+nvault x -- CMD [ARGS...]          # alias
+nvault env --shell bash|zsh|fish   # shell exports for this directory
+nvault hook bash|zsh|fish          # directory hook
+nvault completion bash|zsh|fish|powershell|elvish
+nvault providers                   # configured profiles, no credentials read
+nvault dir                         # nearest configuration directory
 ```
 
 `get` prints the exact value with no trailing newline unless `--newline` is
@@ -116,12 +118,12 @@ Collisions and invalid names fail rather than guessing.
 
 ### Directory hooks
 
-`nsvault hook bash` (or `zsh`, `fish`) prints a shell function that tracks the
-working directory and sets `NSVAULT_DIR`. It does **not** fetch secrets just
-because you changed directory. Set `NSVAULT_AUTOLOAD=1` to opt into
-`nsvault env` on directory change. On every directory change, names recorded in
-`NSVAULT_LOADED_KEYS` are unset first, even if autoload is now disabled; only
-fetching new values is gated by `NSVAULT_AUTOLOAD`. A child process or a shell
+`nvault hook bash` (or `zsh`, `fish`) prints a shell function that tracks the
+working directory and sets `NVAULT_DIR`. It does **not** fetch secrets just
+because you changed directory. Set `NVAULT_AUTOLOAD=1` to opt into
+`nvault env` on directory change. On every directory change, names recorded in
+`NVAULT_LOADED_KEYS` are unset first, even if autoload is now disabled; only
+fetching new values is gated by `NVAULT_AUTOLOAD`. A child process or a shell
 history still sees exported values, so autoload is a deliberate trade.
 
 ## Providers
@@ -183,7 +185,7 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   and preserves the other fields. A missing entry is created with `add -p` only
   when its parent group already exists; missing groups are not created.
   `set` holds one same-user advisory lock shared by every KeePass write on this
-  machine, so cooperating nsvault processes (including the Rust `Client` and
+  machine, so cooperating nvault processes (including the Rust `Client` and
   the C ABI) serialize their read-modify-write. The identity is deliberately
   one shared value, not a database path or inode: two hard links to one KDBX
   have different paths, and `keepassxc-cli` may replace the file atomically, so
@@ -308,7 +310,7 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 - Shell completion lists commands and options; it does not dynamically complete
   provider key names.
 - A directory-scoped configuration is complete on its own. Provider profiles
-  from `~/.config/nsvault` are not merged into it.
+  from `~/.config/nvault` are not merged into it.
 - Windows and macOS were not exercised. The code avoids Unix-only calls outside
   the `bw`/`keepassxc-cli`/`pass-cli` process boundary, but that is not a
   portability claim. The same-user write lock uses Linux `flock` and was not
@@ -317,9 +319,9 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 ## Using the Rust crate
 
 ```rust
-use nsvault::Client;
+use nvault::Client;
 
-let client = Client::open(std::path::Path::new(".nsvault.toml"))?;
+let client = Client::open(std::path::Path::new(".nvault.toml"))?;
 let keys = client.list(Some("work"), "apps/production")?;
 let value = client.get(Some("work"), "apps/production/db#password")?;
 // value.expose() is the only accessor; Debug is redacted.
@@ -331,36 +333,36 @@ is not cached by the client. `set` and `ensure` take the same same-user write
 lock as the CLI, so two threads or processes that write the same provider scope
 serialize; the call can block, and a lock failure is returned as an error
 rather than performed unlocked. This requires both writers to resolve the same
-lock directory: the same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+lock directory: the same OS user and the same `NVAULT_LOCK_DIR`, or the same
 `XDG_STATE_HOME`/`HOME` when it is unset.
 
 ## C ABI
 
-See [`include/nsvault.h`](include/nsvault.h). The ABI is intentionally narrow:
+See [`include/nvault.h`](include/nvault.h). The ABI is intentionally narrow:
 
-- `nsvault_client_open` / `nsvault_client_close`
-- `nsvault_list`, `nsvault_get`, `nsvault_set`, `nsvault_ensure`
-- `nsvault_last_error`
-- `nsvault_bytes_free`
+- `nvault_client_open` / `nvault_client_close`
+- `nvault_list`, `nvault_get`, `nvault_set`, `nvault_ensure`
+- `nvault_last_error`
+- `nvault_bytes_free`
 
 Every entry point catches panics. Strings are NUL-terminated UTF-8. Output
 buffers are caller-owned, freed exactly once, and zeroed before release. A
 status of `0` is success and `1` is an error. The last error is redacted and
-per-thread. `nsvault_client_close` must not race another call using the same
-handle. There is no callback, async, or streaming API. `nsvault_set` and
-`nsvault_ensure` take the same same-user write lock as the CLI; they may block
-behind another nsvault writer, and a lock failure is returned as status `1`
+per-thread. `nvault_client_close` must not race another call using the same
+handle. There is no callback, async, or streaming API. `nvault_set` and
+`nvault_ensure` take the same same-user write lock as the CLI; they may block
+behind another nvault writer, and a lock failure is returned as status `1`
 instead of writing unlocked. Coordination requires the same lock directory:
-the same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+the same OS user and the same `NVAULT_LOCK_DIR`, or the same
 `XDG_STATE_HOME`/`HOME` when it is unset. Different values are different locks.
 
 Smoke test:
 
 ```sh
 cargo build --release --lib
-cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
-   -Wl,-rpath,"$PWD/target/release" -o /tmp/nsvault-ffi-smoke
-/tmp/nsvault-ffi-smoke
+cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnvault \
+   -Wl,-rpath,"$PWD/target/release" -o /tmp/nvault-ffi-smoke
+/tmp/nvault-ffi-smoke
 ```
 
 ## Security model
@@ -416,17 +418,17 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   DNS, or a private endpoint whose name does not match the recognized suffix —
   is treated as a distinct custom endpoint. Two profiles that reach one vault
   through different unrecognized names are not serialized by this lock.
-  Cooperating nsvault writers must use the provider's recognized endpoint or
+  Cooperating nvault writers must use the provider's recognized endpoint or
   the same custom endpoint spelling.
   The lock file lives under
-  `$XDG_STATE_HOME/nsvault/locks` or `~/.local/state/nsvault/locks`. A missing
+  `$XDG_STATE_HOME/nvault/locks` or `~/.local/state/nvault/locks`. A missing
   directory is created `0700`; lock files are created `0600` and must be
-  regular, single-link, owner-only files. `NSVAULT_LOCK_DIR` overrides the
+  regular, single-link, owner-only files. `NVAULT_LOCK_DIR` overrides the
   directory. The path is resolved one component at a time and the verified
   directory handle is retained, so the lock file is opened relative to it; no
   component of the path may be a symbolic link. The path must be absolute; a
-  relative `NSVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected. On a system with
-  a symlinked home or state directory, set `NSVAULT_LOCK_DIR` to a real,
+  relative `NVAULT_LOCK_DIR` or `XDG_STATE_HOME` is rejected. On a system with
+  a symlinked home or state directory, set `NVAULT_LOCK_DIR` to a real,
   non-symlink absolute path. Every parent must be owned by root or this user:
   an owner can rename entries even without write permission. A parent writable
   by group or others must also be sticky. An existing directory is never
@@ -434,7 +436,7 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
   and others. Creation respects the process umask: a directory that does not
   end up exactly owner-only is an error, not something that is chmodded.
   Writers coordinate only when they resolve the same lock directory: the same
-  OS user and the same `NSVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME`
+  OS user and the same `NVAULT_LOCK_DIR`, or the same `XDG_STATE_HOME`/`HOME`
   when it is unset.
   Acquisition fails closed, with no unlocked fallback and no timeout, and a
   lock failure is an error instead of a write. The lock is advisory: while a
@@ -470,7 +472,7 @@ needed. Three more container tests cover Vault, Infisical, and Vaultwarden:
 ```sh
 cargo test --test container_vault -- --ignored --nocapture
 cargo test --test container_infisical -- --ignored --nocapture
-NSVAULT_TEST_BW=/path/to/pinned/bw \
+NVAULT_TEST_BW=/path/to/pinned/bw \
   cargo test --test container_vaultwarden -- --ignored --nocapture
 ```
 
@@ -506,11 +508,11 @@ docker pull floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be7195
 docker pull floci/floci-gcp:0.13.0@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
 docker pull floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
 
-docker run -d --rm --name nsvault-floci-aws -p 127.0.0.1:4566:4566 \
+docker run -d --rm --name nvault-floci-aws -p 127.0.0.1:4566:4566 \
   floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
-docker run -d --rm --name nsvault-floci-gcp -p 127.0.0.1:4588:4588 \
+docker run -d --rm --name nvault-floci-gcp -p 127.0.0.1:4588:4588 \
   floci/floci-gcp:0.13.0@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
-docker run -d --rm --name nsvault-floci-az \
+docker run -d --rm --name nvault-floci-az \
   -e FLOCI_AZ_SERVICES_FUNCTIONS_ENABLED=false -p 127.0.0.1:4577:4577 \
   floci/floci-az:0.17.0@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
 ```
@@ -547,12 +549,12 @@ one common encrypted file format, using [age](https://age-encryption.org/), so
 a store can be backed up and moved between machines. That work is not started.
 This build has no `import` command, no `export` command, no age recipient or
 identity field, and no age dependency. An age file created elsewhere is not a
-nsvault backup and cannot be loaded.
+nvault backup and cannot be loaded.
 
 A local proxy that replaces secret placeholders in agent requests is a future
 consideration, not a design this project has accepted. One sketch, still
-uncommitted, is a separate executable that shares crates with `nsvault`
-instead of growing the `nsvault` binary. Nothing here chooses that split,
+uncommitted, is a separate executable that shares crates with `nvault`
+instead of growing the `nvault` binary. Nothing here chooses that split,
 a placeholder syntax, a listen address, or a wire format.
 
 If that work is ever started, the trust boundary has to be explicit: the
@@ -561,7 +563,7 @@ not a transparent hop and not a reason to log either. It would also need
 injection and egress controls before it could be used: which hosts it may
 contact, which placeholders it may expand, and a refusal to send a value to
 an unexpected URL. None of that exists today. There is no proxy binary, no
-placeholder syntax, and no local listener. `nsvault exec` only exports names
+placeholder syntax, and no local listener. `nvault exec` only exports names
 into a child environment; it does not rewrite request bodies.
 
 ## Verification in this change
@@ -573,9 +575,9 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release --lib
-cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
-   -Wl,-rpath,"$PWD/target/release" -o <tmp>/nsvault-ffi-smoke
-<tmp>/nsvault-ffi-smoke
+cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnvault \
+   -Wl,-rpath,"$PWD/target/release" -o <tmp>/nvault-ffi-smoke
+<tmp>/nvault-ffi-smoke
 ```
 
 Observed:

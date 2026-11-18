@@ -1,4 +1,4 @@
-# nsvault docs site
+# nvault docs site
 
 Astro Starlight site for the CLI, provider limits, and agent-facing commands.
 

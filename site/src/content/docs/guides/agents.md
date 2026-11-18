@@ -1,5 +1,5 @@
 ---
-title: Use nsvault from an agent
+title: Use nvault from an agent
 description: Exact commands, what touches a secret, and what must not land in a log.
 ---
 
@@ -9,17 +9,17 @@ Call the binary. Do not invent a value flag. Do not log stdout from `get`.
 
 | Command | Reads a secret? | Puts a secret in argv? | Stdout |
 | --- | --- | --- | --- |
-| `nsvault ls [PREFIX]` | no, except Vaultwarden and Proton* | no | key names, one per line |
-| `nsvault ls --json [PREFIX]` | no, except Vaultwarden and Proton* | no | JSON array of `{ "key" }` |
-| `nsvault search QUERY` | no, except Vaultwarden and Proton* | no | matching names |
-| `nsvault get KEY` | yes | no | exact value, no added newline |
-| `nsvault get KEY --newline` | yes | no | value plus a newline |
-| `nsvault set KEY` | writes one | no | empty |
-| `nsvault ensure KEY` | writes only if absent | no | empty |
-| `nsvault ensure --json KEY` | writes only if absent | no | `{"status":"created"}` or `{"status":"present"}` |
-| `nsvault exec -- CMD` | yes, into the child env | no | the child's stdout |
-| `nsvault providers` | no | no | profile rows, no credentials |
-| `nsvault dir` | no | no | config directory, or empty |
+| `nvault ls [PREFIX]` | no, except Vaultwarden and Proton* | no | key names, one per line |
+| `nvault ls --json [PREFIX]` | no, except Vaultwarden and Proton* | no | JSON array of `{ "key" }` |
+| `nvault search QUERY` | no, except Vaultwarden and Proton* | no | matching names |
+| `nvault get KEY` | yes | no | exact value, no added newline |
+| `nvault get KEY --newline` | yes | no | value plus a newline |
+| `nvault set KEY` | writes one | no | empty |
+| `nvault ensure KEY` | writes only if absent | no | empty |
+| `nvault ensure --json KEY` | writes only if absent | no | `{"status":"created"}` or `{"status":"present"}` |
+| `nvault exec -- CMD` | yes, into the child env | no | the child's stdout |
+| `nvault providers` | no | no | profile rows, no credentials |
+| `nvault dir` | no | no | config directory, or empty |
 
 `exec` has the alias `x`. A leading `--` before the child command is accepted.
 
@@ -28,11 +28,11 @@ Call the binary. Do not invent a value flag. Do not log stdout from `get`.
 ## Pass a value
 
 ```sh
-printf '%s' 'not-a-real-secret' | nsvault set apps/production/db
-printf '%s' 'not-a-real-secret' | nsvault ensure apps/production/db
+printf '%s' 'not-a-real-secret' | nvault set apps/production/db
+printf '%s' 'not-a-real-secret' | nvault ensure apps/production/db
 ```
 
-Do not put the value after the key. An empty value is refused. `set` prints `nsvault: stored <key>` on stderr. `ensure` prints `created` or `present` and the key on stderr. Neither prints the value.
+Do not put the value after the key. An empty value is refused. `set` prints `nvault: stored <key>` on stderr. `ensure` prints `created` or `present` and the key on stderr. Neither prints the value.
 
 ## Do not log
 
@@ -47,7 +47,7 @@ Do not put the value after the key. An empty value is refused. `set` prints `nsv
 
 | Flag | Effect |
 | --- | --- |
-| `--config FILE` | use this file; wins over `NSVAULT_CONFIG` and discovery |
+| `--config FILE` | use this file; wins over `NVAULT_CONFIG` and discovery |
 | `--provider NAME` | profile name; default is `provider` in the file |
 | `--prefix PATH` | default prefix for list, search, exec, and env |
 

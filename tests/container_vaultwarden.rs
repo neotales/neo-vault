@@ -3,12 +3,12 @@
 //! Run explicitly:
 //!
 //! ```sh
-//! NSVAULT_TEST_BW=/path/to/pinned/bw \
+//! NVAULT_TEST_BW=/path/to/pinned/bw \
 //!   cargo test --test container_vaultwarden -- --ignored --nocapture
 //! ```
 //!
 //! It requires a working Docker daemon and a pinned `bw` CLI on `PATH` or at
-//! `NSVAULT_TEST_BW`. The image is pinned and the test starts only its own
+//! `NVAULT_TEST_BW`. The image is pinned and the test starts only its own
 //! container; testcontainers removes that container on drop. It never touches
 //! another container, network, volume, or image.
 //!
@@ -19,7 +19,7 @@
 //! duplicate. It then uses the second state as an external writer and checks
 //! that a change made before a write is preserved (the adapter syncs) while a
 //! stale whole-item replay is rejected by the server's revision check. That
-//! check is not coordination; nsvault does not claim to preserve concurrent
+//! check is not coordination; nvault does not claim to preserve concurrent
 //! external changes.
 //!
 //! The CLI must accept a plaintext loopback server URL. Packages after
@@ -39,7 +39,7 @@ use aes::Aes256;
 use base64::Engine;
 use cbc::cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use hmac::{Hmac, Mac};
-use nsvault::{Client, Secret};
+use nvault::{Client, Secret};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use testcontainers::{
@@ -48,7 +48,7 @@ use testcontainers::{
     runners::SyncRunner,
 };
 
-const EMAIL: &str = "nsvault-container-test@example.invalid";
+const EMAIL: &str = "nvault-container-test@example.invalid";
 const PASSWORD: &str = "not-a-real-password";
 const KDF_ITERATIONS: u32 = 100_000;
 
@@ -82,7 +82,7 @@ fn get(agent: &ureq::Agent, url: &str) -> u16 {
 }
 
 fn bw_path() -> PathBuf {
-    std::env::var_os("NSVAULT_TEST_BW")
+    std::env::var_os("NVAULT_TEST_BW")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("bw"))
 }
@@ -314,7 +314,7 @@ fn register_account(agent: &ureq::Agent, base: &str) {
     let (status, token) = post(
         agent,
         &format!("{base}/identity/accounts/register/send-verification-email"),
-        &json!({ "email": EMAIL, "name": "nsvault container test" }),
+        &json!({ "email": EMAIL, "name": "nvault container test" }),
     );
     assert_eq!(status, 200, "registration token request failed");
     assert!(!token.is_empty(), "registration token is empty");
@@ -368,7 +368,7 @@ fn vaultwarden_two_cli_states_preserve_fields() {
     }
 
     let directory = std::env::temp_dir().join(format!(
-        "nsvault-vaultwarden-container-{}-{}",
+        "nvault-vaultwarden-container-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

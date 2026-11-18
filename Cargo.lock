@@ -1397,33 +1397,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nsvault"
-version = "0.1.0"
-dependencies = [
- "aes",
- "base64 0.22.1",
- "cbc",
- "clap",
- "clap_complete",
- "crypto_box",
- "getrandom 0.3.4",
- "hmac",
- "libc",
- "pbkdf2",
- "percent-encoding",
- "rpassword",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2",
- "testcontainers",
- "toml",
- "ureq",
- "url",
- "zeroize",
-]
-
-[[package]]
 name = "num"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1499,6 +1472,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "nvault"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "base64 0.22.1",
+ "cbc",
+ "clap",
+ "clap_complete",
+ "crypto_box",
+ "getrandom 0.3.4",
+ "hmac",
+ "libc",
+ "pbkdf2",
+ "percent-encoding",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "testcontainers",
+ "toml",
+ "ureq",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

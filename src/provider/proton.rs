@@ -77,7 +77,7 @@ impl SessionDir {
             return Err(Error::new(SESSION_DIR_ERROR));
         }
         Ok(Self {
-            directory: super::lock::create_private_directory(&parent, "nsvault-proton")?,
+            directory: super::lock::create_private_directory(&parent, "nvault-proton")?,
         })
     }
 
@@ -373,7 +373,7 @@ mod tests {
         use std::sync::Barrier;
 
         let directory = std::env::temp_dir().join(format!(
-            "nsvault-proton-threads-{}-{}",
+            "nvault-proton-threads-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

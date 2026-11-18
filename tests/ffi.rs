@@ -4,14 +4,14 @@
 
 use std::ffi::{CString, c_char};
 
-use nsvault::ffi::{
-    NsvaultBytes, nsvault_bytes_free, nsvault_client_close, nsvault_client_open, nsvault_ensure,
-    nsvault_get, nsvault_last_error, nsvault_list, nsvault_set,
+use nvault::ffi::{
+    NsvaultBytes, nvault_bytes_free, nvault_client_close, nvault_client_open, nvault_ensure,
+    nvault_get, nvault_last_error, nvault_list, nvault_set,
 };
 
 fn temp_config(contents: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "nsvault-ffi-{}-{}.toml",
+        "nvault-ffi-{}-{}.toml",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -28,14 +28,14 @@ fn ffi_reports_errors_without_panicking() {
     let path = CString::new(path.to_string_lossy().as_bytes()).expect("path");
     let mut client = std::ptr::null_mut();
     // SAFETY: the path and output pointers satisfy the documented contract.
-    let status = unsafe { nsvault_client_open(path.as_ptr(), &mut client) };
+    let status = unsafe { nvault_client_open(path.as_ptr(), &mut client) };
     assert_eq!(status, 0);
     assert!(!client.is_null());
 
     let mut output = NsvaultBytes::default();
     // SAFETY: the client is live and the output pointer is writable.
     let status = unsafe {
-        nsvault_get(
+        nvault_get(
             client,
             std::ptr::null(),
             c"missing".as_ptr() as *const c_char,
@@ -47,14 +47,14 @@ fn ffi_reports_errors_without_panicking() {
     assert!(output.data.is_null());
 
     // SAFETY: the output pointer is writable.
-    let status = unsafe { nsvault_last_error(&mut output) };
+    let status = unsafe { nvault_last_error(&mut output) };
     assert_eq!(status, 1);
     assert!(output.len > 0);
     // SAFETY: output was produced by the library and is freed once.
-    unsafe { nsvault_bytes_free(output) };
+    unsafe { nvault_bytes_free(output) };
 
     // SAFETY: the client was opened once and is closed once.
-    unsafe { nsvault_client_close(client) };
+    unsafe { nvault_client_close(client) };
 }
 
 #[cfg(unix)]
@@ -63,7 +63,7 @@ fn ffi_null_prefix_uses_the_configured_default() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = std::env::temp_dir().join(format!(
-        "nsvault-ffi-prefix-{}-{}",
+        "nvault-ffi-prefix-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -110,33 +110,33 @@ password_file = "password"
     let mut client = std::ptr::null_mut();
     // SAFETY: the path and output pointers satisfy the documented contract.
     assert_eq!(
-        unsafe { nsvault_client_open(config.as_ptr(), &mut client) },
+        unsafe { nvault_client_open(config.as_ptr(), &mut client) },
         0
     );
 
     let mut output = NsvaultBytes::default();
     // SAFETY: the client is live; null prefix means the configured default.
-    let status = unsafe { nsvault_list(client, std::ptr::null(), std::ptr::null(), &mut output) };
+    let status = unsafe { nvault_list(client, std::ptr::null(), std::ptr::null(), &mut output) };
     assert_eq!(status, 0);
     // SAFETY: the library produced this buffer and the lengths are valid.
     let keys = unsafe { std::slice::from_raw_parts(output.data, output.len) };
     assert_eq!(keys, b"apps/prod/db\n");
     // SAFETY: output is freed exactly once.
-    unsafe { nsvault_bytes_free(output) };
+    unsafe { nvault_bytes_free(output) };
 
     let explicit = CString::new("other").expect("prefix");
     let mut output = NsvaultBytes::default();
     // SAFETY: the client is live and the explicit prefix is NUL-terminated.
-    let status = unsafe { nsvault_list(client, std::ptr::null(), explicit.as_ptr(), &mut output) };
+    let status = unsafe { nvault_list(client, std::ptr::null(), explicit.as_ptr(), &mut output) };
     assert_eq!(status, 0);
     // SAFETY: the library produced this buffer and the lengths are valid.
     let keys = unsafe { std::slice::from_raw_parts(output.data, output.len) };
     assert_eq!(keys, b"other/key\n");
     // SAFETY: output is freed exactly once.
-    unsafe { nsvault_bytes_free(output) };
+    unsafe { nvault_bytes_free(output) };
 
     // SAFETY: the client was opened once and is closed once.
-    unsafe { nsvault_client_close(client) };
+    unsafe { nvault_client_close(client) };
     std::fs::remove_dir_all(directory).expect("remove temp dir");
 }
 #[cfg(unix)]
@@ -145,7 +145,7 @@ fn ffi_writes_fail_closed_when_the_lock_directory_is_not_private() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = std::env::temp_dir().join(format!(
-        "nsvault-ffi-lock-{}-{}",
+        "nvault-ffi-lock-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -183,21 +183,21 @@ allow_http_loopback = true
         .expect("non-private lock dir");
     // SAFETY: this test binary has no other test that resolves a write lock,
     // so the process-wide override cannot race a concurrent write.
-    unsafe { std::env::set_var("NSVAULT_LOCK_DIR", &lock_dir) };
+    unsafe { std::env::set_var("NVAULT_LOCK_DIR", &lock_dir) };
 
     let config = CString::new(config.to_string_lossy().as_bytes()).expect("config path");
     let mut client = std::ptr::null_mut();
     // SAFETY: the path and output pointers satisfy the documented contract.
     assert_eq!(
-        unsafe { nsvault_client_open(config.as_ptr(), &mut client) },
+        unsafe { nvault_client_open(config.as_ptr(), &mut client) },
         0
     );
 
-    let key = CString::new("nsvault-ffi-lock").expect("key");
+    let key = CString::new("nvault-ffi-lock").expect("key");
     let value = b"must-not-land";
     // SAFETY: the client is live and the value points at readable bytes.
     let status = unsafe {
-        nsvault_set(
+        nvault_set(
             client,
             std::ptr::null(),
             key.as_ptr(),
@@ -208,7 +208,7 @@ allow_http_loopback = true
     assert_eq!(status, 1);
     let mut output = NsvaultBytes::default();
     // SAFETY: the output pointer is writable.
-    assert_eq!(unsafe { nsvault_last_error(&mut output) }, 1);
+    assert_eq!(unsafe { nvault_last_error(&mut output) }, 1);
     // SAFETY: the library produced this buffer and the lengths are valid.
     let message = unsafe { std::slice::from_raw_parts(output.data, output.len) };
     assert!(
@@ -218,12 +218,12 @@ allow_http_loopback = true
     );
     assert!(!String::from_utf8_lossy(message).contains("must-not-land"));
     // SAFETY: output was produced by the library and is freed once.
-    unsafe { nsvault_bytes_free(output) };
+    unsafe { nvault_bytes_free(output) };
 
     let mut created = 7;
     // SAFETY: the client is live and `created` is writable.
     let status = unsafe {
-        nsvault_ensure(
+        nvault_ensure(
             client,
             std::ptr::null(),
             key.as_ptr(),
@@ -236,9 +236,9 @@ allow_http_loopback = true
     assert_eq!(created, 7, "a failed ensure must not report created");
 
     // SAFETY: the client was opened once and is closed once.
-    unsafe { nsvault_client_close(client) };
+    unsafe { nvault_client_close(client) };
     // SAFETY: this test set the variable above and no other test reads it.
-    unsafe { std::env::remove_var("NSVAULT_LOCK_DIR") };
+    unsafe { std::env::remove_var("NVAULT_LOCK_DIR") };
     std::fs::remove_dir_all(directory).expect("remove temp dir");
 }
 
@@ -248,19 +248,15 @@ fn ffi_refuses_an_empty_value() {
     let path = CString::new(path.to_string_lossy().as_bytes()).expect("path");
     let mut client = std::ptr::null_mut();
     // SAFETY: the path and output pointers satisfy the documented contract.
-    assert_eq!(
-        unsafe { nsvault_client_open(path.as_ptr(), &mut client) },
-        0
-    );
+    assert_eq!(unsafe { nvault_client_open(path.as_ptr(), &mut client) }, 0);
     let key = CString::new("KEY").expect("key");
     // SAFETY: the client is live; the value pointer is null with len 0.
-    let status =
-        unsafe { nsvault_set(client, std::ptr::null(), key.as_ptr(), std::ptr::null(), 0) };
+    let status = unsafe { nvault_set(client, std::ptr::null(), key.as_ptr(), std::ptr::null(), 0) };
     assert_eq!(status, 1);
     let mut created = 7;
     // SAFETY: the client is live; the value pointer is null with len 0.
     let status = unsafe {
-        nsvault_ensure(
+        nvault_ensure(
             client,
             std::ptr::null(),
             key.as_ptr(),
@@ -272,5 +268,5 @@ fn ffi_refuses_an_empty_value() {
     assert_eq!(status, 1);
     assert_eq!(created, 7);
     // SAFETY: the client was opened once and is closed once.
-    unsafe { nsvault_client_close(client) };
+    unsafe { nvault_client_close(client) };
 }

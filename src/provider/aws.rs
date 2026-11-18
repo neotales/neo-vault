@@ -229,7 +229,7 @@ impl AwsSecretsManagerProvider {
     /// A recognized AWS Secrets Manager hostname maps to one lock per region,
     /// so the standard, FIPS, dual-stack, and China spellings of one regional
     /// service share a lock. An unrecognized custom endpoint keeps its
-    /// canonical origin, because nsvault cannot tell whether two custom names
+    /// canonical origin, because nvault cannot tell whether two custom names
     /// reach the same vault. The identity deliberately excludes the access
     /// key, secret key, session token, profile name, and config path. Two
     /// profiles for the same endpoint and region therefore share one lock even

@@ -137,7 +137,7 @@ impl GcpSecretManagerProvider {
     /// the service, so endpoint aliases share it. A custom endpoint keeps its
     /// canonical origin. The project is deliberately not an input: a project
     /// id and its numeric project number are two spellings of one project, and
-    /// nsvault cannot map one to the other locally. The token, profile name,
+    /// nvault cannot map one to the other locally. The token, profile name,
     /// and config path are also excluded.
     fn write_identity(&self) -> Result<String> {
         lock_identity(&self.base)

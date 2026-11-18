@@ -1,4 +1,4 @@
-//! Same-user advisory lock for nsvault writes on this machine, plus a
+//! Same-user advisory lock for nvault writes on this machine, plus a
 //! verified private directory for provider state that must not live in a
 //! shared or attacker-controlled location.
 //!
@@ -13,13 +13,13 @@
 //! canonical service endpoint or custom origin plus non-secret scope;
 //! recognized cloud endpoint aliases are folded onto one conservative service
 //! or vault identity, while an arbitrary custom URL alias is not detectable.
-//! Every nsvault write on this machine uses it: the CLI, the
+//! Every nvault write on this machine uses it: the CLI, the
 //! [`crate::Client`] API, and the C ABI. It serializes those writers only. It
 //! does not stop the Vault CLI, a provider UI, another host, or a different OS
 //! user; provider CAS remains the control for those writers.
 //!
 //! Coordination also assumes the writers resolve the *same* lock directory.
-//! Two nsvault processes with different `NSVAULT_LOCK_DIR` values, or different
+//! Two nvault processes with different `NVAULT_LOCK_DIR` values, or different
 //! `XDG_STATE_HOME`/`HOME` when it is unset, use different lock files even for
 //! the same provider identity and are not serialized by this mechanism.
 //!
@@ -66,7 +66,7 @@
 //! sits under a parent that other users can modify is refused. So is a lock
 //! file that is not a regular, single-link, owner-only file, or a platform
 //! where the advisory lock cannot be taken. There is no unlocked fallback and
-//! no timeout: a call can wait until the other nsvault writer exits.
+//! no timeout: a call can wait until the other nvault writer exits.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -155,7 +155,7 @@ impl PrivateDirectory {
 impl Drop for PrivateDirectory {
     fn drop(&mut self) {
         if self.remove().is_err() {
-            eprintln!("nsvault: warning: could not remove the isolated session directory");
+            eprintln!("nvault: warning: could not remove the isolated session directory");
         }
     }
 }
@@ -354,7 +354,7 @@ pub fn canonical_origin(url: &url::Url) -> Result<String> {
 /// a lock even when the kind label differs.
 #[must_use]
 pub fn identity(kind: &str, origin: &str, scope: &[&str]) -> String {
-    let mut text = String::from("nsvault-write-lock-v1");
+    let mut text = String::from("nvault-write-lock-v1");
     text.push('\0');
     text.push_str(kind);
     text.push('\0');
@@ -368,10 +368,10 @@ pub fn identity(kind: &str, origin: &str, scope: &[&str]) -> String {
 
 /// Acquires the exclusive write lock for `identity`.
 ///
-/// Blocks until this user's other nsvault process releases it. The identity
+/// Blocks until this user's other nvault process releases it. The identity
 /// is hashed into the file name and is not written into the file or the error.
 /// Writers are serialized only when they resolve the same lock directory: the
-/// same OS user and the same `NSVAULT_LOCK_DIR`, or the same
+/// same OS user and the same `NVAULT_LOCK_DIR`, or the same
 /// `XDG_STATE_HOME`/`HOME` when it is unset.
 ///
 /// # Errors
@@ -413,18 +413,18 @@ fn acquire_unix(identity: &str) -> Result<WriteGuard> {
 /// Returns the lock directory and whether its missing parents may be created.
 ///
 /// Only the default location may create parents. An explicitly configured
-/// `NSVAULT_LOCK_DIR` must be absolute and have an existing parent; its parent
+/// `NVAULT_LOCK_DIR` must be absolute and have an existing parent; its parent
 /// chain is not created, so a stale or mistyped path fails instead of creating
 /// directories. Relative paths are rejected: a walk from the working directory
 /// could not validate the directories above it.
 fn lock_spec() -> Result<(PathBuf, bool)> {
-    if let Some(dir) = std::env::var_os("NSVAULT_LOCK_DIR") {
+    if let Some(dir) = std::env::var_os("NVAULT_LOCK_DIR") {
         if dir.is_empty() {
-            return Err(Error::new("NSVAULT_LOCK_DIR is empty"));
+            return Err(Error::new("NVAULT_LOCK_DIR is empty"));
         }
         let path = PathBuf::from(dir);
         if !path.is_absolute() {
-            return Err(Error::new("NSVAULT_LOCK_DIR must be an absolute path"));
+            return Err(Error::new("NVAULT_LOCK_DIR must be an absolute path"));
         }
         return Ok((path, false));
     }
@@ -451,7 +451,7 @@ fn lock_spec() -> Result<(PathBuf, bool)> {
             home.join(".local/state")
         }
     };
-    Ok((state.join("nsvault/locks"), true))
+    Ok((state.join("nvault/locks"), true))
 }
 
 /// A resolved, verified lock directory.
@@ -884,7 +884,7 @@ mod tests {
     #[cfg(unix)]
     fn scratch_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "nsvault-lock-unit-{}-{}-{name}",
+            "nvault-lock-unit-{}-{}-{name}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1221,11 +1221,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let base = scratch_dir("create-parents");
-        let target = base.join("state/nsvault/locks");
+        let target = base.join("state/nvault/locks");
         let directory = LockDirectory::open(&target, true).expect("create lock path");
         for path in [
             base.join("state"),
-            base.join("state/nsvault"),
+            base.join("state/nvault"),
             target.clone(),
         ] {
             let mode = std::fs::metadata(&path)

@@ -11,7 +11,7 @@ cleanup or remove unrelated containers, volumes, networks, or images.
 
 - image: `hashicorp/vault:1.21.4`
 - command: `vault server -dev -dev-listen-address=0.0.0.0:8200`
-- dummy root token: `nsvault-test-root-token` (not a real credential)
+- dummy root token: `nvault-test-root-token` (not a real credential)
 - only its own mapped port and container
 
 The test covers the security fixes directly: after writing `value` and a
@@ -139,7 +139,7 @@ Notes:
 - image: `vaultwarden/server:1.37.5`
 - `SIGNUPS_ALLOWED=true`, `I_REALLY_WANT_VOLATILE_STORAGE=true`,
   `WEB_VAULT_ENABLED=false`, only its own mapped port
-- a pinned `@bitwarden/cli` supplied through `NSVAULT_TEST_BW`
+- a pinned `@bitwarden/cli` supplied through `NVAULT_TEST_BW`
 
 The test creates a throwaway account inside the container through the
 documented registration flow (`/identity/accounts/register/send-verification-email`,
@@ -170,11 +170,11 @@ asserts that no lookup or write is attempted and no value leaks.
 Run it explicitly:
 
 ```sh
-NSVAULT_TEST_BW=/path/to/pinned/bw \
+NVAULT_TEST_BW=/path/to/pinned/bw \
   cargo test --test container_vaultwarden -- --ignored --nocapture
 ```
 
-Observed in this workspace on 2026-11-17, with `NSVAULT_TEST_BW` pointing at
+Observed in this workspace on 2026-11-17, with `NVAULT_TEST_BW` pointing at
 `@bitwarden/cli` 2025.6.1:
 
 ```text

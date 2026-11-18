@@ -17,7 +17,7 @@ use base64::Engine;
 use serde_json::{Map, Value, json};
 
 fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_nsvault")
+    env!("CARGO_BIN_EXE_nvault")
 }
 
 fn run(
@@ -27,7 +27,7 @@ fn run(
     stdin: Option<&[u8]>,
 ) -> Output {
     let mut command = Command::new(binary());
-    let lock_dir = std::env::temp_dir().join(format!("nsvault-locks-{}", std::process::id()));
+    let lock_dir = std::env::temp_dir().join(format!("nvault-locks-{}", std::process::id()));
     std::fs::create_dir_all(&lock_dir).expect("lock dir");
     #[cfg(unix)]
     {
@@ -38,12 +38,12 @@ fn run(
     command
         .args(arguments)
         .current_dir(directory)
-        .env("NSVAULT_LOCK_DIR", &lock_dir)
+        .env("NVAULT_LOCK_DIR", &lock_dir)
         .envs(environment.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn nsvault");
+    let mut child = command.spawn().expect("spawn nvault");
     if let Some(bytes) = stdin {
         child
             .stdin
@@ -53,7 +53,7 @@ fn run(
             .expect("write stdin");
     }
     drop(child.stdin.take());
-    child.wait_with_output().expect("wait for nsvault")
+    child.wait_with_output().expect("wait for nvault")
 }
 
 fn run_with_stdin_file(
@@ -71,7 +71,7 @@ fn run_with_stdin_file(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("run nsvault with stdin file")
+        .expect("run nvault with stdin file")
 }
 
 fn stdout(output: &Output) -> String {
@@ -237,7 +237,7 @@ fn simple_response(status: &str, body: &str) -> String {
 
 fn vault_config(directory: &Path, port: u16) {
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "v"
@@ -303,7 +303,7 @@ fn lists_reads_writes_and_injects_through_the_cli() {
     let exports = run(&directory, &["env", "--shell", "bash"], &environment, None);
     assert!(exports.status.success(), "{}", stderr(&exports));
     assert!(stdout(&exports).contains("export DB='s3cr3t'"));
-    assert!(stdout(&exports).contains("NSVAULT_LOADED_KEYS='DB'"));
+    assert!(stdout(&exports).contains("NVAULT_LOADED_KEYS='DB'"));
 }
 
 #[derive(Default)]
@@ -1147,11 +1147,11 @@ fn completion_and_hooks_work_without_a_configuration() {
     let directory = tempfile_dir();
     let completion = run(&directory, &["completion", "bash"], &[], None);
     assert!(completion.status.success(), "{}", stderr(&completion));
-    assert!(stdout(&completion).contains("nsvault"));
+    assert!(stdout(&completion).contains("nvault"));
 
     let hook = run(&directory, &["hook", "zsh"], &[], None);
     assert!(hook.status.success(), "{}", stderr(&hook));
-    assert!(stdout(&hook).contains("NSVAULT_AUTOLOAD"));
+    assert!(stdout(&hook).contains("NVAULT_AUTOLOAD"));
 
     let dir = run(&directory, &["dir"], &[], None);
     assert!(dir.status.success());
@@ -1176,7 +1176,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "v"
@@ -1244,7 +1244,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "p"
@@ -1302,7 +1302,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "p"
@@ -1344,7 +1344,7 @@ token_env = "PROTON_TEST_PAT"
     assert!(!session.is_empty());
     assert!(sessions.iter().all(|recorded| *recorded == session));
     assert_ne!(session, ambient.to_str().expect("ambient path"));
-    assert!(session.contains("nsvault-proton-"));
+    assert!(session.contains("nvault-proton-"));
     assert!(
         !Path::new(session).exists(),
         "isolated session directory was not removed"
@@ -1384,7 +1384,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "p"
@@ -1435,7 +1435,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "p"
@@ -1491,7 +1491,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "p"
@@ -1555,7 +1555,7 @@ exit 0
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "p"
@@ -1703,7 +1703,7 @@ esac
         .expect("database mode");
     }
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "k"
@@ -1741,7 +1741,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "k"
@@ -1769,7 +1769,7 @@ fn keepass_fixture_serializes_concurrent_writers() {
     let directory = tempfile_dir();
     let script = keepass_overlap_script(&directory);
     std::fs::write(directory.join("test.kdbx"), b"not-a-real-database").expect("database fixture");
-    keepass_config(&directory, ".nsvault.toml", "test.kdbx", &script);
+    keepass_config(&directory, ".nvault.toml", "test.kdbx", &script);
     let lock_dir = keepass_lock_dir();
 
     let first = spawn_keepass_set(&directory, None, &lock_dir, b"one-value\n");
@@ -1836,7 +1836,7 @@ password_env = "KP_PW"
 }
 
 fn keepass_lock_dir() -> std::path::PathBuf {
-    let lock_dir = std::env::temp_dir().join(format!("nsvault-locks-{}", std::process::id()));
+    let lock_dir = std::env::temp_dir().join(format!("nvault-locks-{}", std::process::id()));
     std::fs::create_dir_all(&lock_dir).expect("lock dir");
     #[cfg(unix)]
     {
@@ -1860,12 +1860,12 @@ fn spawn_keepass_set(
     command
         .args(["set", "Entry"])
         .current_dir(directory)
-        .env("NSVAULT_LOCK_DIR", lock_dir)
+        .env("NVAULT_LOCK_DIR", lock_dir)
         .env("KP_PW", "not-a-real-password")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn nsvault");
+    let mut child = command.spawn().expect("spawn nvault");
     child
         .stdin
         .as_mut()
@@ -1893,7 +1893,7 @@ fn assert_keepass_writers_serialized(
 
 fn infisical_config(directory: &Path, port: u16) {
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "i"
@@ -2079,8 +2079,8 @@ fn two_profiles_do_not_overlap_writes_to_the_same_vault() {
     let beta = tempfile_dir();
     vault_config(&alpha, port);
     std::fs::write(
-        beta.join(".nsvault.toml"),
-        std::fs::read_to_string(alpha.join(".nsvault.toml"))
+        beta.join(".nvault.toml"),
+        std::fs::read_to_string(alpha.join(".nvault.toml"))
             .expect("read config")
             .replace("provider = \"v\"", "provider = \"other\"")
             .replace("[providers.v]", "[providers.other]"),
@@ -2097,7 +2097,7 @@ fn two_profiles_do_not_overlap_writes_to_the_same_vault() {
             &["set", "apps/prod/db"],
             &[
                 ("TEST_VAULT_TOKEN", "test-token"),
-                ("NSVAULT_LOCK_DIR", lock_for_first.as_str()),
+                ("NVAULT_LOCK_DIR", lock_for_first.as_str()),
             ],
             Some(b"from-alpha\n"),
         )
@@ -2117,7 +2117,7 @@ fn two_profiles_do_not_overlap_writes_to_the_same_vault() {
             &["set", "apps/prod/db"],
             &[
                 ("TEST_VAULT_TOKEN", "test-token"),
-                ("NSVAULT_LOCK_DIR", lock_for_second.as_str()),
+                ("NVAULT_LOCK_DIR", lock_for_second.as_str()),
             ],
             Some(b"from-beta\n"),
         )
@@ -2126,7 +2126,7 @@ fn two_profiles_do_not_overlap_writes_to_the_same_vault() {
     assert_eq!(
         in_flight.load(Ordering::SeqCst),
         1,
-        "second nsvault process reached the provider while the first write was held"
+        "second nvault process reached the provider while the first write was held"
     );
     release.store(true, Ordering::SeqCst);
     let first = first.join().expect("first thread");
@@ -2160,7 +2160,7 @@ fn aws_config(
         }
     }
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "{provider_name}"
@@ -2179,7 +2179,7 @@ allow_http_loopback = true
 
 fn gcp_config(directory: &Path, port: u16, project: &str, provider_name: &str) {
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "{provider_name}"
@@ -2256,8 +2256,8 @@ fn two_cloud_profiles_share_one_write_lock_across_processes() {
     let first = thread::spawn(move || {
         run(
             &alpha_dir,
-            &["set", "nsvault-lock-aws"],
-            &[("NSVAULT_LOCK_DIR", lock_for_first.as_str())],
+            &["set", "nvault-lock-aws"],
+            &[("NVAULT_LOCK_DIR", lock_for_first.as_str())],
             Some(b"from-alpha\n"),
         )
     });
@@ -2273,8 +2273,8 @@ fn two_cloud_profiles_share_one_write_lock_across_processes() {
     let second = thread::spawn(move || {
         run(
             &beta_dir,
-            &["set", "nsvault-lock-aws"],
-            &[("NSVAULT_LOCK_DIR", lock_for_second.as_str())],
+            &["set", "nvault-lock-aws"],
+            &[("NVAULT_LOCK_DIR", lock_for_second.as_str())],
             Some(b"from-beta\n"),
         )
     });
@@ -2356,8 +2356,8 @@ fn gcp_project_id_and_number_share_one_write_lock_across_processes() {
     let first = thread::spawn(move || {
         run(
             &alpha_dir,
-            &["set", "nsvault-lock-gcp"],
-            &[("NSVAULT_LOCK_DIR", lock_for_first.as_str())],
+            &["set", "nvault-lock-gcp"],
+            &[("NVAULT_LOCK_DIR", lock_for_first.as_str())],
             Some(b"from-alpha\n"),
         )
     });
@@ -2373,8 +2373,8 @@ fn gcp_project_id_and_number_share_one_write_lock_across_processes() {
     let second = thread::spawn(move || {
         run(
             &beta_dir,
-            &["set", "nsvault-lock-gcp"],
-            &[("NSVAULT_LOCK_DIR", lock_for_second.as_str())],
+            &["set", "nvault-lock-gcp"],
+            &[("NVAULT_LOCK_DIR", lock_for_second.as_str())],
             Some(b"from-beta\n"),
         )
     });
@@ -2409,7 +2409,7 @@ fn cloud_writes_fail_closed_when_the_lock_directory_is_not_private() {
     aws_config(&aws, fixture.port, "", "aws", "test", "test");
     let gcp = tempfile_dir();
     std::fs::write(
-        gcp.join(".nsvault.toml"),
+        gcp.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "gcp"
@@ -2433,7 +2433,7 @@ allow_http_loopback = true
             .expect("Azure token mode");
     }
     std::fs::write(
-        azure.join(".nsvault.toml"),
+        azure.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "azure"
@@ -2456,8 +2456,8 @@ allow_http_loopback = true
     ] {
         let output = run(
             directory,
-            &[command, "nsvault-lock-refused"],
-            &[("NSVAULT_LOCK_DIR", lock_dir.as_str())],
+            &[command, "nvault-lock-refused"],
+            &[("NVAULT_LOCK_DIR", lock_dir.as_str())],
             Some(b"must-not-land\n"),
         );
         assert!(!output.status.success(), "{command} must fail closed");
@@ -2484,7 +2484,7 @@ fn write_lock_rejects_a_relative_directory() {
         &["set", "apps/prod/db"],
         &[
             ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", "nsvault-relative-locks"),
+            ("NVAULT_LOCK_DIR", "nvault-relative-locks"),
         ],
         Some(b"must-not-land\n"),
     );
@@ -2493,7 +2493,7 @@ fn write_lock_rejects_a_relative_directory() {
     assert!(!stderr(&set).contains("must-not-land"));
     assert!(fixture.requests().is_empty());
     assert!(
-        !directory.join("nsvault-relative-locks").exists(),
+        !directory.join("nvault-relative-locks").exists(),
         "a relative lock path must not be created in the working directory"
     );
 }
@@ -2527,7 +2527,7 @@ fn write_lock_refuses_a_non_private_directory_without_changing_it() {
         &["set", "apps/prod/db"],
         &[
             ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+            ("NVAULT_LOCK_DIR", lock_dir.as_str()),
         ],
         Some(b"must-not-land\n"),
     );
@@ -2570,7 +2570,7 @@ fn write_lock_rejects_a_symlinked_directory() {
         &["set", "apps/prod/db"],
         &[
             ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", link.as_str()),
+            ("NVAULT_LOCK_DIR", link.as_str()),
         ],
         Some(b"must-not-land\n"),
     );
@@ -2612,7 +2612,7 @@ fn write_lock_rejects_a_symlinked_parent() {
         &["set", "apps/prod/db"],
         &[
             ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+            ("NVAULT_LOCK_DIR", lock_dir.as_str()),
         ],
         Some(b"must-not-land\n"),
     );
@@ -2641,7 +2641,7 @@ fn write_lock_creates_a_missing_private_directory() {
         &["set", "apps/prod/db"],
         &[
             ("TEST_VAULT_TOKEN", "test-token"),
-            ("NSVAULT_LOCK_DIR", lock_dir.as_str()),
+            ("NVAULT_LOCK_DIR", lock_dir.as_str()),
         ],
         Some(b"new-value\n"),
     );
@@ -2787,7 +2787,7 @@ fn infisical_fixture_sends_bearer_auth_and_writes() {
     let fixture = InfisicalFixture::start();
     let directory = tempfile_dir();
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "i"
@@ -2904,7 +2904,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "v"
@@ -2969,7 +2969,7 @@ esac
     .expect("write fixture");
     make_executable(&script);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "v"
@@ -3079,7 +3079,7 @@ esac
         .expect("write fixture");
         make_executable(&script);
         std::fs::write(
-            directory.join(".nsvault.toml"),
+            directory.join(".nvault.toml"),
             format!(
                 r#"version = 1
 provider = "v"
@@ -3146,7 +3146,7 @@ session_env = "BW_SESSION"
 
 fn tempfile_dir() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "nsvault-test-{}-{}",
+        "nvault-test-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

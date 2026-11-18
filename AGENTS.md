@@ -18,7 +18,7 @@ Opt-in container tests (require Docker and do not run by default):
 ```sh
 cargo test --test container_vault -- --ignored --nocapture
 cargo test --test container_infisical -- --ignored --nocapture
-NSVAULT_TEST_BW=/path/to/pinned/bw \
+NVAULT_TEST_BW=/path/to/pinned/bw \
   cargo test --test container_vaultwarden -- --ignored --nocapture
 ```
 
@@ -29,9 +29,9 @@ The C ABI check is:
 
 ```sh
 cargo build --release --lib
-cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
-   -Wl,-rpath,"$PWD/target/release" -o /tmp/nsvault-ffi-smoke
-/tmp/nsvault-ffi-smoke
+cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnvault \
+   -Wl,-rpath,"$PWD/target/release" -o /tmp/nvault-ffi-smoke
+/tmp/nvault-ffi-smoke
 ```
 
 ## Rules
@@ -58,6 +58,6 @@ cc examples/ffi_smoke.c -Iinclude -Ltarget/release -lnsvault \
 - `src/config.rs` — TOML/YAML discovery, validation, no literal credentials.
 - `src/provider/` — adapters and the provider boundary.
 - `src/api.rs` — reusable Rust `Client`.
-- `src/ffi.rs`, `include/nsvault.h` — conservative C ABI.
+- `src/ffi.rs`, `include/nvault.h` — conservative C ABI.
 - `src/shell.rs` — quoting, exports, directory hooks.
 - `tests/cli.rs` — end-to-end CLI tests against loopback and process fixtures.

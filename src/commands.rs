@@ -18,7 +18,7 @@ pub fn run(cli: Cli) -> u8 {
     match dispatch(cli) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("nsvault: {error}");
+            eprintln!("nvault: {error}");
             1
         }
     }
@@ -29,7 +29,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
     match cli.command {
         Command::Completion { shell } => {
             let mut command = <Cli as clap::CommandFactory>::command();
-            clap_complete::generate(shell, &mut command, "nsvault", &mut io::stdout());
+            clap_complete::generate(shell, &mut command, "nvault", &mut io::stdout());
             Ok(0)
         }
         Command::Hook { shell } => {
@@ -102,7 +102,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             }
             let secret = read_secret(stdin)?;
             selected.provider.set(&key, &secret)?;
-            eprintln!("nsvault: stored {key}");
+            eprintln!("nvault: stored {key}");
             Ok(0)
         }
         Command::Ensure {
@@ -126,7 +126,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             if json {
                 println!(r#"{{"status":"{label}"}}"#);
             }
-            eprintln!("nsvault: {label} {key}");
+            eprintln!("nvault: {label} {key}");
             Ok(0)
         }
         Command::Search { query, limit, json } => {
@@ -210,7 +210,7 @@ fn load_optional(explicit: &Option<PathBuf>) -> Result<Option<Config>> {
 fn require_config(config: Option<Config>) -> Result<Config> {
     config.ok_or_else(|| {
         Error::new(
-            "no .nsvault.toml found; create one or pass --config (completion, hook, and dir work without one)",
+            "no .nvault.toml found; create one or pass --config (completion, hook, and dir work without one)",
         )
     })
 }

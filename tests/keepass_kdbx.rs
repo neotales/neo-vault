@@ -8,7 +8,7 @@
 //! cargo test --test keepass_kdbx -- --ignored --nocapture
 //! ```
 //!
-//! It requires `keepassxc-cli` on `PATH` or `NSVAULT_TEST_KEEPASSXC` set to an
+//! It requires `keepassxc-cli` on `PATH` or `NVAULT_TEST_KEEPASSXC` set to an
 //! absolute path. The database, its password, and every entry value are
 //! throwaway fixtures created in a private temporary directory. No existing
 //! vault is opened.
@@ -29,7 +29,7 @@ fn scratch_dir() -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let path = std::env::temp_dir().join(format!(
-        "nsvault-keepass-kdbx-{}-{}",
+        "nvault-keepass-kdbx-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -42,7 +42,7 @@ fn scratch_dir() -> PathBuf {
 }
 
 fn keepass_cli() -> PathBuf {
-    if let Some(value) = std::env::var_os("NSVAULT_TEST_KEEPASSXC") {
+    if let Some(value) = std::env::var_os("NVAULT_TEST_KEEPASSXC") {
         return PathBuf::from(value);
     }
     let path = std::env::var_os("PATH").expect("PATH is set");
@@ -52,7 +52,7 @@ fn keepass_cli() -> PathBuf {
             return candidate;
         }
     }
-    panic!("keepassxc-cli was not found; set NSVAULT_TEST_KEEPASSXC to its absolute path");
+    panic!("keepassxc-cli was not found; set NVAULT_TEST_KEEPASSXC to its absolute path");
 }
 
 fn run_cli(real: &Path, arguments: &[&str], stdin: Option<&str>) -> Output {
@@ -75,32 +75,32 @@ fn run_cli(real: &Path, arguments: &[&str], stdin: Option<&str>) -> Output {
     child.wait_with_output().expect("wait for keepassxc-cli")
 }
 
-fn run_nsvault(directory: &Path, arguments: &[&str], stdin: Option<&[u8]>, real: &Path) -> Output {
+fn run_nvault(directory: &Path, arguments: &[&str], stdin: Option<&[u8]>, real: &Path) -> Output {
     let lock_dir = directory.join("locks");
     std::fs::create_dir_all(&lock_dir).expect("lock dir");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o700)).expect("lock mode");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_nsvault"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nvault"));
     command
         .args(arguments)
         .current_dir(directory)
         .env("KP_TEST_PASSWORD", DATABASE_PASSWORD)
-        .env("NSVAULT_LOCK_DIR", &lock_dir)
-        .env("NSVAULT_TEST_KEEPASS_REAL", real)
+        .env("NVAULT_LOCK_DIR", &lock_dir)
+        .env("NVAULT_TEST_KEEPASS_REAL", real)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn nsvault");
+    let mut child = command.spawn().expect("spawn nvault");
     if let Some(stdin) = stdin {
         child
             .stdin
             .as_mut()
             .expect("stdin")
             .write_all(stdin)
-            .expect("write nsvault stdin");
+            .expect("write nvault stdin");
     }
     drop(child.stdin.take());
-    child.wait_with_output().expect("wait for nsvault")
+    child.wait_with_output().expect("wait for nvault")
 }
 
 fn show(real: &Path, database: &Path, field: &str, entry: &str) -> String {
@@ -127,7 +127,7 @@ fn wrapper(directory: &Path) -> PathBuf {
         &path,
         r#"#!/bin/sh
 printf '<%s>\n' "$@" >> "$(dirname "$0")/argv.log"
-exec "$NSVAULT_TEST_KEEPASS_REAL" "$@"
+exec "$NVAULT_TEST_KEEPASS_REAL" "$@"
 "#,
     )
     .expect("write wrapper");
@@ -191,7 +191,7 @@ fn generated_kdbx_round_trip_preserves_fields_and_refuses_ensure() {
 
     let command = wrapper(&directory);
     std::fs::write(
-        directory.join(".nsvault.toml"),
+        directory.join(".nvault.toml"),
         format!(
             r#"version = 1
 provider = "k"
@@ -206,7 +206,7 @@ password_env = "KP_TEST_PASSWORD"
     )
     .expect("write config");
 
-    let read = run_nsvault(&directory, &["get", "Group/DB"], None, &real);
+    let read = run_nvault(&directory, &["get", "Group/DB"], None, &real);
     assert!(
         read.status.success(),
         "{}",
@@ -214,7 +214,7 @@ password_env = "KP_TEST_PASSWORD"
     );
     assert_eq!(String::from_utf8_lossy(&read.stdout), INITIAL_VALUE);
 
-    let updated = run_nsvault(
+    let updated = run_nvault(
         &directory,
         &["set", "Group/DB"],
         Some(b"replacement-secret-value\n"),
@@ -238,7 +238,7 @@ password_env = "KP_TEST_PASSWORD"
     assert_eq!(show(&real, &database, "Notes", "Group/DB"), "keep-me");
 
     let argv_before_ensure = std::fs::read_to_string(directory.join("argv.log")).expect("argv log");
-    let refused_ensure = run_nsvault(&directory, &["ensure", "Group/DB"], None, &real);
+    let refused_ensure = run_nvault(&directory, &["ensure", "Group/DB"], None, &real);
     assert!(!refused_ensure.status.success());
     assert!(
         String::from_utf8_lossy(&refused_ensure.stderr).contains("does not support ensure"),
@@ -255,7 +255,7 @@ password_env = "KP_TEST_PASSWORD"
         "a refused ensure must not invoke keepassxc-cli"
     );
 
-    let added = run_nsvault(
+    let added = run_nvault(
         &directory,
         &["set", "Group/Second"],
         Some(b"second-secret-value\n"),
@@ -271,7 +271,7 @@ password_env = "KP_TEST_PASSWORD"
         "second-secret-value"
     );
 
-    let refused = run_nsvault(
+    let refused = run_nvault(
         &directory,
         &["set", "Group/DB#UserName"],
         Some(b"must-not-be-written\n"),
@@ -285,7 +285,7 @@ password_env = "KP_TEST_PASSWORD"
     );
     assert_eq!(show(&real, &database, "UserName", "Group/DB"), "alice");
 
-    let missing_group = run_nsvault(
+    let missing_group = run_nvault(
         &directory,
         &["set", "Missing/Entry"],
         Some(b"must-not-be-written\n"),
@@ -298,7 +298,7 @@ password_env = "KP_TEST_PASSWORD"
         String::from_utf8_lossy(&missing_group.stderr)
     );
 
-    let multiline = run_nsvault(
+    let multiline = run_nvault(
         &directory,
         &["set", "Group/DB"],
         Some(b"has\nnewline"),
@@ -318,17 +318,17 @@ password_env = "KP_TEST_PASSWORD"
     let mut children = Vec::new();
     for index in 0..4 {
         let lock_dir = directory.join("locks");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_nsvault"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_nvault"))
             .args(["set", &format!("Group/Concurrent{index}")])
             .current_dir(&directory)
             .env("KP_TEST_PASSWORD", DATABASE_PASSWORD)
-            .env("NSVAULT_LOCK_DIR", &lock_dir)
-            .env("NSVAULT_TEST_KEEPASS_REAL", &real)
+            .env("NVAULT_LOCK_DIR", &lock_dir)
+            .env("NVAULT_TEST_KEEPASS_REAL", &real)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn concurrent nsvault");
+            .expect("spawn concurrent nvault");
         child
             .stdin
             .as_mut()

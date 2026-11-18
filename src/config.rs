@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 
 /// Directory-scoped configuration names, in precedence order.
-pub const CONFIG_NAMES: &[&str] = &[".nsvault.toml", ".nsvault.yaml", ".nsvault.yml"];
+pub const CONFIG_NAMES: &[&str] = &[".nvault.toml", ".nvault.yaml", ".nvault.yml"];
 
 /// User-scoped configuration names, in precedence order.
 pub const USER_CONFIG_NAMES: &[&str] = &["config.toml", "config.yaml", "config.yml"];
@@ -429,10 +429,10 @@ impl Config {
     /// Discovers a configuration from the current directory upwards, then from
     /// the user configuration directory.
     ///
-    /// `NSVAULT_CONFIG`, when set, wins and may point at a file or a directory.
+    /// `NVAULT_CONFIG`, when set, wins and may point at a file or a directory.
     #[must_use]
     pub fn discover(start: &Path) -> Option<PathBuf> {
-        if let Some(explicit) = std::env::var_os("NSVAULT_CONFIG") {
+        if let Some(explicit) = std::env::var_os("NVAULT_CONFIG") {
             let path = PathBuf::from(explicit);
             if path.is_dir() {
                 return first_existing(&path, CONFIG_NAMES)
@@ -448,7 +448,7 @@ impl Config {
         let config_home = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-        first_existing(&config_home.join("nsvault"), USER_CONFIG_NAMES)
+        first_existing(&config_home.join("nvault"), USER_CONFIG_NAMES)
     }
 
     fn validate(&self) -> Result<()> {
@@ -758,7 +758,7 @@ address = "http://vault.example"
     #[test]
     fn loads_yaml_configuration() {
         let path = std::env::temp_dir().join(format!(
-            "nsvault-config-{}-{}.yaml",
+            "nvault-config-{}-{}.yaml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

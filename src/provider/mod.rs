@@ -173,7 +173,7 @@ pub fn select(config: &Config, requested: Option<&str>) -> Result<SelectedProvid
                 .expect("one provider"),
             None => {
                 return Err(Error::new(
-                    "no provider selected: set `provider` in .nsvault.toml or pass --provider",
+                    "no provider selected: set `provider` in .nvault.toml or pass --provider",
                 ));
             }
         },
@@ -470,7 +470,7 @@ impl HttpClient {
                     .agent
                     .get(url.as_str())
                     .header("Accept", "application/json")
-                    .header("User-Agent", concat!("nsvault/", env!("CARGO_PKG_VERSION")));
+                    .header("User-Agent", concat!("nvault/", env!("CARGO_PKG_VERSION")));
                 if let Some((name, token)) = token {
                     request = request.header(name, token);
                 }
@@ -484,7 +484,7 @@ impl HttpClient {
                     .agent
                     .delete(url.as_str())
                     .header("Accept", "application/json")
-                    .header("User-Agent", concat!("nsvault/", env!("CARGO_PKG_VERSION")));
+                    .header("User-Agent", concat!("nvault/", env!("CARGO_PKG_VERSION")));
                 if let Some((name, token)) = token {
                     request = request.header(name, token);
                 }
@@ -501,7 +501,7 @@ impl HttpClient {
                 };
                 let mut request = request
                     .header("Accept", "application/json")
-                    .header("User-Agent", concat!("nsvault/", env!("CARGO_PKG_VERSION")))
+                    .header("User-Agent", concat!("nvault/", env!("CARGO_PKG_VERSION")))
                     .header("Content-Type", content_type);
                 if let Some((name, token)) = token {
                     request = request.header(name, token);
@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn credential_file_rejects_content_over_the_bound() {
         let path = std::env::temp_dir().join(format!(
-            "nsvault-large-credential-{}-{}.token",
+            "nvault-large-credential-{}-{}.token",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -615,7 +615,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let path = std::env::temp_dir().join(format!(
-            "nsvault-credential-{}-{}.token",
+            "nvault-credential-{}-{}.token",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

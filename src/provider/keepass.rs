@@ -12,7 +12,7 @@
 //! only the password and leaves every other field of the entry intact.
 //!
 //! `set` holds one same-user advisory lock shared by every KeePass write on
-//! this machine, so cooperating nsvault processes do not overlap a
+//! this machine, so cooperating nvault processes do not overlap a
 //! read-modify-write of any KDBX file. The lock is deliberately coarser than a
 //! database: two hard links to one KDBX have different paths, and
 //! `keepassxc-cli` may replace the file, so a path or inode identity would let
@@ -408,7 +408,7 @@ impl Provider for KeepassProvider {
     /// An existing entry is edited, which leaves its username, URL, notes,
     /// custom attributes, tags, and UUID untouched. A new entry is added only
     /// when its parent group already exists. The same-user lock is held across
-    /// the listing and the write, so cooperating nsvault processes cannot
+    /// the listing and the write, so cooperating nvault processes cannot
     /// interleave. `keepassxc-cli` has no conditional write, so an external
     /// process (the KeePassXC GUI, another tool, another host) is not
     /// coordinated.
@@ -516,7 +516,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = std::env::temp_dir().join(format!(
-            "nsvault-keepass-unit-{}-{}-{name}",
+            "nvault-keepass-unit-{}-{}-{name}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
