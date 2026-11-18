@@ -97,7 +97,7 @@ fn dispatch(cli: Cli) -> Result<u8> {
             let config = require_config(config)?;
             let selected = provider::select(&config, cli.provider.as_deref())?;
             let key = apply_field(&key, field.as_deref())?;
-            if !selected.provider.capabilities().write {
+            if !selected.provider.can_create() {
                 return Err(crate::error::unsupported("set", &selected.name));
             }
             let secret = read_secret(stdin)?;
@@ -365,7 +365,10 @@ fn list_providers(config: &Config) {
         } else {
             " (command unavailable)"
         };
-        println!("{name}\t{kind}\tread={read}\twrite={write}\tensure={ensure}{marker}");
+        let create = write || matches!(profile, ProviderConfig::Proton(_));
+        println!(
+            "{name}\t{kind}\tread={read}\twrite={write}\tensure={ensure}\tcreate={create}{marker}"
+        );
     }
 }
 

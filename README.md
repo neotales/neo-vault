@@ -235,7 +235,11 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   writers share a conservative lock, but the list-then-create check is **not
   atomic** against other clients, users, hosts, or differently configured lock
   directories; concurrent creation can produce duplicate titles. `ensure` is
-  unsupported. This uses the separately installed CLI, not its GPL library.
+  unsupported. A failed create process has an indeterminate outcome: the item
+  may exist, so inspect the vault before retrying. `providers` reports
+  `write=false` (no overwrite) and `create=true`; Rust callers can use
+  `Client::capabilities` and `Client::can_create`. This uses the separately
+  installed CLI, not its GPL library.
 - Proton listings are not a metadata-only fetch. In `pass-cli` 2.7.1,
   `item list --output json` downloads and decrypts every `Item` before
   serializing an `ItemSummary` without content. The adapter keeps only titles
