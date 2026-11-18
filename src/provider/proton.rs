@@ -122,7 +122,14 @@ impl ProtonProvider {
         let token = match (&config.token_env, &config.token_file) {
             (Some(variable), _) => Some(crate::provider::credential_from_env(variable)?),
             (None, Some(path)) => Some(crate::provider::credential_from_file(&root.join(path))?),
-            (None, None) => None,
+            (None, None) => {
+                if std::env::var_os("PROTON_PASS_PERSONAL_ACCESS_TOKEN").is_some() {
+                    return Err(Error::new(
+                        "PROTON_PASS_PERSONAL_ACCESS_TOKEN is present but not configured; set token_env to use it, or unset it to use an existing session",
+                    ));
+                }
+                None
+            }
         };
         Ok(Self {
             name: name.to_owned(),
@@ -401,7 +408,6 @@ mod tests {
     #[test]
     fn programmatic_none_disables_ambient_token() {
         use crate::config::ProtonConfig;
-        use crate::provider::Provider;
         use std::os::unix::fs::PermissionsExt;
         if let Some(script) = std::env::var_os("NVAULT_TEST_PROTON_SCRIPT") {
             let config = ProtonConfig {
@@ -411,9 +417,9 @@ mod tests {
                 token_file: None,
                 reason: None,
             };
-            let provider =
-                ProtonProvider::new("p", &config, std::path::Path::new(".")).expect("provider");
-            assert!(provider.list("").expect("session listing").is_empty());
+            let error = ProtonProvider::new("p", &config, std::path::Path::new("."))
+                .expect_err("ambient token must fail closed");
+            assert!(error.message().contains("token_env"));
             return;
         }
         let directory =

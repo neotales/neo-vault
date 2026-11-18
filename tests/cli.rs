@@ -1575,6 +1575,37 @@ fn proton_explicit_default_token_missing_fails_closed() {
 }
 
 #[test]
+fn proton_ambient_token_without_source_fails_before_invoking_cli() {
+    let directory = tempfile_dir();
+    let script = directory.join("pass-cli");
+    let trace = directory.join("trace");
+    std::fs::write(&script, "#!/bin/sh\nprintf invoked > \"$TRACE\"\n").expect("fixture");
+    make_executable(&script);
+    std::fs::write(
+        directory.join(".nvault.toml"),
+        format!(
+            "version = 1\nprovider = \"p\"\n[providers.p]\nkind = \"proton\"\ncommand = {:?}\n",
+            script.display().to_string()
+        ),
+    )
+    .expect("config");
+    let result = run(
+        &directory,
+        &["ls"],
+        &[
+            ("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-ambient-token"),
+            ("PROTON_PASS_SESSION_DIR", directory.to_str().expect("path")),
+            ("TRACE", trace.to_str().expect("path")),
+        ],
+        None,
+    );
+    assert!(!result.status.success());
+    assert!(!trace.exists());
+    assert!(!stderr(&result).contains("fake-ambient-token"));
+    assert!(stderr(&result).contains("token_env"));
+}
+
+#[test]
 fn proton_yaml_null_disables_ambient_token() {
     let directory = tempfile_dir();
     let script = directory.join("pass-cli");
@@ -1589,7 +1620,8 @@ fn proton_yaml_null_disables_ambient_token() {
         &[("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-token")],
         None,
     );
-    assert!(result.status.success(), "{}", stderr(&result));
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("token_env"));
     std::fs::write(
         directory.join(".nvault.yaml"),
         format!(
@@ -1604,6 +1636,9 @@ fn proton_yaml_null_disables_ambient_token() {
         &[("PROTON_PASS_PERSONAL_ACCESS_TOKEN", "fake-token")],
         None,
     );
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("token_env"));
+    let result = run(&directory, &["ls"], &[], None);
     assert!(result.status.success(), "{}", stderr(&result));
 }
 

@@ -38,10 +38,11 @@ ambiguous, rename the item or configure a vault name where it is unique.
 An explicitly configured `token_env` must be set; otherwise the operation
 fails instead of using an existing session. When `token_env` is omitted, a
 configured `token_file` is used, or else the existing CLI session is used
-without inheriting the token variable. Automatic discovery of
-`PROTON_PASS_PERSONAL_ACCESS_TOKEN` is no longer supported; explicitly set
-`token_env` to that name to use it. YAML `null` and programmatic `None` also
-disable environment-token authentication.
+only if `PROTON_PASS_PERSONAL_ACCESS_TOKEN` is absent. If it is present,
+nvault fails instead of silently choosing a session. Automatic discovery is
+no longer supported: explicitly set `token_env` to that name to use the
+token, or unset the variable to use the session. YAML `null` and programmatic
+`None` follow the same rule.
 - GitHub: `SECRET_NAME`. List and set only.
 - AWS Secrets Manager: `SECRET_NAME`. No field suffix.
 - GCP Secret Manager: `SECRET_ID`. No field suffix; latest version only.
