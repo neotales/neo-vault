@@ -5,6 +5,24 @@ images. They never use real credentials. Each test starts only its own
 container(s); testcontainers removes them on drop. Do not run broad Docker
 cleanup or remove unrelated containers, volumes, networks, or images.
 
+## OpenBao: implemented and exercised
+
+`tests/container_openbao.rs` starts
+`openbao/openbao:2.3.1@sha256:41dc3e47da01575e1ffea70aa635180b57ff999264398313334c259a697bf7a2`
+in dev mode with a dummy root token, a temporary configuration and a random
+host port bound explicitly to 127.0.0.1. The digest pins the image manifest.
+The test exercises the `openbao` kind's list, get, set, path and field ensure,
+and sibling preservation. Direct requests additionally check the server rejects
+CAS 0 on an existing path and a stale CAS patch; they do not reproduce a race
+inside the adapter.
+
+```sh
+cargo test --test container_openbao -- --ignored --nocapture
+```
+
+Observed on 2026-11-17: one test passed, 0 failed, in 13.22 seconds.
+No production OpenBao server was contacted. The image remains locally.
+
 ## Vault: implemented and exercised
 
 `tests/container_vault.rs` starts:

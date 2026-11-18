@@ -131,7 +131,7 @@ history still sees exported values, so autoload is a deliberate trade.
 | Kind | Read | Write | Ensure | Mechanism | Status in this repository |
 | --- | --- | --- | --- | --- | --- |
 | `vault` | yes | yes | yes | KV v2 HTTP API. Ensure uses metadata and subkeys, then CAS 0 create or a CAS patch. | Fixture plus opt-in testcontainer against `hashicorp/vault:1.21.4`; no production server |
-| `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Shares the `vault` adapter; kind not separately exercised |
+| `openbao` | yes | yes | yes | Vault-compatible KV v2 API | Opt-in testcontainer against `openbao/openbao:2.3.1`; no production server |
 | `keepass` | yes | yes | **no** | `keepassxc-cli`; `edit -p`/`add -p` read the database password and the value from stdin, never `argv`. `ensure` is refused: the CLI's check-and-save is not atomic against an external writer. | Fake-CLI fixture in the suite plus opt-in generated local KDBX tests for the round trip, concurrent writers, and duplicate add (`cargo test --test keepass_kdbx -- --ignored`) with `keepassxc-cli` 2.7.12; no production vault |
 | `infisical` | yes | yes | yes | v4 secrets HTTP API; service token or Universal Auth. `set` is a GET-then-POST/PATCH write. `ensure` sends only Create (`POST`); the pinned server's partial unique index rejects a duplicate with `400`, which the adapter reports present. A create that loses a concurrent insert race is an error. | Fixture-tested for list/get/set/ensure, plus an opt-in testcontainer against `infisical/infisical:v0.167.11` with pinned PostgreSQL and Redis, including concurrent duplicate creates; no production server |
 | `vaultwarden` | yes | yes | no | `bw` CLI with a supplied unlocked session; writes send encoded item JSON on stdin to `bw create item`/`bw edit item` | Fake `bw` fixture plus an opt-in testcontainer against `vaultwarden/server:1.37.5` with `@bitwarden/cli` 2025.6.1; `bw` not installed here for production use |
@@ -476,10 +476,11 @@ It starts `floci/floci:2.5.0`, `floci/floci-gcp:0.13.0`, and
 `floci/floci-az:0.17.0` on random loopback-mapped ports, writes only obviously
 fake fixture values, and lets testcontainers remove only those containers.
 Azure Functions is disabled in the Azure container so no Docker socket is
-needed. Three more container tests cover Vault, Infisical, and Vaultwarden:
+needed. Four more container tests cover Vault, OpenBao, Infisical, and Vaultwarden:
 
 ```sh
 cargo test --test container_vault -- --ignored --nocapture
+cargo test --test container_openbao -- --ignored --nocapture
 cargo test --test container_infisical -- --ignored --nocapture
 NVAULT_TEST_BW=/path/to/pinned/bw \
   cargo test --test container_vaultwarden -- --ignored --nocapture
