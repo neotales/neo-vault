@@ -84,7 +84,8 @@ impl Client {
         provider::default_prefix(&self.config, requested)
     }
 
-    /// Lists key names. Values are not read.
+    /// Lists key names without returning values. Some providers, including
+    /// Proton and Vaultwarden, fetch item values internally while listing.
     ///
     /// # Errors
     ///

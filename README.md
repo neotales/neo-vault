@@ -257,6 +257,12 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
   hardened directory walk, or when the temporary path is not a trusted,
   symlink-free location. This is based on the pinned 2.7.1 source, not a live
   service.
+- Proton `vault` filters by vault name, not share ID. Duplicate item titles
+  must be renamed or narrowed to a vault where the title is unique.
+  An explicitly configured `token_env` must be set; it never falls back to
+  an existing session. If omitted, the standard
+  `PROTON_PASS_PERSONAL_ACCESS_TOKEN` is used when present, otherwise an
+  existing session is used unless `token_file` is configured.
 - GitHub repository secrets only. Organization, environment, Codespaces, and
   Dependabot scopes are future work. `ensure` is unsupported: the secrets API
   has one PUT that creates or updates, and a check-then-PUT race would

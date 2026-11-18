@@ -191,13 +191,14 @@ pub struct ProtonConfig {
     /// Executable name or absolute path. Defaults to `pass-cli`.
     #[serde(default = "default_pass_cli")]
     pub command: String,
-    /// Vault name or share id. Omit when a default vault is configured in
-    /// `pass-cli`.
+    /// Vault name, passed to `pass-cli` as `--vault-name`. Omit to search
+    /// without a vault-name filter.
     #[serde(default)]
     pub vault: Option<String>,
-    /// Environment variable holding a personal access token. Defaults to
-    /// `PROTON_PASS_PERSONAL_ACCESS_TOKEN`.
-    #[serde(default = "default_proton_token_env")]
+    /// Environment variable holding a personal access token. If explicitly
+    /// configured it must be set. When omitted, the standard
+    /// `PROTON_PASS_PERSONAL_ACCESS_TOKEN` is used if present.
+    #[serde(default)]
     pub token_env: Option<String>,
     /// Owner-only file holding the personal access token.
     #[serde(default)]
@@ -346,10 +347,6 @@ fn default_bw_session_env() -> Option<String> {
 
 fn default_pass_cli() -> String {
     "pass-cli".to_owned()
-}
-
-fn default_proton_token_env() -> Option<String> {
-    Some("PROTON_PASS_PERSONAL_ACCESS_TOKEN".to_owned())
 }
 
 fn default_github_api() -> String {

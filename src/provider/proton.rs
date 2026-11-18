@@ -110,8 +110,8 @@ impl ProtonProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error when `pass-cli` is unavailable or the token file cannot
-    /// be read.
+    /// Returns an error when `pass-cli` is unavailable or a configured token
+    /// source cannot be read.
     pub fn new(name: &str, config: &ProtonConfig, root: &Path) -> Result<Self> {
         if !command_available(&config.command) && !Path::new(&config.command).is_file() {
             return Err(Error::new(format!(
@@ -119,12 +119,14 @@ impl ProtonProvider {
                 config.command
             )));
         }
+        let default_env = "PROTON_PASS_PERSONAL_ACCESS_TOKEN";
         let token = match (&config.token_env, &config.token_file) {
-            (Some(variable), _) if std::env::var_os(variable).is_some() => {
-                Some(crate::provider::credential_from_env(variable)?)
+            (Some(variable), _) => Some(crate::provider::credential_from_env(variable)?),
+            (None, _) if std::env::var_os(default_env).is_some() => {
+                Some(crate::provider::credential_from_env(default_env)?)
             }
-            (_, Some(path)) => Some(crate::provider::credential_from_file(&root.join(path))?),
-            _ => None,
+            (None, Some(path)) => Some(crate::provider::credential_from_file(&root.join(path))?),
+            (None, None) => None,
         };
         Ok(Self {
             name: name.to_owned(),
@@ -268,7 +270,7 @@ impl ProtonProvider {
                 "Proton Pass item {title:?} was not found"
             ))),
             _ => Err(Error::new(format!(
-                "Proton Pass item title {title:?} is ambiguous; use a unique title or share id"
+                "Proton Pass item title {title:?} is ambiguous; use a unique title or configure a vault name that makes it unique"
             ))),
         }
     }
