@@ -1165,6 +1165,7 @@ fn vaultwarden_fixture_reads_a_name_and_field() {
     std::fs::write(
         &script,
         r#"#!/bin/sh
+if [ -n "$BW_TRACE" ]; then printf '%s\n' "$*" >> "$BW_TRACE"; fi
 case "$*" in
   *"list items"*) printf '%s' '[{"id":"123e4567-e89b-12d3-a456-426614174000","name":"DB","login":{"password":"pw"}}]' ;;
   *"get item"*) printf '%s' '{"name":"DB","login":{"password":"pw"},"fields":[{"name":"api","value":"key"}]}' ;;
@@ -1188,7 +1189,12 @@ session_env = "BW_SESSION"
         ),
     )
     .expect("write config");
-    let environment = [("BW_SESSION", "test-session")];
+    let trace = directory.join("calls");
+    let trace_path = trace.to_string_lossy().to_string();
+    let environment = [
+        ("BW_SESSION", "test-session"),
+        ("BW_TRACE", trace_path.as_str()),
+    ];
     let get = run(&directory, &["get", "DB#password"], &environment, None);
     assert!(get.status.success(), "{}", stderr(&get));
     assert_eq!(stdout(&get), "pw");
@@ -1202,6 +1208,11 @@ session_env = "BW_SESSION"
     assert!(!stdout(&listing).contains("pw"));
     assert!(!stderr(&listing).contains("pw"));
     assert!(!stdout(&listing).contains("key"));
+    let calls = std::fs::read_to_string(&trace).expect("bw call trace");
+    assert!(
+        calls.lines().any(|line| line.ends_with("list items")),
+        "ls did not fetch items through the CLI: {calls}"
+    );
 
     let ensured = run(
         &directory,

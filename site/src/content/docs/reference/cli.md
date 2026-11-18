@@ -17,7 +17,7 @@ Global flags, accepted before or after the subcommand:
 nsvault ls [PREFIX] [--json]
 ```
 
-Lists key names under the prefix. Never reads values. `--json` prints a JSON array of objects with a `key` field.
+Lists key names under the prefix. Prints names only. Vaultwarden's `bw list items` returns full items and Proton's `pass-cli item list` downloads and decrypts each item, but both adapters keep only names and print no value. `--json` prints a JSON array of objects with a `key` field.
 
 ## `get`
 
@@ -49,7 +49,7 @@ Creates the key only through a provider path that cannot replace an existing key
 nsvault search QUERY [--limit N] [--json]
 ```
 
-Case-insensitive name search. Default limit is 50. Values are not fetched.
+Case-insensitive name search over the provider listing. Default limit is 50. It uses the same listing path as `ls`, so the Vaultwarden and Proton item fetches apply; no value is printed.
 
 ## `exec`
 

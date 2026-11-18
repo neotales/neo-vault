@@ -90,6 +90,12 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 The final run finished in 5.42s once the pinned images were cached; the first
 run took longer while pulling them.
 
+A focused rerun of the AWS test alone, against the same pinned image, passed
+in 2.02s. A raw `PutSecretValue` request for a missing secret returned
+`HTTP/1.1 400 Bad Request` with a JSON body beginning
+`{"__type":"ResourceNotFoundException"`. AWS documents HTTP 400 for that error,
+and the adapter creates only on that exact response.
+
 The AWS test uses access key `test` and secret key `test` from owner-only
 temporary files. The GCP test uses `allow_anonymous = true` on a loopback
 endpoint. The Azure test uses `floci-fake-token` from an owner-only temporary
@@ -97,7 +103,8 @@ file. All fixture values are obviously fake.
 
 What the test covers:
 
-- AWS: `set` on a missing name (PutSecretValue 404, then CreateSecret), `get`,
+- AWS: `set` on a missing name (PutSecretValue HTTP 400 with
+  `ResourceNotFoundException`, then CreateSecret), `get`,
   metadata-only `list`, and `ensure` create then present without overwrite.
 - GCP: `set` on a missing name (AddVersion 404, CreateSecret, AddVersion),
   `get` of the latest version, a second `set` that adds a version, metadata-only
