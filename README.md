@@ -177,27 +177,31 @@ case-sensitive and a case-insensitive match would leave the real variable
 untracked. A malformed object, a missing or extra tracking entry, a non-string
 value, invalid base64 or UTF-8, or a name outside that set is refused with no
 change. `Set-Item` runs with `-ErrorAction Stop`. Before applying anything the
-hook records whether each target variable existed and its value, so if an
-assignment fails (including the `NVAULT_LOADED_KEYS` assignment) every applied
-name is restored to its previous value or removed if it did not exist. Before
-the first assignment it also puts every name it will touch, including
-`NVAULT_LOADED_KEYS`, on an in-memory pending-cleanup list. If a restore or
-removal then fails as well, the name stays on that list, the hook prints a
-distinct fixed line, `nvault: could not clean up a failed load; will retry`,
-and refuses to load anything else until the cleanup succeeds on a later
-invocation; the pending name is removed then, so it does not stay set. This is
-not an absolute guarantee: the list lives in the current PowerShell process,
-and if the process exits while cleanup is still failing the value can remain
-until the shell exits. The hook says so rather than claiming otherwise.
+hook records, for each target variable, whether it existed and its value. That
+record is also written to an in-memory pending-cleanup list before the first
+assignment. If an assignment fails (including the `NVAULT_LOADED_KEYS`
+assignment), every applied name is restored from that record or removed if it
+did not exist. If a restore or removal also fails, the record stays on the
+pending list, the hook prints a distinct fixed line,
+`nvault: could not clean up a failed load; will retry`, and refuses to load
+anything else until the record is applied on a later invocation: an existing
+variable is restored to its previous value, an absent one is removed. Previous
+values are held only in the current PowerShell process and are never printed;
+the diagnostics are fixed strings. This is not an absolute guarantee: if the
+process exits while a restore is still failing, the value can remain until the
+shell exits. The hook says so rather than claiming otherwise.
 
 The recorded directory is compared ordinally and case-sensitively, so on Linux
 `a` and `A` are different directories and each transition cleans and reloads.
-On Windows the same comparison can cause one extra reload, which is harmless. Windows PowerShell 5.1 and PowerShell before 7.5 cannot store an empty
+On Windows the same comparison can cause one extra reload, which is harmless.
+
+Windows PowerShell 5.1 and PowerShell before 7.5 cannot store an empty
 environment value, so a load containing an empty value is refused before
 anything is applied and reports the retry line. The refusal applies on every
-edition, so the same payload behaves the same way on 5.1 and 7 and later. A response with no exports and
-an empty `NVAULT_LOADED_KEYS` sets nothing and is accepted. The diagnostic is a
-fixed string and never contains a value or a name. `env --shell powershell` and `env --shell pwsh` still print
+edition, so the same payload behaves the same way on 5.1 and 7 and later. A
+response with no exports and an empty `NVAULT_LOADED_KEYS` sets nothing and is
+accepted. The diagnostic is a fixed string and never contains a value or a
+name. `env --shell powershell` and `env --shell pwsh` still print
 `$env:NAME = 'value'` assignments for direct use. PowerShell reads five
 characters as a single quote — `'`, U+2018, U+2019, U+201A, and U+201B — and a
 value containing U+2019 could otherwise close the string. Every one of the five
@@ -254,9 +258,10 @@ tracking, empty value, unsafe name), a case-mismatched tracking name, invalid
 base64 and invalid UTF-8, and four rejected Nushell payloads; rollback of a
 partially applied PowerShell load simulated with a failing `Set-Item`, once for
 an export and once for the tracking assignment, with pre-existing values
-restored; a failed restore and a failed pending removal that keep the name on
-the pending list until a later invocation cleans it; a case-sensitive directory
-transition between `a` and `A`; a valid-base64 case-mismatched tracking value;
+restored; a failed restore and a failed pending removal that keep the records on
+the pending list until a later invocation restores the previous value (and
+removes the new one) with autoload disabled and the directory changed; a
+case-sensitive directory transition between `a` and `A`; a valid-base64 case-mismatched tracking value;
 an empty PowerShell export set; malformed and wrong-shaped JSON in
 Nushell, a transient first failure followed by a successful retry, a real zsh
 prompt retrying a failed load while keeping an existing `precmd` hook, a nested

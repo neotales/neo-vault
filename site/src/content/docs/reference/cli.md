@@ -80,9 +80,10 @@ and `NVAULT_LOADED_KEYS` must list exactly the other names (compared
 case-sensitively). A PowerShell load containing an empty value is refused (5.1
 and pre-7.5 cannot store one), invalid base64 or UTF-8 is refused, a
 case-mismatched tracking name is refused, and a failed assignment restores
-every value that attempt overwrote. A name whose restore or pending removal
+every value that attempt overwrote. A record whose restore or pending removal
 also fails stays on an in-memory cleanup list, is retried on later prompts with
-a distinct fixed diagnostic, and blocks new loads until it is removed.
+a distinct fixed diagnostic, and blocks new loads until it is applied: an
+existing variable is restored to its previous value, an absent one is removed.
 Directory comparisons are case-sensitive.
 
 ## `completion`
