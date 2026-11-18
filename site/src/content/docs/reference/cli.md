@@ -63,10 +63,13 @@ Maps each selected key's basename to an environment variable in the child. `apps
 ## `env`
 
 ```sh
-nvault env [--shell bash|zsh|fish] [--env-prefix PREFIX] [--only KEYS]
+nvault env [--shell bash|zsh|fish|powershell|pwsh|nu] [--env-prefix PREFIX] [--only KEYS]
 ```
 
 Prints shell exports for the current directory. Default shell is bash.
+`powershell` and `pwsh` print `$env:NAME = 'value'` with quotes doubled; both
+editions accept the output. `nu` has no `eval`, so it prints a JSON object to
+pipe into `from json | load-env`.
 
 ## `completion`
 
@@ -79,10 +82,14 @@ Prints a static completion script. It does not complete key names from the provi
 ## `hook`
 
 ```sh
-nvault hook bash|zsh|fish
+nvault hook bash|zsh|fish|powershell|pwsh|nu
 ```
 
-Prints a directory hook that sets `NVAULT_DIR`. It does not fetch secrets on `cd` unless `NVAULT_AUTOLOAD=1`.
+Prints a directory hook that sets `NVAULT_DIR`. It does not fetch secrets on
+`cd` unless `NVAULT_AUTOLOAD=1`. PowerShell wraps the existing `prompt`
+function; Nushell registers a `pre_prompt` hook and loads JSON with
+`load-env`. Installation snippets and the exact evidence for what was executed
+are in the project README.
 
 ## `dir`
 

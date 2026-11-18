@@ -152,6 +152,15 @@ pub enum HookShell {
     Zsh,
     /// Friendly Interactive Shell.
     Fish,
+    /// Windows PowerShell 5.1 (`powershell.exe`).
+    #[value(name = "powershell")]
+    PowerShell,
+    /// PowerShell 7 and later (`pwsh`).
+    #[value(name = "pwsh")]
+    Pwsh,
+    /// Nushell.
+    #[value(name = "nu")]
+    Nu,
 }
 
 /// Shells supported by `env`.
@@ -163,4 +172,22 @@ pub enum EnvShell {
     Zsh,
     /// Friendly Interactive Shell.
     Fish,
+    /// Windows PowerShell 5.1 (`powershell.exe`).
+    ///
+    /// Renders `$env:NAME = 'value'` assignments, which the 5.1 and 7+
+    /// editions both accept.
+    #[value(name = "powershell")]
+    PowerShell,
+    /// PowerShell 7 and later (`pwsh`).
+    ///
+    /// Renders the same assignments as `powershell`; the name exists so a hook
+    /// can pass the edition it targets and so help can describe the caveats.
+    #[value(name = "pwsh")]
+    Pwsh,
+    /// Nushell.
+    ///
+    /// Renders a JSON object, because Nushell has no `eval`: pipe it to
+    /// `from json | load-env`.
+    #[value(name = "nu")]
+    Nu,
 }

@@ -87,8 +87,8 @@ nvault ensure KEY                  # create only if the provider confirms absenc
 nvault search QUERY                # names only
 nvault exec -- CMD [ARGS...]       # secrets in the child environment
 nvault x -- CMD [ARGS...]          # alias
-nvault env --shell bash|zsh|fish   # shell exports for this directory
-nvault hook bash|zsh|fish          # directory hook
+nvault env --shell bash|zsh|fish|powershell|pwsh|nu   # shell exports
+nvault hook bash|zsh|fish|powershell|pwsh|nu          # directory hook
 nvault completion bash|zsh|fish|powershell|elvish
 nvault providers                   # configured profiles, no credentials read
 nvault dir                         # nearest configuration directory
@@ -118,13 +118,72 @@ Collisions and invalid names fail rather than guessing.
 
 ### Directory hooks
 
-`nvault hook bash` (or `zsh`, `fish`) prints a shell function that tracks the
-working directory and sets `NVAULT_DIR`. It does **not** fetch secrets just
-because you changed directory. Set `NVAULT_AUTOLOAD=1` to opt into
-`nvault env` on directory change. On every directory change, names recorded in
-`NVAULT_LOADED_KEYS` are unset first, even if autoload is now disabled; only
-fetching new values is gated by `NVAULT_AUTOLOAD`. A child process or a shell
-history still sees exported values, so autoload is a deliberate trade.
+`nvault hook` prints a directory hook for `bash`, `zsh`, `fish`, `powershell`
+(Windows PowerShell 5.1), `pwsh` (PowerShell 7 and later), or `nu` (Nushell).
+The hook tracks the working directory and sets `NVAULT_DIR`. It does **not**
+fetch secrets just because you changed directory. Set `NVAULT_AUTOLOAD=1` to
+opt into `nvault env` on directory change. On every directory change, names
+recorded in `NVAULT_LOADED_KEYS` are removed first, even if autoload is now
+disabled; only fetching new values is gated by `NVAULT_AUTOLOAD`. A child
+process or a shell history still sees exported values, so autoload is a
+deliberate trade.
+
+Install one hook per interactive shell, for example:
+
+```sh
+# bash, in ~/.bashrc
+eval "$(nvault hook bash)"
+# zsh, in ~/.zshrc
+eval "$(nvault hook zsh)"
+# fish, in ~/.config/fish/config.fish
+nvault hook fish | source
+```
+
+PowerShell has no directory-change event, so `nvault hook powershell` and
+`nvault hook pwsh` print a wrapper that keeps the existing `prompt` function
+and calls it after tracking the directory. Add one line to the file named by
+`$PROFILE`:
+
+```powershell
+# PowerShell 7 and later
+Invoke-Expression (& nvault hook pwsh | Out-String)
+# Windows PowerShell 5.1
+Invoke-Expression (& nvault hook powershell | Out-String)
+```
+
+The `powershell` and `pwsh` names differ only in the header comment and in the
+`--shell` flag the hook passes back; the body is identical and uses no
+PowerShell 7-only operator, so it targets 5.1 and 7 alike. Only PowerShell 7
+was executed here. The hook restores `[Console]::OutputEncoding` around the
+`nvault env` call so a non-ASCII value is not decoded with the console code
+page, and a sentinel keeps a second source of the hook from nesting `prompt`.
+
+Nushell has no `eval`, so `nvault env --shell nu` prints a JSON object instead
+of statements and the hook applies it with `load-env`. Save it once and source
+the file from `config.nu`:
+
+```nu
+# in a shell:
+#   nvault hook nu | save -f ~/.config/nvault/nvault.nu
+# in config.nu:
+source ~/.config/nvault/nvault.nu
+```
+
+The provider output never becomes code in Nushell: it travels as JSON and is
+loaded as data. In PowerShell and the POSIX hooks, values still reach an
+evaluation step (`Invoke-Expression`, `eval`). The generated text quotes each
+value: POSIX single quotes with `'\''`, PowerShell single quotes with `''`,
+fish with backslash escapes, so a value cannot close the string and append a
+command. Environment names are validated against
+`^[A-Za-z_][A-Za-z0-9_]*$` before the PowerShell and Nushell hooks remove them.
+
+What was executed here: the bash hook under GNU bash 5.3.20, and the PowerShell
+and Nushell hooks under PowerShell 7.7.0 and Nushell 0.117.0 on Linux,
+including directory transitions, prompt preservation, JSON loading, and a value
+containing `';` plus a command that would create a file if it were executed.
+`zsh`, `fish`, Windows PowerShell 5.1, and macOS were not available in this
+environment and were not executed. Nushell releases older than 0.117.0 were not
+exercised and may use different configuration syntax.
 
 ## Providers
 
@@ -332,7 +391,10 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 - Windows and macOS were not exercised. The code avoids Unix-only calls outside
   the `bw`/`keepassxc-cli`/`pass-cli` process boundary, but that is not a
   portability claim. The same-user write lock uses Linux `flock` and was not
-  exercised on those systems.
+  exercised on those systems. The PowerShell directory hooks target Windows
+  PowerShell 5.1 and PowerShell 7 alike, but only PowerShell 7.7.0 on Linux was
+  executed here; 5.1 itself was not. Nushell 0.117.0 was executed; older
+  releases were not.
 
 ## Using the Rust crate
 
