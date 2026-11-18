@@ -87,7 +87,7 @@ nvault ensure KEY                  # create only if the provider confirms absenc
 nvault search QUERY                # names only
 nvault exec -- CMD [ARGS...]       # secrets in the child environment
 nvault x -- CMD [ARGS...]          # alias
-nvault env --shell bash|zsh|fish|powershell|pwsh|nu|json   # shell exports
+nvault env --shell bash|zsh|fish|powershell|pwsh|nu|json|json-base64  # exports
 nvault hook bash|zsh|fish|powershell|pwsh|nu          # directory hook
 nvault completion bash|zsh|fish|powershell|elvish
 nvault providers                   # configured profiles, no credentials read
@@ -159,9 +159,13 @@ was executed here. The hook restores `[Console]::OutputEncoding` around the
 page, and a sentinel keeps a second source of the hook from nesting `prompt`.
 
 The PowerShell hook does not evaluate provider output. It asks for
-`env --shell json`, validates each property name, and copies the values into
-`Env:` with `Set-Item`, so a value is data even if it contains quotes, `$`, or
-newlines. `env --shell powershell` and `env --shell pwsh` still print
+`env --shell json-base64`, validates each property name, decodes the base64
+bytes itself, and copies the values into `Env:` with `Set-Item`, so a value is
+data even if it contains quotes, `$`, or newlines. Values travel encoded
+because `ConvertFrom-Json` turns a timestamp-looking string such as
+`2020-01-01T00:00:00Z` into a `DateTime` and would reformat it; decoding the
+bytes preserves the exact value. That coercion was reproduced on PowerShell
+7.7.0 and is why the hook does not parse plain JSON. `env --shell powershell` and `env --shell pwsh` still print
 `$env:NAME = 'value'` assignments for direct use. PowerShell reads five
 characters as a single quote — `'`, U+2018, U+2019, U+201A, and U+201B — and a
 value containing U+2019 could otherwise close the string. Every one of the five
@@ -169,7 +173,9 @@ is doubled, matching `CharTraits.IsSingleQuote` in the PowerShell source; the
 runtime tests evaluate a rendered assignment containing all five.
 
 Nushell has no `eval`, so `nvault env --shell nu` (and `--shell json`) prints a
-JSON object and the hook applies it with `load-env`. Save it once and source
+JSON object and the hook applies it with `load-env`. Malformed JSON, or a JSON
+value that is not an object, is treated as a failed load: it prints the retry
+line and does not record the directory. Save it once and source
 the file from `config.nu`:
 
 ```nu
@@ -186,24 +192,35 @@ instead of skipping it. The installer also re-registers when the `pre_prompt`
 hook list is empty, so re-sourcing a config that replaced `$env.config`
 restores the hook.
 
-A failed probe or a failed load does not record the directory. The hook prints
-one fixed redacted line, `nvault: could not load this directory; will retry`,
-and the next prompt in the same directory tries again; bash and zsh retry from
-`PROMPT_COMMAND`/`chpwd_functions`, fish from `fish_prompt`, and PowerShell and
-Nushell from `prompt`/`pre_prompt`. The message contains no value and no path.
+A directory change cleans the names in `NVAULT_LOADED_KEYS` and clears
+`NVAULT_DIR` *before* the new directory is probed, so a failed probe still
+removes the previous directory's exports instead of leaving them active. A
+failed probe or load then prints one fixed redacted line,
+`nvault: could not load this directory; will retry`, and is retried from the
+next prompt; bash retries from `PROMPT_COMMAND`, zsh from both the `chpwd` and
+`precmd` lists, fish from `fish_prompt`, and PowerShell and Nushell from
+`prompt`/`pre_prompt`. The message contains no value and no path. zsh appends
+to the existing hook lists without replacing them.
 
 `render_env` is also the library boundary, so it validates every export name as
 `[A-Za-z_][A-Za-z0-9_]*` and refuses `NVAULT_AUTOLOAD`, `NVAULT_DIR`,
-`NVAULT_LAST_DIR`, and `NVAULT_LOADED_KEYS`, which the hooks own.
+`NVAULT_LAST_DIR`, and `NVAULT_LOADED_KEYS`, which the hooks own. This is a
+compatibility change: a key whose derived name is not a plain identifier, or is
+one of those four, is refused by `env` and by library callers instead of being
+written into shell code. `exec` is unaffected because it passes names to a
+child process, not to a shell parser.
 
 What was executed here on Linux: the bash hook under GNU bash 5.3.20, zsh
 5.9.2, fish 4.9.3, PowerShell 7.7.0, and Nushell 0.117.0, including directory
-transitions, cleanup with autoload disabled, prompt preservation, JSON loading,
-a transient first failure followed by a successful retry, a nested Nushell
-install, and values containing `';` or a smart quote plus a command that would
-create a file if it were executed. Windows PowerShell 5.1 and macOS were not
-available and were not executed. Nushell releases older than 0.117.0 were not
-exercised and may use different configuration syntax.
+transitions, cleanup with autoload disabled, cleanup when the directory probe
+fails, prompt preservation, base64 decoding of a timestamp value, JSON loading,
+malformed and wrong-shaped JSON in Nushell, a transient first failure followed
+by a successful retry, a real zsh prompt retrying a failed load while keeping
+an existing `precmd` hook, a nested Nushell install, and values containing
+`';` or a smart quote plus a command that would create a file if it were
+executed. Windows PowerShell 5.1 and macOS were not available and were not
+executed. Nushell releases older than 0.117.0 were not exercised and may use
+different configuration syntax.
 
 ## Providers
 

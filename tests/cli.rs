@@ -335,6 +335,24 @@ fn lists_reads_writes_and_injects_through_the_cli() {
             None,
         ))
     );
+
+    let encoded = run(
+        &directory,
+        &["env", "--shell", "json-base64"],
+        &environment,
+        None,
+    );
+    assert!(encoded.status.success(), "{}", stderr(&encoded));
+    assert!(
+        !stdout(&encoded).contains("s3cr3t"),
+        "plaintext in base64 form"
+    );
+    let encoded: serde_json::Value =
+        serde_json::from_str(stdout(&encoded).trim()).expect("base64 output is JSON");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded["DB"].as_str().expect("base64 string"))
+        .expect("base64");
+    assert_eq!(String::from_utf8(bytes).expect("utf8"), "s3cr3t");
 }
 
 #[derive(Default)]

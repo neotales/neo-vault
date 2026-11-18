@@ -192,9 +192,16 @@ pub enum EnvShell {
     Nu,
     /// JSON object.
     ///
-    /// The data form used by the PowerShell and Nushell hooks, so provider
-    /// output is applied without an evaluation step. Contains the same keys as
-    /// `nu`, including `NVAULT_LOADED_KEYS`.
+    /// The data form used by the Nushell hook, so provider output is applied
+    /// without an evaluation step. Contains the same keys as `nu`, including
+    /// `NVAULT_LOADED_KEYS`.
     #[value(name = "json")]
     Json,
+    /// JSON object with base64-encoded UTF-8 values.
+    ///
+    /// The form the PowerShell hook applies. `ConvertFrom-Json` can turn a
+    /// timestamp-looking string into a `DateTime`, so values travel encoded
+    /// and the hook decodes the exact bytes itself.
+    #[value(name = "json-base64")]
+    JsonBase64,
 }

@@ -18,8 +18,10 @@ pub struct Export {
 /// Renders `export`/`set -gx`/`$env:` assignments for a shell.
 ///
 /// `EnvShell::Nu` and `EnvShell::Json` render a JSON object instead of
-/// statements: Nushell has no `eval`, and the PowerShell hook applies the JSON
-/// as data rather than executing it. The object also carries
+/// statements, and `EnvShell::JsonBase64` renders the same object with each
+/// value base64-encoded. The PowerShell hook uses the encoded form because
+/// `ConvertFrom-Json` can reinterpret a timestamp-looking string as a
+/// `DateTime`; decoding the bytes preserves the value. The object also carries
 /// `NVAULT_LOADED_KEYS` as a space-separated string.
 ///
 /// Every export name must be a plain environment identifier and must not be
@@ -52,6 +54,9 @@ pub fn render_env(exports: &[Export], shell: EnvShell) -> Result<String> {
         .join(" ");
     pairs.push(("NVAULT_LOADED_KEYS", loaded.as_str()));
 
+    if shell == EnvShell::JsonBase64 {
+        return render_json_base64(&pairs);
+    }
     if matches!(shell, EnvShell::Nu | EnvShell::Json) {
         return render_json(&pairs);
     }
@@ -66,7 +71,7 @@ pub fn render_env(exports: &[Export], shell: EnvShell) -> Result<String> {
             EnvShell::PowerShell | EnvShell::Pwsh => {
                 writeln!(output, "$env:{name} = {}", quote_powershell(value))
             }
-            EnvShell::Nu | EnvShell::Json => {
+            EnvShell::Nu | EnvShell::Json | EnvShell::JsonBase64 => {
                 unreachable!("JSON shells are rendered before this loop")
             }
         }
@@ -109,6 +114,25 @@ fn render_json(pairs: &[(&str, &str)]) -> Result<String> {
     let mut object = serde_json::Map::with_capacity(pairs.len());
     for (name, value) in pairs {
         object.insert((*name).to_owned(), serde_json::Value::from(*value));
+    }
+    let mut output = serde_json::to_string(&serde_json::Value::Object(object))
+        .map_err(|_| Error::new("cannot render shell exports"))?;
+    output.push('\n');
+    Ok(output)
+}
+
+/// Renders the pairs as JSON with every value base64-encoded.
+///
+/// The PowerShell hook decodes these bytes, so a value such as
+/// `2020-01-01T00:00:00Z` is never coerced to `DateTime` by
+/// `ConvertFrom-Json`.
+fn render_json_base64(pairs: &[(&str, &str)]) -> Result<String> {
+    use base64::Engine as _;
+
+    let mut object = serde_json::Map::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
+        object.insert((*name).to_owned(), serde_json::Value::from(encoded));
     }
     let mut output = serde_json::to_string(&serde_json::Value::Object(object))
         .map_err(|_| Error::new("cannot render shell exports"))?;
@@ -241,14 +265,8 @@ fn bash_hook() -> String {
   local dir="${PWD:-}"
   local root output
   [ "$dir" = "${NVAULT_LAST_DIR:-}" ] && return 0
-  if ! root="$(nvault dir 2>/dev/null)"; then
-    return 0
-  fi
-  if [ -n "$root" ]; then
-    export NVAULT_DIR="$root"
-  else
-    unset NVAULT_DIR
-  fi
+  unset NVAULT_LAST_DIR
+  unset NVAULT_DIR
   if [ -n "${NVAULT_LOADED_KEYS:-}" ]; then
     local key
     read -r -a _nvault_keys <<< "$NVAULT_LOADED_KEYS"
@@ -260,6 +278,13 @@ fn bash_hook() -> String {
     done
     unset _nvault_keys
     unset NVAULT_LOADED_KEYS
+  fi
+  if ! root="$(nvault dir 2>/dev/null)"; then
+    printf '%s\n' 'nvault: could not load this directory; will retry' >&2
+    return 0
+  fi
+  if [ -n "$root" ]; then
+    export NVAULT_DIR="$root"
   fi
   if [ "${NVAULT_AUTOLOAD:-0}" = "1" ] && [ -n "$root" ]; then
     if ! output="$(nvault env --shell bash 2>/dev/null)"; then
@@ -284,14 +309,8 @@ fn zsh_hook() -> String {
   local dir="$PWD"
   local root output key
   if [ "$dir" = "${NVAULT_LAST_DIR:-}" ]; then return 0; fi
-  if ! root="$(nvault dir 2>/dev/null)"; then
-    return 0
-  fi
-  if [ -n "$root" ]; then
-    export NVAULT_DIR="$root"
-  else
-    unset NVAULT_DIR
-  fi
+  unset NVAULT_LAST_DIR
+  unset NVAULT_DIR
   if [ -n "${NVAULT_LOADED_KEYS:-}" ]; then
     for key in ${(z)NVAULT_LOADED_KEYS}; do
       case "$key" in
@@ -300,6 +319,13 @@ fn zsh_hook() -> String {
       unset "$key"
     done
     unset NVAULT_LOADED_KEYS
+  fi
+  if ! root="$(nvault dir 2>/dev/null)"; then
+    print -u2 'nvault: could not load this directory; will retry'
+    return 0
+  fi
+  if [ -n "$root" ]; then
+    export NVAULT_DIR="$root"
   fi
   if [ "${NVAULT_AUTOLOAD:-0}" = "1" ] && [ -n "$root" ]; then
     if ! output="$(nvault env --shell zsh 2>/dev/null)"; then
@@ -310,9 +336,12 @@ fn zsh_hook() -> String {
   fi
   NVAULT_LAST_DIR="$dir"
 }
-typeset -ga chpwd_functions
+typeset -ga chpwd_functions precmd_functions
 if (( ${chpwd_functions[(I)_nvault_hook]:-0} == 0 )); then
   chpwd_functions+=(_nvault_hook)
+fi
+if (( ${precmd_functions[(I)_nvault_hook]:-0} == 0 )); then
+  precmd_functions+=(_nvault_hook)
 fi
 _nvault_hook
 "#
@@ -325,15 +354,8 @@ fn fish_hook() -> String {
     if set -q NVAULT_LAST_DIR; and test "$NVAULT_LAST_DIR" = "$dir"
         return
     end
-    set -l root (nvault dir 2>/dev/null)
-    if test $status -ne 0
-        return
-    end
-    if test -n "$root"
-        set -gx NVAULT_DIR $root
-    else
-        set -e NVAULT_DIR
-    end
+    set -e NVAULT_LAST_DIR
+    set -e NVAULT_DIR
     if set -q NVAULT_LOADED_KEYS
         for key in (string split ' ' -- $NVAULT_LOADED_KEYS)
             if string match -qr '^[A-Za-z_][A-Za-z0-9_]*$' -- $key
@@ -341,6 +363,14 @@ fn fish_hook() -> String {
             end
         end
         set -e NVAULT_LOADED_KEYS
+    end
+    set -l root (nvault dir 2>/dev/null)
+    if test $status -ne 0
+        echo 'nvault: could not load this directory; will retry' >&2
+        return
+    end
+    if test -n "$root"
+        set -gx NVAULT_DIR $root
     end
     if test "$NVAULT_AUTOLOAD" = "1"; and test -n "$root"
         set -l output (nvault env --shell fish 2>/dev/null)
@@ -376,15 +406,8 @@ fn powershell_hook(edition: &str, label: &str) -> String {
 function global:_nvault_hook {
     $here = $PWD.Path
     if ($global:_nvault_last_dir -eq $here) { return }
-    $probe = $null
-    try { $probe = & nvault dir 2>$null } catch { return }
-    if ($LASTEXITCODE -ne 0) { return }
-    $root = ([string]($probe | Select-Object -First 1)).Trim()
-    if ($root) {
-        $env:NVAULT_DIR = $root
-    } else {
-        Remove-Item Env:\NVAULT_DIR -ErrorAction SilentlyContinue
-    }
+    $global:_nvault_last_dir = $null
+    Remove-Item Env:\NVAULT_DIR -ErrorAction SilentlyContinue
     if ($env:NVAULT_LOADED_KEYS) {
         foreach ($key in ($env:NVAULT_LOADED_KEYS -split ' ')) {
             if ($key -match '^[A-Za-z_][A-Za-z0-9_]*$') {
@@ -393,13 +416,24 @@ function global:_nvault_hook {
         }
         Remove-Item Env:\NVAULT_LOADED_KEYS -ErrorAction SilentlyContinue
     }
+    $probe = $null
+    try { $probe = & nvault dir 2>$null } catch {
+        [Console]::Error.WriteLine('nvault: could not load this directory; will retry')
+        return
+    }
+    if ($LASTEXITCODE -ne 0) {
+        [Console]::Error.WriteLine('nvault: could not load this directory; will retry')
+        return
+    }
+    $root = ([string]($probe | Select-Object -First 1)).Trim()
+    if ($root) { $env:NVAULT_DIR = $root }
     if ($root -and $env:NVAULT_AUTOLOAD -eq '1') {
         $json = ''
         $encoding = $null
         try {
             $encoding = [Console]::OutputEncoding
             [Console]::OutputEncoding = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
-            $json = (& nvault env --shell json 2>$null | Out-String)
+            $json = (& nvault env --shell json-base64 2>$null | Out-String)
         } catch {
             $json = ''
         } finally {
@@ -413,14 +447,26 @@ function global:_nvault_hook {
         } else {
             try { $values = $json | ConvertFrom-Json } catch { $values = $null }
         }
-        if ($null -eq $values) {
+        if ($null -eq $values -or $values -is [System.Array]) {
             [Console]::Error.WriteLine('nvault: could not load this directory; will retry')
             return
         }
-        foreach ($property in $values.PSObject.Properties) {
-            if ($property.Name -match '^[A-Za-z_][A-Za-z0-9_]*$') {
-                Set-Item -LiteralPath ('Env:\' + $property.Name) -Value ([string]$property.Value)
+        $decoded = @{}
+        try {
+            foreach ($property in $values.PSObject.Properties) {
+                if ($property.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw 'invalid name' }
+                $bytes = [Convert]::FromBase64String([string]$property.Value)
+                $decoded[$property.Name] = [Text.Encoding]::UTF8.GetString($bytes)
             }
+        } catch {
+            $decoded = $null
+        }
+        if ($null -eq $decoded) {
+            [Console]::Error.WriteLine('nvault: could not load this directory; will retry')
+            return
+        }
+        foreach ($name in $decoded.Keys) {
+            Set-Item -LiteralPath ('Env:\' + $name) -Value $decoded[$name]
         }
     }
     $global:_nvault_last_dir = $here
@@ -461,14 +507,8 @@ fn nu_hook() -> String {
 def --env _nvault_hook [] {
     let here = (($nu.pid | into string) + '|' + ($env.PWD | into string))
     if (($env.NVAULT_LAST_DIR? | default '') == $here) { return }
-    let probe = (try { ^nvault dir | complete } catch { { stdout: '', stderr: '', exit_code: 127 } })
-    if $probe.exit_code != 0 { return }
-    let root = ($probe.stdout | str trim)
-    if ($root | is-empty) {
-        hide-env -i NVAULT_DIR
-    } else {
-        $env.NVAULT_DIR = $root
-    }
+    hide-env -i NVAULT_LAST_DIR
+    hide-env -i NVAULT_DIR
     if (($env.NVAULT_LOADED_KEYS? | default '') | is-not-empty) {
         for key in ($env.NVAULT_LOADED_KEYS | split row ' ') {
             if (($key | is-not-empty) and ($key =~ '^[A-Za-z_][A-Za-z0-9_]*$')) {
@@ -477,13 +517,24 @@ def --env _nvault_hook [] {
         }
         hide-env -i NVAULT_LOADED_KEYS
     }
+    let probe = (try { ^nvault dir | complete } catch { { stdout: '', stderr: '', exit_code: 127 } })
+    if $probe.exit_code != 0 {
+        print -e 'nvault: could not load this directory; will retry'
+        return
+    }
+    let root = ($probe.stdout | str trim)
+    if (not ($root | is-empty)) { $env.NVAULT_DIR = $root }
     if ((not ($root | is-empty)) and (($env.NVAULT_AUTOLOAD? | default '0') == '1')) {
         let loaded = (try { ^nvault env --shell json | complete } catch { { stdout: '', stderr: '', exit_code: 127 } })
         if $loaded.exit_code != 0 {
             print -e 'nvault: could not load this directory; will retry'
             return
         }
-        let values = (try { $loaded.stdout | from json } catch { {} })
+        let values = (try { $loaded.stdout | from json } catch { null })
+        if (not ((($values | describe) | str starts-with 'record'))) {
+            print -e 'nvault: could not load this directory; will retry'
+            return
+        }
         if ($values | is-not-empty) { load-env $values }
     }
     $env.NVAULT_LAST_DIR = $here
@@ -507,7 +558,7 @@ mod tests {
     use crate::cli::{EnvShell, HookShell};
     use crate::secret::Secret;
 
-    const ALL_ENV_SHELLS: [EnvShell; 7] = [
+    const ALL_ENV_SHELLS: [EnvShell; 8] = [
         EnvShell::Bash,
         EnvShell::Zsh,
         EnvShell::Fish,
@@ -515,6 +566,7 @@ mod tests {
         EnvShell::Pwsh,
         EnvShell::Nu,
         EnvShell::Json,
+        EnvShell::JsonBase64,
     ];
     const ALL_HOOK_SHELLS: [HookShell; 6] = [
         HookShell::Bash,
@@ -612,6 +664,34 @@ mod tests {
     }
 
     #[test]
+    fn json_base64_preserves_exact_values() {
+        use base64::Engine as _;
+
+        let exports = [
+            export("STAMP", "2020-01-01T00:00:00Z"),
+            export("UNICODE", "héllo"),
+            export("EMPTY", ""),
+        ];
+        let output = render_env(&exports, EnvShell::JsonBase64).expect("json-base64");
+        assert!(
+            !output.contains("2020-01-01"),
+            "the timestamp appears plainly in {output}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&output).expect("json object");
+        let decode = |name: &str| {
+            let encoded = value[name].as_str().expect("base64 string");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("base64");
+            String::from_utf8(bytes).expect("utf8")
+        };
+        assert_eq!(decode("STAMP"), "2020-01-01T00:00:00Z");
+        assert_eq!(decode("UNICODE"), "héllo");
+        assert_eq!(decode("EMPTY"), "");
+        assert_eq!(decode("NVAULT_LOADED_KEYS"), "STAMP UNICODE EMPTY");
+    }
+
+    #[test]
     fn nu_exports_are_json_data() {
         let payload = "x'); touch PWNED-MARKER; # héllo\nnext";
         let output = render_env(&[export("TOKEN", payload)], EnvShell::Nu).expect("env");
@@ -623,15 +703,14 @@ mod tests {
     }
 
     #[test]
-    fn hooks_clean_loaded_names_before_considering_autoload() {
+    fn hooks_clean_before_probing_and_probe_before_autoload() {
         for shell in ALL_HOOK_SHELLS {
             let script = hook(shell);
             let cleanup = script.find("NVAULT_LOADED_KEYS").expect("cleanup");
-            let autoload = script.find("NVAULT_AUTOLOAD").expect("autoload check");
-            assert!(
-                cleanup < autoload,
-                "{shell:?} checks autoload before cleanup"
-            );
+            let probe = script.find("nvault dir ").expect("directory probe");
+            let autoload = script.rfind("NVAULT_AUTOLOAD").expect("autoload check");
+            assert!(cleanup < probe, "{shell:?} probes before cleaning exports");
+            assert!(probe < autoload, "{shell:?} loads before probing");
         }
     }
 
@@ -779,20 +858,61 @@ mod tests {
         env_body: &str,
         counter: Option<&std::path::Path>,
         failures: usize,
+        dir_fail: Option<&std::path::Path>,
     ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let count = counter
             .map(|path| path.display().to_string())
             .unwrap_or_default();
+        let dir_fail = dir_fail
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
         let path = dir.join("nvault");
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\ncase \"$1\" in\n  dir) printf '%s\\n' \"$FAKE_NVAULT_DIR\" ;;\n  env)\n    COUNT='{count}'\n    FAILS={failures}\n    if [ -n \"$COUNT\" ]; then\n      n=0\n      [ -f \"$COUNT\" ] && n=$(cat \"$COUNT\")\n      n=$((n + 1))\n      printf '%s' \"$n\" > \"$COUNT\"\n      if [ \"$n\" -le \"$FAILS\" ]; then\n        printf '%s\\n' 'transient failure' >&2\n        exit 1\n      fi\n    fi\n    cat <<'NVAULT_FAKE_ENV_END'\n{env_body}NVAULT_FAKE_ENV_END\n    ;;\n  *) exit 2 ;;\nesac\n"
+                "#!/bin/sh\ncase \"$1\" in\n  dir)\n    DIR_FAIL='{dir_fail}'\n    if [ -n \"$DIR_FAIL\" ] && [ -f \"$DIR_FAIL\" ]; then exit 1; fi\n    printf '%s\\n' \"$FAKE_NVAULT_DIR\"\n    ;;\n  env)\n    COUNT='{count}'\n    FAILS={failures}\n    if [ -n \"$COUNT\" ]; then\n      n=0\n      [ -f \"$COUNT\" ] && n=$(cat \"$COUNT\")\n      n=$((n + 1))\n      printf '%s' \"$n\" > \"$COUNT\"\n      if [ \"$n\" -le \"$FAILS\" ]; then\n        printf '%s\\n' 'transient failure' >&2\n        exit 1\n      fi\n    fi\n    cat <<'NVAULT_FAKE_ENV_END'\n{env_body}NVAULT_FAKE_ENV_END\n    ;;\n  *) exit 2 ;;\nesac\n"
             ),
         )
         .expect("fake nvault");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake nvault");
+        path
+    }
+
+    /// Writes a fake `nvault` that serves a different `env` body per call.
+    ///
+    /// Call N prints `bodies[N - 1]`, or the last body after that.
+    #[cfg(unix)]
+    fn fake_nvault_sequence(
+        dir: &std::path::Path,
+        counter: &std::path::Path,
+        bodies: &[&str],
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let body_dir = counter.parent().expect("counter parent");
+        for (index, body) in bodies.iter().enumerate() {
+            std::fs::write(body_dir.join(format!("body.{}", index + 1)), body).expect("body file");
+        }
+        std::fs::write(
+            body_dir.join("body.last"),
+            bodies.last().expect("at least one body"),
+        )
+        .expect("last body");
+
+        let path = dir.join("nvault");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  dir) printf '%s\\n' \"$FAKE_NVAULT_DIR\" ;;\n  env)\n    COUNT='{}'\n    n=0\n    [ -f \"$COUNT\" ] && n=$(cat \"$COUNT\")\n    n=$((n + 1))\n    printf '%s' \"$n\" > \"$COUNT\"\n    BODY='{}/body.'\"$n\"\n    [ -f \"$BODY\" ] || BODY='{}/body.last'\n    cat \"$BODY\"\n    ;;\n  *) exit 2 ;;\nesac\n",
+                counter.display(),
+                body_dir.display(),
+                body_dir.display()
+            ),
+        )
+        .expect("fake nvault sequence");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
             .expect("chmod fake nvault");
         path
@@ -841,7 +961,7 @@ mod tests {
         std::fs::create_dir_all(&other).expect("other");
 
         let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Bash).expect("env");
-        fake_nvault(&bin, &rendered, None, 0);
+        fake_nvault(&bin, &rendered, None, 0, None);
         let hook_file = write_hook(&base, HookShell::Bash, "hook.bash");
         let script = base.join("test.bash");
         std::fs::write(
@@ -884,7 +1004,7 @@ _nvault_hook
 
         let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Bash).expect("env");
         let counter = base.join("count");
-        fake_nvault(&bin, &rendered, Some(&counter), 1);
+        fake_nvault(&bin, &rendered, Some(&counter), 1, None);
         let hook_file = write_hook(&base, HookShell::Bash, "hook.bash");
         let script = base.join("test.bash");
         std::fs::write(
@@ -933,7 +1053,7 @@ _nvault_hook
         std::fs::create_dir_all(&other).expect("other");
 
         let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Zsh).expect("env");
-        fake_nvault(&bin, &rendered, None, 0);
+        fake_nvault(&bin, &rendered, None, 0, None);
         let hook_file = write_hook(&base, HookShell::Zsh, "hook.zsh");
         let script = base.join("test.zsh");
         std::fs::write(
@@ -975,7 +1095,7 @@ cd "{}"
 
         let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Zsh).expect("env");
         let counter = base.join("count");
-        fake_nvault(&bin, &rendered, Some(&counter), 1);
+        fake_nvault(&bin, &rendered, Some(&counter), 1, None);
         let hook_file = write_hook(&base, HookShell::Zsh, "hook.zsh");
         let script = base.join("test.zsh");
         std::fs::write(
@@ -1025,7 +1145,7 @@ source "{}"
 
         let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Fish).expect("env");
         let counter = base.join("count");
-        fake_nvault(&bin, &rendered, Some(&counter), 1);
+        fake_nvault(&bin, &rendered, Some(&counter), 1, None);
         let hook_file = write_hook(&base, HookShell::Fish, "hook.fish");
         let script = base.join("test.fish");
         std::fs::write(
@@ -1074,7 +1194,7 @@ test "$FAKE_SECRET" = "loaded"; or exit 20
         std::fs::create_dir_all(&other).expect("other");
 
         let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Fish).expect("env");
-        fake_nvault(&bin, &rendered, None, 0);
+        fake_nvault(&bin, &rendered, None, 0, None);
         let hook_file = write_hook(&base, HookShell::Fish, "hook.fish");
         let script = base.join("test.fish");
         std::fs::write(
@@ -1123,18 +1243,26 @@ not set -q FAKE_SECRET; or exit 22
             "x’ ; New-Item -ItemType File -Path '{}' -Force; ’y",
             marker.display()
         );
+        let timestamp = "2020-01-01T00:00:00Z";
+        let unicode = "héllo\nline";
         let rendered = render_env(
             &[
                 export("FAKE_SECRET", &payload),
+                export("STAMP", timestamp),
+                export("UNICODE", unicode),
                 export("SECOND_KEY", "second"),
             ],
-            EnvShell::Json,
+            EnvShell::JsonBase64,
         )
         .expect("env");
-        fake_nvault(&bin, &rendered, None, 0);
+        fake_nvault(&bin, &rendered, None, 0, None);
 
         let payload_file = base.join("payload.txt");
         std::fs::write(&payload_file, payload.as_bytes()).expect("payload file");
+        let stamp_file = base.join("stamp.txt");
+        std::fs::write(&stamp_file, timestamp.as_bytes()).expect("stamp file");
+        let unicode_file = base.join("unicode.txt");
+        std::fs::write(&unicode_file, unicode.as_bytes()).expect("unicode file");
         let hook_file = write_hook(&base, HookShell::Pwsh, "hook.ps1");
         let script = base.join("test.ps1");
         std::fs::write(
@@ -1149,7 +1277,9 @@ $env:NVAULT_AUTOLOAD = '1'
 _nvault_hook
 if ((prompt) -ne 'ORIGINAL> ') { exit 26 }
 if ($env:FAKE_SECRET -ne [IO.File]::ReadAllText('__PAYLOAD__')) { exit 20 }
-if ($env:NVAULT_LOADED_KEYS -ne 'FAKE_SECRET SECOND_KEY') { exit 21 }
+if ($env:STAMP -ne [IO.File]::ReadAllText('__STAMP__')) { exit 27 }
+if ($env:UNICODE -ne [IO.File]::ReadAllText('__UNICODE__')) { exit 28 }
+if ($env:NVAULT_LOADED_KEYS -ne 'FAKE_SECRET STAMP UNICODE SECOND_KEY') { exit 21 }
 if (Test-Path -LiteralPath '__MARKER__') { exit 24 }
 $env:NVAULT_AUTOLOAD = '0'
 Set-Location -LiteralPath '__OTHER__'
@@ -1162,6 +1292,8 @@ if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 23 }
             .replace("__OTHER__", &other.display().to_string())
             .replace("__HOOK__", &hook_file.display().to_string())
             .replace("__PAYLOAD__", &payload_file.display().to_string())
+            .replace("__STAMP__", &stamp_file.display().to_string())
+            .replace("__UNICODE__", &unicode_file.display().to_string())
             .replace("__MARKER__", &marker.display().to_string()),
         )
         .expect("test script");
@@ -1235,9 +1367,10 @@ if (Test-Path -LiteralPath '__MARKER__') { exit 24 }
         std::fs::create_dir_all(&bin).expect("bin");
         std::fs::create_dir_all(&root).expect("root");
 
-        let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Json).expect("env");
+        let rendered =
+            render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::JsonBase64).expect("env");
         let counter = base.join("count");
-        fake_nvault(&bin, &rendered, Some(&counter), 1);
+        fake_nvault(&bin, &rendered, Some(&counter), 1, None);
         let hook_file = write_hook(&base, HookShell::Pwsh, "hook.ps1");
         let script = base.join("test.ps1");
         std::fs::write(
@@ -1300,7 +1433,7 @@ if ($env:FAKE_SECRET -ne 'loaded') { exit 20 }
             EnvShell::Json,
         )
         .expect("env");
-        fake_nvault(&bin, &rendered, None, 0);
+        fake_nvault(&bin, &rendered, None, 0, None);
 
         let payload_file = base.join("payload.txt");
         std::fs::write(&payload_file, payload.as_bytes()).expect("payload file");
@@ -1359,7 +1492,7 @@ if (($env.NVAULT_LOADED_KEYS? | default '') | is-not-empty) { exit 23 }
         std::fs::create_dir_all(&root).expect("root");
 
         let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Json).expect("env");
-        fake_nvault(&bin, &rendered, None, 0);
+        fake_nvault(&bin, &rendered, None, 0, None);
         let hook_file = write_hook(&base, HookShell::Nu, "hook.nu");
 
         let child = base.join("child.nu");
@@ -1419,7 +1552,7 @@ if (($hooks.stdout | str trim) != '1') {{ exit 22 }}
 
         let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Json).expect("env");
         let counter = base.join("count");
-        fake_nvault(&bin, &rendered, Some(&counter), 1);
+        fake_nvault(&bin, &rendered, Some(&counter), 1, None);
         let hook_file = write_hook(&base, HookShell::Nu, "hook.nu");
         let script = base.join("test.nu");
         std::fs::write(
@@ -1454,6 +1587,443 @@ if (($env.FAKE_SECRET? | default '') != 'loaded') {{ exit 20 }}
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "2");
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_hook_cleans_exports_when_the_probe_fails() {
+        let base = temp_base("bash-probe-fail");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&other).expect("other");
+
+        let dir_fails = base.join("dir-fails");
+        let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Bash).expect("env");
+        fake_nvault(&bin, &rendered, None, 0, Some(&dir_fails));
+        let hook_file = write_hook(&base, HookShell::Bash, "hook.bash");
+        let script = base.join("test.bash");
+        std::fs::write(
+            &script,
+            format!(
+                r#"export PATH="{}:$PATH"
+export FAKE_NVAULT_DIR="{}"
+export NVAULT_AUTOLOAD=1
+source "{}"
+[ "${{FAKE_SECRET:-}}" = "loaded" ] || exit 20
+: > "{}"
+cd "{}"
+_nvault_hook
+[ -z "${{FAKE_SECRET+x}}" ] || exit 21
+[ -z "${{NVAULT_LOADED_KEYS+x}}" ] || exit 22
+[ -z "${{NVAULT_DIR+x}}" ] || exit 23
+[ -z "${{NVAULT_LAST_DIR+x}}" ] || exit 24
+rm -f "{}"
+_nvault_hook
+[ "${{FAKE_SECRET:-}}" = "loaded" ] || exit 25
+"#,
+                bin.display(),
+                root.display(),
+                hook_file.display(),
+                dir_fails.display(),
+                other.display(),
+                dir_fails.display(),
+            ),
+        )
+        .expect("test script");
+
+        let output = run("bash", "--noprofile", &script, &base);
+        assert_ok(&output, "bash probe failure");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_hook_cleans_exports_when_the_probe_fails() {
+        let Some(zsh) = shell_binary("zsh") else {
+            return;
+        };
+        let base = temp_base("zsh-probe-fail");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&other).expect("other");
+
+        let dir_fails = base.join("dir-fails");
+        let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Zsh).expect("env");
+        fake_nvault(&bin, &rendered, None, 0, Some(&dir_fails));
+        let hook_file = write_hook(&base, HookShell::Zsh, "hook.zsh");
+        let script = base.join("test.zsh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"export PATH="{}:$PATH"
+export FAKE_NVAULT_DIR="{}"
+export NVAULT_AUTOLOAD=1
+source "{}"
+[ "${{FAKE_SECRET:-}}" = "loaded" ] || exit 20
+: > "{}"
+cd "{}"
+[ -z "${{FAKE_SECRET+x}}" ] || exit 21
+[ -z "${{NVAULT_LOADED_KEYS+x}}" ] || exit 22
+[ -z "${{NVAULT_DIR+x}}" ] || exit 23
+[ -z "${{NVAULT_LAST_DIR+x}}" ] || exit 24
+rm -f "{}"
+_nvault_hook
+[ "${{FAKE_SECRET:-}}" = "loaded" ] || exit 25
+"#,
+                bin.display(),
+                root.display(),
+                hook_file.display(),
+                dir_fails.display(),
+                other.display(),
+                dir_fails.display(),
+            ),
+        )
+        .expect("test script");
+
+        let output = run(&zsh, "-f", &script, &base);
+        assert_ok(&output, "zsh probe failure");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fish_hook_cleans_exports_when_the_probe_fails() {
+        let Some(fish) = shell_binary("fish") else {
+            return;
+        };
+        let base = temp_base("fish-probe-fail");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&other).expect("other");
+
+        let dir_fails = base.join("dir-fails");
+        let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Fish).expect("env");
+        fake_nvault(&bin, &rendered, None, 0, Some(&dir_fails));
+        let hook_file = write_hook(&base, HookShell::Fish, "hook.fish");
+        let script = base.join("test.fish");
+        std::fs::write(
+            &script,
+            format!(
+                r#"set -gx PATH "{}" $PATH
+set -gx FAKE_NVAULT_DIR "{}"
+set -gx NVAULT_AUTOLOAD 1
+source "{}"
+test "$FAKE_SECRET" = "loaded"; or exit 20
+touch "{}"
+cd "{}"
+not set -q FAKE_SECRET; or exit 21
+not set -q NVAULT_LOADED_KEYS; or exit 22
+not set -q NVAULT_DIR; or exit 23
+not set -q NVAULT_LAST_DIR; or exit 24
+rm -f "{}"
+_nvault_hook
+test "$FAKE_SECRET" = "loaded"; or exit 25
+"#,
+                bin.display(),
+                root.display(),
+                hook_file.display(),
+                dir_fails.display(),
+                other.display(),
+                dir_fails.display(),
+            ),
+        )
+        .expect("test script");
+
+        let output = run(&fish, "--no-config", &script, &base);
+        assert_ok(&output, "fish probe failure");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pwsh_hook_cleans_exports_when_the_probe_fails() {
+        let Some(pwsh) = shell_binary("pwsh") else {
+            return;
+        };
+        let base = temp_base("pwsh-probe-fail");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&other).expect("other");
+
+        let dir_fails = base.join("dir-fails");
+        let rendered =
+            render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::JsonBase64).expect("env");
+        fake_nvault(&bin, &rendered, None, 0, Some(&dir_fails));
+        let hook_file = write_hook(&base, HookShell::Pwsh, "hook.ps1");
+        let script = base.join("test.ps1");
+        std::fs::write(
+            &script,
+            r#"
+$ErrorActionPreference = 'Stop'
+$env:PATH = '__BIN__' + [IO.Path]::PathSeparator + $env:PATH
+$env:FAKE_NVAULT_DIR = '__ROOT__'
+$env:NVAULT_AUTOLOAD = '1'
+. '__HOOK__'
+if ($env:FAKE_SECRET -ne 'loaded') { exit 20 }
+New-Item -ItemType File -Path '__DIR_FAILS__' -Force | Out-Null
+Set-Location -LiteralPath '__OTHER__'
+_nvault_hook
+if (Test-Path Env:\FAKE_SECRET) { exit 21 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 22 }
+if (Test-Path Env:\NVAULT_DIR) { exit 23 }
+if ($null -ne $global:_nvault_last_dir) { exit 24 }
+Remove-Item -LiteralPath '__DIR_FAILS__'
+_nvault_hook
+if ($env:FAKE_SECRET -ne 'loaded') { exit 25 }
+"#
+            .replace("__BIN__", &bin.display().to_string())
+            .replace("__ROOT__", &root.display().to_string())
+            .replace("__OTHER__", &other.display().to_string())
+            .replace("__HOOK__", &hook_file.display().to_string())
+            .replace("__DIR_FAILS__", &dir_fails.display().to_string()),
+        )
+        .expect("test script");
+
+        let output = std::process::Command::new(&pwsh)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-File")
+            .arg(&script)
+            .current_dir(&base)
+            .output()
+            .expect("run pwsh");
+        assert_ok(&output, "pwsh probe failure");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nu_hook_cleans_exports_when_the_probe_fails() {
+        let Some(nu) = shell_binary("nu") else {
+            return;
+        };
+        let base = temp_base("nu-probe-fail");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        let other = base.join("other");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&other).expect("other");
+
+        let dir_fails = base.join("dir-fails");
+        let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Json).expect("env");
+        fake_nvault(&bin, &rendered, None, 0, Some(&dir_fails));
+        let hook_file = write_hook(&base, HookShell::Nu, "hook.nu");
+        let script = base.join("test.nu");
+        std::fs::write(
+            &script,
+            format!(
+                r#"$env.PATH = ($env.PATH | prepend '{}')
+$env.FAKE_NVAULT_DIR = '{}'
+$env.NVAULT_AUTOLOAD = '1'
+source "{}"
+if (($env.FAKE_SECRET? | default '') != 'loaded') {{ exit 20 }}
+touch '{}'
+cd '{}'
+_nvault_hook
+if (($env.FAKE_SECRET? | default '') | is-not-empty) {{ exit 21 }}
+if (($env.NVAULT_LOADED_KEYS? | default '') | is-not-empty) {{ exit 22 }}
+if (($env.NVAULT_DIR? | default '') | is-not-empty) {{ exit 23 }}
+if (($env.NVAULT_LAST_DIR? | default '') | is-not-empty) {{ exit 24 }}
+rm '{}'
+_nvault_hook
+if (($env.FAKE_SECRET? | default '') != 'loaded') {{ exit 25 }}
+"#,
+                bin.display(),
+                root.display(),
+                hook_file.display(),
+                dir_fails.display(),
+                other.display(),
+                dir_fails.display(),
+            ),
+        )
+        .expect("test script");
+
+        let output = std::process::Command::new(&nu)
+            .arg("--no-config-file")
+            .arg(&script)
+            .current_dir(&base)
+            .output()
+            .expect("run nu");
+        assert_ok(&output, "nu probe failure");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_hook_retries_from_the_next_prompt_and_keeps_existing_precmd_hooks() {
+        let (Some(zsh), Some(_script)) = (shell_binary("zsh"), shell_binary("script")) else {
+            return;
+        };
+        let base = temp_base("zsh-precmd");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let rendered = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Zsh).expect("env");
+        let counter = base.join("count");
+        fake_nvault(&bin, &rendered, Some(&counter), 1, None);
+        let hook_file = write_hook(&base, HookShell::Zsh, "hook.zsh");
+        let result = base.join("result.txt");
+        let counts = base.join("counts.txt");
+        let mine = base.join("mine.txt");
+
+        let input = format!(
+            r#"my_precmd() {{ print -r -- mine >> '{}' }}
+precmd_functions=(my_precmd)
+source '{}'
+print -r -- "$#chpwd_functions $#precmd_functions" > '{}'
+print -r -- "$FAKE_SECRET" > '{}'
+exit
+"#,
+            mine.display(),
+            hook_file.display(),
+            counts.display(),
+            result.display(),
+        );
+
+        let mut child = std::process::Command::new("script")
+            .arg("-qec")
+            .arg(format!("{zsh} -f -i"))
+            .arg("/dev/null")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("FAKE_NVAULT_DIR", root.display().to_string())
+            .env("NVAULT_AUTOLOAD", "1")
+            .current_dir(&base)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn interactive zsh");
+        std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), input.as_bytes())
+            .expect("write commands");
+        drop(child.stdin.take());
+        let output = child.wait_with_output().expect("wait for zsh");
+
+        assert_ok(&output, "zsh prompt retry");
+        assert_eq!(
+            std::fs::read_to_string(&result).expect("result").trim(),
+            "loaded",
+            "the prompt did not retry the failed load"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counts).expect("counts").trim(),
+            "1 2",
+            "an existing precmd hook was not preserved, or ours was duplicated"
+        );
+        assert!(
+            std::fs::read_to_string(&mine)
+                .expect("mine")
+                .contains("mine"),
+            "the user's precmd hook did not run"
+        );
+        assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "2");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nu_hook_retries_malformed_and_wrong_shaped_json() {
+        let Some(nu) = shell_binary("nu") else {
+            return;
+        };
+        let base = temp_base("nu-malformed");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let valid = render_env(&[export("FAKE_SECRET", "loaded")], EnvShell::Json).expect("env");
+        let counter = base.join("count");
+        fake_nvault_sequence(&bin, &counter, &["{oops\n", "[1,2]\n", valid.as_str()]);
+        let hook_file = write_hook(&base, HookShell::Nu, "hook.nu");
+        let script = base.join("test.nu");
+        std::fs::write(
+            &script,
+            format!(
+                r#"$env.PATH = ($env.PATH | prepend '{}')
+$env.FAKE_NVAULT_DIR = '{}'
+$env.NVAULT_AUTOLOAD = '1'
+source "{}"
+if (($env.NVAULT_LAST_DIR? | default '') | is-not-empty) {{ exit 30 }}
+if (($env.FAKE_SECRET? | default '') | is-not-empty) {{ exit 31 }}
+_nvault_hook
+if (($env.NVAULT_LAST_DIR? | default '') | is-not-empty) {{ exit 32 }}
+if (($env.FAKE_SECRET? | default '') | is-not-empty) {{ exit 33 }}
+_nvault_hook
+if (($env.FAKE_SECRET? | default '') != 'loaded') {{ exit 20 }}
+"#,
+                bin.display(),
+                root.display(),
+                hook_file.display(),
+            ),
+        )
+        .expect("test script");
+
+        let output = std::process::Command::new(&nu)
+            .arg("--no-config-file")
+            .arg(&script)
+            .current_dir(&base)
+            .output()
+            .expect("run nu");
+        assert_ok(&output, "nu malformed json retry");
+        assert_eq!(std::fs::read_to_string(&counter).expect("counter"), "3");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.matches("will retry").count() >= 2,
+            "expected a diagnostic per failure: {stderr}"
+        );
         std::fs::remove_dir_all(base).expect("remove temp hook dir");
     }
 }
