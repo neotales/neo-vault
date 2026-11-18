@@ -949,6 +949,33 @@ mod tests {
         path
     }
 
+    /// Writes the hook and a driver script as two distinct files.
+    ///
+    /// A driver written over the hook would make `. __HOOK__` dot-source the
+    /// driver again. The body builder receives the hook path and the hook is
+    /// re-read after the driver is written, so a shared path cannot regress
+    /// unnoticed. Returns `(hook, driver)`.
+    fn write_windows_driver(
+        base: &std::path::Path,
+        driver_name: &str,
+        body: impl FnOnce(&std::path::Path) -> String,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let hook_path = write_hook_file(base, HookShell::PowerShell, "hook.ps1");
+        let driver_path = base.join(driver_name);
+        assert_ne!(
+            hook_path, driver_path,
+            "the driver must not replace the hook"
+        );
+        std::fs::write(&driver_path, body(&hook_path)).expect("driver script");
+        let written = std::fs::read_to_string(&hook_path).expect("read the hook back");
+        assert_eq!(
+            written,
+            hook(HookShell::PowerShell),
+            "the driver replaced the hook file"
+        );
+        (hook_path, driver_path)
+    }
+
     /// Returns whether `name --version` runs.
     ///
     /// Generation tests always run; execution tests skip with an explicit
@@ -1652,6 +1679,28 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major 
         );
     }
 
+    /// Proves the driver and the hook are separate files on every host.
+    ///
+    /// The five 5.1 tests write a driver and a hook into one directory. This
+    /// test runs locally without PowerShell and fails if the helper ever puts
+    /// the driver on the hook's path.
+    #[test]
+    fn windows_driver_never_overwrites_the_hook() {
+        let base = temp_base("win-driver");
+        let (hook_path, driver_path) = write_windows_driver(&base, "driver.ps1", |hook_path| {
+            format!("# driver reads {}\n", hook_path.display())
+        });
+        assert_ne!(hook_path, driver_path);
+        assert_eq!(
+            std::fs::read_to_string(&hook_path).expect("hook"),
+            hook(HookShell::PowerShell)
+        );
+        let driver = std::fs::read_to_string(&driver_path).expect("driver");
+        assert!(driver.starts_with("# driver reads "));
+        assert!(driver.contains("hook.ps1"));
+        std::fs::remove_dir_all(base).expect("remove temp driver dir");
+    }
+
     #[cfg_attr(not(windows), ignore = "requires Windows PowerShell 5.1")]
     #[test]
     fn windows_powershell_51_hook_loads_and_cleans_up() {
@@ -1687,10 +1736,7 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major 
         std::fs::write(&stamp_file, timestamp.as_bytes()).expect("stamp file");
         let unicode_file = base.join("unicode.txt");
         std::fs::write(&unicode_file, unicode.as_bytes()).expect("unicode file");
-        let hook_file = write_hook_file(&base, HookShell::PowerShell, "hook.ps1");
-        let script = base.join("hook.ps1");
-        std::fs::write(
-            &script,
+        let (_hook_file, script) = write_windows_driver(&base, "driver.ps1", |hook_file| {
             WINDOWS_PS51_GUARD.to_owned()
                 + &r#"function global:prompt { 'ORIGINAL> ' }
 $env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
@@ -1715,15 +1761,14 @@ if (Test-Path Env:\SECOND_KEY) { exit 37 }
 if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 23 }
 "#
                 .replace("__BIN__", &ps_literal(&bin))
-                .replace("__HOOK__", &ps_literal(&hook_file))
+                .replace("__HOOK__", &ps_literal(hook_file))
                 .replace("__PAYLOAD__", &ps_literal(&payload_file))
                 .replace("__STAMP__", &ps_literal(&stamp_file))
                 .replace("__UNICODE__", &ps_literal(&unicode_file))
                 .replace("__ROOTPATH__", &ps_literal(&root))
                 .replace("__MARKER__", &ps_literal(&marker))
-                .replace("__OTHER__", &ps_literal(&other)),
-        )
-        .expect("test script");
+                .replace("__OTHER__", &ps_literal(&other))
+        });
 
         let output = run_windows_powershell(&script, &base);
         assert_windows_ok(&output, "Windows PowerShell 5.1 hook");
@@ -1785,10 +1830,7 @@ if (Test-Path -LiteralPath __MARKER__) { exit 24 }
         fake_nvault_cmd(&bin, &rendered, &format!("{}\r\n", root.display()));
         let sentinel = bin.join("dir-fail");
         std::fs::write(&sentinel, b"").expect("dir-fail sentinel");
-        let hook_file = write_hook_file(&base, HookShell::PowerShell, "retry.ps1");
-        let script = base.join("retry.ps1");
-        std::fs::write(
-            &script,
+        let (_hook_file, script) = write_windows_driver(&base, "driver.ps1", |hook_file| {
             WINDOWS_PS51_GUARD.to_owned()
                 + &r#"$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
 $env:NVAULT_AUTOLOAD = '1'
@@ -1800,9 +1842,8 @@ if ($env:FAKE_SECRET -cne 'loaded') { exit 20 }
 if ($env:NVAULT_LOADED_KEYS -cne 'FAKE_SECRET') { exit 21 }
 "#
                 .replace("__BIN__", &ps_literal(&bin))
-                .replace("__HOOK__", &ps_literal(&hook_file)),
-        )
-        .expect("test script");
+                .replace("__HOOK__", &ps_literal(hook_file))
+        });
 
         let output = run_windows_powershell(&script, &base);
         assert_windows_ok(&output, "Windows PowerShell 5.1 retry");
@@ -1824,10 +1865,7 @@ if ($env:NVAULT_LOADED_KEYS -cne 'FAKE_SECRET') { exit 21 }
         std::fs::create_dir_all(&root).expect("root");
 
         fake_nvault_cmd(&bin, "{}\n", &format!("{}\r\n", root.display()));
-        let hook_file = write_hook_file(&base, HookShell::PowerShell, "pending.ps1");
-        let script = base.join("pending.ps1");
-        std::fs::write(
-            &script,
+        let (_hook_file, script) = write_windows_driver(&base, "driver.ps1", |hook_file| {
             WINDOWS_PS51_GUARD.to_owned()
                 + &r#"$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
 $env:NVAULT_AUTOLOAD = '0'
@@ -1846,9 +1884,8 @@ if (Test-Path Env:\ABSENT) { exit 38 }
 if ($global:_nvault_pending_cleanup.Count -ne 0) { exit 39 }
 "#
                 .replace("__BIN__", &ps_literal(&bin))
-                .replace("__HOOK__", &ps_literal(&hook_file)),
-        )
-        .expect("test script");
+                .replace("__HOOK__", &ps_literal(hook_file))
+        });
 
         let output = run_windows_powershell(&script, &base);
         assert_windows_ok(&output, "Windows PowerShell 5.1 pending cleanup");
@@ -1871,10 +1908,7 @@ if ($global:_nvault_pending_cleanup.Count -ne 0) { exit 39 }
         std::fs::create_dir_all(&root).expect("root");
 
         fake_nvault_cmd(&bin, "not-json\n", &format!("{}\r\n", root.display()));
-        let hook_file = write_hook_file(&base, HookShell::PowerShell, "invalid.ps1");
-        let script = base.join("invalid.ps1");
-        std::fs::write(
-            &script,
+        let (_hook_file, script) = write_windows_driver(&base, "driver.ps1", |hook_file| {
             WINDOWS_PS51_GUARD.to_owned()
                 + &r#"$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
 $env:NVAULT_AUTOLOAD = '1'
@@ -1884,9 +1918,8 @@ if (Test-Path Env:\FAKE_SECRET) { exit 20 }
 if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 21 }
 "#
                 .replace("__BIN__", &ps_literal(&bin))
-                .replace("__HOOK__", &ps_literal(&hook_file)),
-        )
-        .expect("test script");
+                .replace("__HOOK__", &ps_literal(hook_file))
+        });
 
         let output = run_windows_powershell(&script, &base);
         assert_windows_ok(&output, "Windows PowerShell 5.1 invalid JSON");
@@ -1915,10 +1948,7 @@ if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 21 }
             encode("OTHER_KEY")
         );
         fake_nvault_cmd(&bin, &body, &format!("{}\r\n", root.display()));
-        let hook_file = write_hook_file(&base, HookShell::PowerShell, "tracking.ps1");
-        let script = base.join("tracking.ps1");
-        std::fs::write(
-            &script,
+        let (_hook_file, script) = write_windows_driver(&base, "driver.ps1", |hook_file| {
             WINDOWS_PS51_GUARD.to_owned()
                 + &r#"$env:PATH = __BIN__ + [IO.Path]::PathSeparator + $env:PATH
 $env:NVAULT_AUTOLOAD = '1'
@@ -1928,9 +1958,8 @@ if (Test-Path Env:\FAKE_SECRET) { exit 20 }
 if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 21 }
 "#
                 .replace("__BIN__", &ps_literal(&bin))
-                .replace("__HOOK__", &ps_literal(&hook_file)),
-        )
-        .expect("test script");
+                .replace("__HOOK__", &ps_literal(hook_file))
+        });
 
         let output = run_windows_powershell(&script, &base);
         assert_windows_ok(&output, "Windows PowerShell 5.1 tracking");

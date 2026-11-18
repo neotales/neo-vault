@@ -32,21 +32,40 @@ jobs:
             throw "expected Windows PowerShell 5.1, found $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
           }
           $rustc = (& rustc --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "rustc --version failed with exit code $LASTEXITCODE"
+          }
           if ($rustc -notmatch '^rustc 1\.100\.0 ') {
             throw "expected rustc 1.100.0 from rust-toolchain.toml, found $rustc"
           }
+          $cargo = (& cargo --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo --version failed with exit code $LASTEXITCODE"
+          }
           Write-Output "PS51_OK $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
           Write-Output $rustc
-          Write-Output ((& cargo --version | Out-String).Trim())
+          Write-Output $cargo
 
       - name: Run the shell hook tests on 5.1
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $output = & cargo test --lib windows_powershell_51 -- --test-threads=1 --nocapture 2>&1 | Out-String
+
+          # PowerShell 5.1 turns native stderr into an ErrorRecord when `2>&1`
+          # is used, and Stop would end the step before the exit code is read.
+          # cmd.exe merges the streams, the code is saved immediately, and Stop
+          # is restored before the explicit checks below.
+          $previous = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $output = (& cmd.exe /d /c 'cargo test --lib windows_powershell_51 -- --test-threads=1 --nocapture 2>&1' | Out-String)
+            $code = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $previous
+          }
           Write-Output $output
-          if ($LASTEXITCODE -ne 0) {
-            throw "cargo test failed with exit code $LASTEXITCODE"
+          if ($code -ne 0) {
+            throw "cargo test failed with exit code $code"
           }
           if ($output -notmatch 'test result: ok\. 6 passed; 0 failed; 0 ignored') {
             throw 'the Windows PowerShell 5.1 tests did not all run and pass'

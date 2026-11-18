@@ -11,8 +11,12 @@ README was never executed: this repository's Linux worktree can run PowerShell 7
 cargo test --lib windows_powershell_51 -- --test-threads=1 --nocapture
 ```
 
-Six tests in `src/shell.rs`:
+Six 5.1 tests in `src/shell.rs`, plus a host-independent invariant:
 
+- `windows_driver_never_overwrites_the_hook` — runs in ordinary `cargo test` on
+  every host. Each 5.1 test writes a hook and a separate driver script; the
+  helper refuses a shared path and re-reads the hook after the driver is
+  written, so `. __HOOK__` cannot dot-source the driver itself.
 - `windows_powershell_51_hook_loads_and_cleans_up` — source the hook,
   load `dir` + `env --shell json-base64`, keep the previous `prompt`, re-source
   the hook, then change directory and confirm every loaded name and
@@ -33,7 +37,7 @@ Six tests in `src/shell.rs`:
 - `windows_powershell_51_refuses_mismatched_tracking` — `NVAULT_LOADED_KEYS`
   that does not match the decoded names is refused before anything is applied.
 
-Every test asserts `$PSVersionTable.PSEdition -eq 'Desktop'` and
+Every 5.1 test asserts `$PSVersionTable.PSEdition -eq 'Desktop'` and
 `$PSVersionTable.PSVersion` 5.1 in the script, and the Rust helper probes the
 engine first. A different engine exits 90 instead of skipping. The workflow
 repeats the assertion in its own `shell: powershell` step and rejects a run that
@@ -86,6 +90,13 @@ reports `6 ignored`, never passed.
   ignored, which is how a silently skipped 5.1 suite is caught.
 - `nvault: fake: unexpected arguments` on stderr with a test failure — the hook
   invoked the fake CLI with an argument shape the test fixtures do not serve.
+
+The workflow captures the native test command through `cmd.exe` with
+`$ErrorActionPreference = 'Continue'`, saves `$LASTEXITCODE` immediately, then
+restores `Stop` and checks the exit code and the `6 passed; 0 failed; 0 ignored`
+summary. Windows PowerShell 5.1 turns a native command's normal stderr into an
+`ErrorRecord` when `2>&1` is used, and `Stop` would otherwise end the step before
+the code is read.
 
 ## Not covered
 
