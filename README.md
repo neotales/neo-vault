@@ -179,10 +179,20 @@ value, invalid base64 or UTF-8, or a name outside that set is refused with no
 change. `Set-Item` runs with `-ErrorAction Stop`. Before applying anything the
 hook records whether each target variable existed and its value, so if an
 assignment fails (including the `NVAULT_LOADED_KEYS` assignment) every applied
-name is restored to its previous value or removed if it did not exist; a
-partial load never leaves an untracked export and never loses a value the user
-already had. Restoration errors are swallowed and reported only through the
-fixed retry line. Windows PowerShell 5.1 and PowerShell before 7.5 cannot store an empty
+name is restored to its previous value or removed if it did not exist. Before
+the first assignment it also puts every name it will touch, including
+`NVAULT_LOADED_KEYS`, on an in-memory pending-cleanup list. If a restore or
+removal then fails as well, the name stays on that list, the hook prints a
+distinct fixed line, `nvault: could not clean up a failed load; will retry`,
+and refuses to load anything else until the cleanup succeeds on a later
+invocation; the pending name is removed then, so it does not stay set. This is
+not an absolute guarantee: the list lives in the current PowerShell process,
+and if the process exits while cleanup is still failing the value can remain
+until the shell exits. The hook says so rather than claiming otherwise.
+
+The recorded directory is compared ordinally and case-sensitively, so on Linux
+`a` and `A` are different directories and each transition cleans and reloads.
+On Windows the same comparison can cause one extra reload, which is harmless. Windows PowerShell 5.1 and PowerShell before 7.5 cannot store an empty
 environment value, so a load containing an empty value is refused before
 anything is applied and reports the retry line. The refusal applies on every
 edition, so the same payload behaves the same way on 5.1 and 7 and later. A response with no exports and
@@ -244,7 +254,10 @@ tracking, empty value, unsafe name), a case-mismatched tracking name, invalid
 base64 and invalid UTF-8, and four rejected Nushell payloads; rollback of a
 partially applied PowerShell load simulated with a failing `Set-Item`, once for
 an export and once for the tracking assignment, with pre-existing values
-restored; an empty PowerShell export set; malformed and wrong-shaped JSON in
+restored; a failed restore and a failed pending removal that keep the name on
+the pending list until a later invocation cleans it; a case-sensitive directory
+transition between `a` and `A`; a valid-base64 case-mismatched tracking value;
+an empty PowerShell export set; malformed and wrong-shaped JSON in
 Nushell, a transient first failure followed by a successful retry, a real zsh
 prompt retrying a failed load while keeping an existing `precmd` hook, a nested
 Nushell install, and values containing `';` or a smart quote plus a command

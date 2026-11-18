@@ -405,7 +405,26 @@ fn powershell_hook(edition: &str, label: &str) -> String {
 # NVAULT_LOADED_KEYS first. Values load only while NVAULT_AUTOLOAD = '1'.
 function global:_nvault_hook {
     $here = $PWD.Path
-    if ($global:_nvault_last_dir -eq $here) { return }
+    $pending = @($global:_nvault_pending_cleanup | Where-Object { $_ })
+    if ($pending.Count -gt 0) {
+        $still = @()
+        foreach ($name in $pending) {
+            try {
+                $path = 'Env:\' + $name
+                if (Test-Path -LiteralPath $path) {
+                    Remove-Item -LiteralPath $path -ErrorAction Stop
+                }
+            } catch {
+                $still += $name
+            }
+        }
+        $global:_nvault_pending_cleanup = $still
+        if ($still.Count -gt 0) {
+            [Console]::Error.WriteLine('nvault: could not clean up a failed load; will retry')
+            return
+        }
+    }
+    if ($global:_nvault_last_dir -ceq $here) { return }
     $global:_nvault_last_dir = $null
     Remove-Item Env:\NVAULT_DIR -ErrorAction SilentlyContinue
     if ($env:NVAULT_LOADED_KEYS) {
@@ -501,15 +520,17 @@ function global:_nvault_hook {
             [Console]::Error.WriteLine('nvault: could not load this directory; will retry')
             return
         }
+        $global:_nvault_pending_cleanup = @($names + @('NVAULT_LOADED_KEYS'))
         $applied = @()
         try {
             foreach ($name in $names) {
-                Set-Item -LiteralPath ('Env:\' + $name) -Value $decoded[$name] -ErrorAction Stop
                 $applied += $name
+                Set-Item -LiteralPath ('Env:\' + $name) -Value $decoded[$name] -ErrorAction Stop
             }
-            Set-Item -LiteralPath 'Env:\NVAULT_LOADED_KEYS' -Value $tracking -ErrorAction Stop
             $applied += 'NVAULT_LOADED_KEYS'
+            Set-Item -LiteralPath 'Env:\NVAULT_LOADED_KEYS' -Value $tracking -ErrorAction Stop
         } catch {
+            $still = @()
             foreach ($name in $applied) {
                 $path = 'Env:\' + $name
                 $old = $previous[$name]
@@ -522,12 +543,18 @@ function global:_nvault_hook {
                         Set-Item -LiteralPath $path -Value $old -ErrorAction Stop
                     }
                 } catch {
-                    # Never print the old value or the exception; the fixed line below is the diagnostic.
+                    # Keep the name for the next invocation; never print the value or exception.
+                    $still += $name
                 }
             }
+            $global:_nvault_pending_cleanup = $still
             [Console]::Error.WriteLine('nvault: could not load this directory; will retry')
+            if ($still.Count -gt 0) {
+                [Console]::Error.WriteLine('nvault: could not clean up a failed load; will retry')
+            }
             return
         }
+        $global:_nvault_pending_cleanup = @()
     }
     $global:_nvault_last_dir = $here
 }
@@ -2214,7 +2241,7 @@ if ($global:_nvault_last_dir -ne $PWD.Path) { exit 36 }
 $ErrorActionPreference = 'Stop'
 function global:Set-Item {
     param($LiteralPath, $Value, $ErrorAction)
-    if ($LiteralPath -eq 'Env:\B') { throw 'mock assignment failure' }
+    if ($LiteralPath -eq 'Env:\B' -and $Value -eq 'y') { throw 'mock assignment failure' }
     Microsoft.PowerShell.Management\Set-Item -LiteralPath $LiteralPath -Value $Value -ErrorAction $ErrorAction
 }
 $env:PATH = '__BIN__' + [IO.Path]::PathSeparator + $env:PATH
@@ -2416,7 +2443,7 @@ if (($env.NVAULT_LAST_DIR? | default '') | is-empty) {{ exit 36 }}
             &bin,
             &counter,
             &[
-                r#"{"TOKEN":"eA==","NVAULT_LOADED_KEYS":"token"}
+                r#"{"TOKEN":"eA==","NVAULT_LOADED_KEYS":"dG9rZW4="}
 "#,
                 r#"{"TOKEN":"eA==","NVAULT_LOADED_KEYS":"VE9LRU4="}
 "#,
@@ -2533,6 +2560,174 @@ if ($env:NVAULT_LOADED_KEYS -ne 'A') { exit 27 }
             !stderr.contains("//8=") && !stderr.contains("!!!") && !stderr.contains("eA=="),
             "payload text reached stderr: {stderr}"
         );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[test]
+    fn powershell_hook_carries_strict_validation_and_cleanup_markers() {
+        for edition in [HookShell::PowerShell, HookShell::Pwsh] {
+            let script = hook(edition);
+            for needle in [
+                "-ErrorAction Stop",
+                "$applied += $name",
+                "$previous[$name] =",
+                "PSCustomObject",
+                "'empty value'",
+                "-cne",
+                "-ceq 'NVAULT_LOADED_KEYS'",
+                "$strict.GetString",
+                "$global:_nvault_pending_cleanup = @($names + @('NVAULT_LOADED_KEYS'))",
+                "could not clean up a failed load",
+                "if ($global:_nvault_last_dir -ceq $here)",
+            ] {
+                assert!(script.contains(needle), "{edition:?} lacks {needle:?}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pwsh_hook_keeps_pending_cleanup_when_restore_and_removal_fail() {
+        let Some(pwsh) = shell_binary("pwsh") else {
+            return;
+        };
+        let base = temp_base("pwsh-pending");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let body = concat!(
+            r#"{"A":"eA==","B":"eQ==","NVAULT_LOADED_KEYS":"QSBC"}"#,
+            "\n"
+        );
+        fake_nvault(&bin, body, None, 0, None);
+        let hook_file = write_hook(&base, HookShell::Pwsh, "hook.ps1");
+        let script = base.join("test.ps1");
+        std::fs::write(
+            &script,
+            r#"
+$ErrorActionPreference = 'Stop'
+function global:Set-Item {
+    param($LiteralPath, $Value, $ErrorAction)
+    if ($LiteralPath -eq 'Env:\B' -and $Value -eq 'y') { throw 'mock assignment failure' }
+    if ($LiteralPath -eq 'Env:\A' -and $Value -eq 'user-value') { throw 'mock restore failure' }
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath $LiteralPath -Value $Value -ErrorAction $ErrorAction
+}
+$env:PATH = '__BIN__' + [IO.Path]::PathSeparator + $env:PATH
+$env:FAKE_NVAULT_DIR = '__ROOT__'
+$env:A = 'user-value'
+$env:B = 'keep-me'
+$env:NVAULT_AUTOLOAD = '1'
+. '__HOOK__'
+if ($env:A -ne 'x') { exit 21 }
+if ($env:B -ne 'keep-me') { exit 22 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 23 }
+if ($null -ne $global:_nvault_last_dir) { exit 24 }
+if (-not (@($global:_nvault_pending_cleanup) -contains 'A')) { exit 25 }
+Microsoft.PowerShell.Management\Remove-Item -Path Function:\Set-Item -Force
+function global:Remove-Item {
+    param($LiteralPath, $ErrorAction)
+    if ($LiteralPath -eq 'Env:\A' -and -not $global:_remove_failed) {
+        $global:_remove_failed = $true
+        throw 'mock removal failure'
+    }
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -ErrorAction $ErrorAction
+}
+_nvault_hook
+if ($env:A -ne 'x') { exit 31 }
+if (-not (@($global:_nvault_pending_cleanup) -contains 'A')) { exit 32 }
+if ($null -ne $global:_nvault_last_dir) { exit 33 }
+Microsoft.PowerShell.Management\Remove-Item -Path Function:\Remove-Item -Force
+_nvault_hook
+if ($env:A -ne 'x') { exit 41 }
+if ($env:B -ne 'y') { exit 42 }
+if ($env:NVAULT_LOADED_KEYS -ne 'A B') { exit 43 }
+if (@($global:_nvault_pending_cleanup).Count -ne 0) { exit 44 }
+if ($global:_nvault_last_dir -cne $PWD.Path) { exit 45 }
+"#
+            .replace("__BIN__", &bin.display().to_string())
+            .replace("__ROOT__", &root.display().to_string())
+            .replace("__HOOK__", &hook_file.display().to_string()),
+        )
+        .expect("test script");
+
+        let output = std::process::Command::new(&pwsh)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-File")
+            .arg(&script)
+            .current_dir(&base)
+            .output()
+            .expect("run pwsh");
+        assert_ok(&output, "pwsh pending cleanup");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.matches("could not clean up a failed load").count() >= 2,
+            "expected a rollback diagnostic per failed restore/removal: {stderr}"
+        );
+        assert!(
+            stderr.contains("could not load this directory"),
+            "the load failure was not reported: {stderr}"
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pwsh_hook_reloads_for_a_directory_that_differs_only_in_case() {
+        let Some(pwsh) = shell_binary("pwsh") else {
+            return;
+        };
+        let base = temp_base("pwsh-case-dir");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        let lower = base.join("a");
+        let upper = base.join("A");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&lower).expect("lower");
+        std::fs::create_dir_all(&upper).expect("upper");
+
+        let rendered = render_env(&[export("A", "x")], EnvShell::JsonBase64).expect("env");
+        let counter = base.join("count");
+        fake_nvault(&bin, &rendered, Some(&counter), 0, None);
+        let hook_file = write_hook(&base, HookShell::Pwsh, "hook.ps1");
+        let script = base.join("test.ps1");
+        std::fs::write(
+            &script,
+            r#"
+$ErrorActionPreference = 'Stop'
+$env:PATH = '__BIN__' + [IO.Path]::PathSeparator + $env:PATH
+$env:FAKE_NVAULT_DIR = '__ROOT__'
+$env:NVAULT_AUTOLOAD = '1'
+Set-Location -LiteralPath '__LOWER__'
+. '__HOOK__'
+if ([IO.File]::ReadAllText('__COUNTER__').Trim() -ne '1') { exit 21 }
+Set-Location -LiteralPath '__UPPER__'
+_nvault_hook
+if ([IO.File]::ReadAllText('__COUNTER__').Trim() -ne '2') { exit 22 }
+if ($env:A -ne 'x') { exit 23 }
+if ($global:_nvault_last_dir -cne $PWD.Path) { exit 24 }
+"#
+            .replace("__BIN__", &bin.display().to_string())
+            .replace("__ROOT__", &root.display().to_string())
+            .replace("__LOWER__", &lower.display().to_string())
+            .replace("__UPPER__", &upper.display().to_string())
+            .replace("__HOOK__", &hook_file.display().to_string())
+            .replace("__COUNTER__", &counter.display().to_string()),
+        )
+        .expect("test script");
+
+        let output = std::process::Command::new(&pwsh)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-File")
+            .arg(&script)
+            .current_dir(&base)
+            .output()
+            .expect("run pwsh");
+        assert_ok(&output, "pwsh case-distinct directories");
         std::fs::remove_dir_all(base).expect("remove temp hook dir");
     }
 }
