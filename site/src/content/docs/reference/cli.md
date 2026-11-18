@@ -76,9 +76,10 @@ Export names must be plain identifiers and must not collide with nvault's own
 `NVAULT_*` hook variables; callers of the library's `render_env` get the same
 validation. The PowerShell and Nushell hooks check the decoded object before
 changing the environment: values must be strings, names must be identifiers,
-and `NVAULT_LOADED_KEYS` must list exactly the other names. A PowerShell load
-containing an empty value is refused (5.1 and pre-7.5 cannot store one), and a
-failed assignment rolls back what that attempt already set.
+and `NVAULT_LOADED_KEYS` must list exactly the other names (compared
+case-sensitively). A PowerShell load containing an empty value is refused (5.1
+and pre-7.5 cannot store one), invalid base64 or UTF-8 is refused, and a failed
+assignment restores every value that attempt overwrote.
 
 ## `completion`
 

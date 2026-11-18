@@ -168,13 +168,21 @@ bytes preserves the exact value. That coercion was reproduced on PowerShell
 7.7.0 and is why the hook does not parse plain JSON.
 
 Validation happens before any change: the payload must be one object, every
-value must be a base64 string that decodes to UTF-8, every name must match
+value must be a base64 string that decodes as strict UTF-8 (invalid bytes are
+refused rather than replaced), every name must match
 `[A-Za-z_][A-Za-z0-9_]*`, and `NVAULT_LOADED_KEYS` must list exactly the other
-names. A malformed object, a missing or extra tracking entry, a non-string
-value, or a name outside that set is refused with no change. `Set-Item` runs
-with `-ErrorAction Stop`; if one assignment fails, every name already applied
-in that attempt is removed again, so a partial load never leaves an untracked
-export. Windows PowerShell 5.1 and PowerShell before 7.5 cannot store an empty
+names. Tracking is compared ordinally and case-sensitively: `TOKEN` and
+`token` are different names, because Linux environment names are
+case-sensitive and a case-insensitive match would leave the real variable
+untracked. A malformed object, a missing or extra tracking entry, a non-string
+value, invalid base64 or UTF-8, or a name outside that set is refused with no
+change. `Set-Item` runs with `-ErrorAction Stop`. Before applying anything the
+hook records whether each target variable existed and its value, so if an
+assignment fails (including the `NVAULT_LOADED_KEYS` assignment) every applied
+name is restored to its previous value or removed if it did not exist; a
+partial load never leaves an untracked export and never loses a value the user
+already had. Restoration errors are swallowed and reported only through the
+fixed retry line. Windows PowerShell 5.1 and PowerShell before 7.5 cannot store an empty
 environment value, so a load containing an empty value is refused before
 anything is applied and reports the retry line. The refusal applies on every
 edition, so the same payload behaves the same way on 5.1 and 7 and later. A response with no exports and
@@ -232,9 +240,11 @@ What was executed here on Linux: the bash hook under GNU bash 5.3.20, zsh
 transitions, cleanup with autoload disabled, cleanup when the directory probe
 fails, prompt preservation, base64 decoding of a timestamp value, JSON loading,
 five rejected PowerShell payloads (non-string value, missing tracking, extra
-tracking, empty value, unsafe name) and four rejected Nushell payloads,
-rollback of a partially applied PowerShell load simulated with a failing
-`Set-Item`, an empty PowerShell export set, malformed and wrong-shaped JSON in
+tracking, empty value, unsafe name), a case-mismatched tracking name, invalid
+base64 and invalid UTF-8, and four rejected Nushell payloads; rollback of a
+partially applied PowerShell load simulated with a failing `Set-Item`, once for
+an export and once for the tracking assignment, with pre-existing values
+restored; an empty PowerShell export set; malformed and wrong-shaped JSON in
 Nushell, a transient first failure followed by a successful retry, a real zsh
 prompt retrying a failed load while keeping an existing `precmd` hook, a nested
 Nushell install, and values containing `';` or a smart quote plus a command

@@ -454,13 +454,14 @@ function global:_nvault_hook {
         $names = @()
         $tracking = $null
         $decoded = @{}
+        $strict = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false, $true
         try {
             foreach ($property in $values.PSObject.Properties) {
-                if ($property.Name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw 'invalid name' }
+                if ($property.Name -cnotmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw 'invalid name' }
                 if (-not ($property.Value -is [string])) { throw 'non-string value' }
                 $bytes = [Convert]::FromBase64String([string]$property.Value)
-                $text = [Text.Encoding]::UTF8.GetString($bytes)
-                if ($property.Name -eq 'NVAULT_LOADED_KEYS') {
+                $text = $strict.GetString($bytes)
+                if ($property.Name -ceq 'NVAULT_LOADED_KEYS') {
                     $tracking = $text
                 } else {
                     if ($text.Length -eq 0) { throw 'empty value' }
@@ -473,9 +474,9 @@ function global:_nvault_hook {
             if ($tracking.Length -gt 0) { $tracked = @($tracking -split ' ') }
             if ($tracked.Count -ne $names.Count) { throw 'mismatched tracking' }
             foreach ($name in $tracked) {
-                if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw 'mismatched tracking' }
+                if ($name -cnotmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw 'mismatched tracking' }
             }
-            if ((($tracked | Sort-Object) -join ' ') -ne (($names | Sort-Object) -join ' ')) {
+            if ((($tracked | Sort-Object) -join ' ') -cne (($names | Sort-Object) -join ' ')) {
                 throw 'mismatched tracking'
             }
         } catch {
@@ -484,6 +485,20 @@ function global:_nvault_hook {
         }
         if ($names.Count -eq 0) {
             $global:_nvault_last_dir = $here
+            return
+        }
+        $previous = @{}
+        try {
+            foreach ($name in ($names + @('NVAULT_LOADED_KEYS'))) {
+                $path = 'Env:\' + $name
+                if (Test-Path -LiteralPath $path) {
+                    $previous[$name] = (Get-Item -LiteralPath $path -ErrorAction Stop).Value
+                } else {
+                    $previous[$name] = $null
+                }
+            }
+        } catch {
+            [Console]::Error.WriteLine('nvault: could not load this directory; will retry')
             return
         }
         $applied = @()
@@ -496,7 +511,19 @@ function global:_nvault_hook {
             $applied += 'NVAULT_LOADED_KEYS'
         } catch {
             foreach ($name in $applied) {
-                Remove-Item -LiteralPath ('Env:\' + $name) -ErrorAction SilentlyContinue
+                $path = 'Env:\' + $name
+                $old = $previous[$name]
+                try {
+                    if ($null -eq $old) {
+                        if (Test-Path -LiteralPath $path) {
+                            Remove-Item -LiteralPath $path -ErrorAction Stop
+                        }
+                    } else {
+                        Set-Item -LiteralPath $path -Value $old -ErrorAction Stop
+                    }
+                } catch {
+                    # Never print the old value or the exception; the fixed line below is the diagnostic.
+                }
             }
             [Console]::Error.WriteLine('nvault: could not load this directory; will retry')
             return
@@ -2193,11 +2220,24 @@ function global:Set-Item {
 $env:PATH = '__BIN__' + [IO.Path]::PathSeparator + $env:PATH
 $env:FAKE_NVAULT_DIR = '__ROOT__'
 $env:NVAULT_AUTOLOAD = '1'
+$env:A = 'user-value'
+$env:B = 'keep-me'
 . '__HOOK__'
-if (Test-Path Env:\A) { exit 21 }
-if (Test-Path Env:\B) { exit 22 }
+if ($env:A -ne 'user-value') { exit 21 }
+if ($env:B -ne 'keep-me') { exit 22 }
 if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 23 }
 if ($null -ne $global:_nvault_last_dir) { exit 24 }
+Remove-Item -Path Function:\Set-Item -Force
+function global:Set-Item {
+    param($LiteralPath, $Value, $ErrorAction)
+    if ($LiteralPath -eq 'Env:\NVAULT_LOADED_KEYS') { throw 'mock tracking failure' }
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath $LiteralPath -Value $Value -ErrorAction $ErrorAction
+}
+_nvault_hook
+if ($env:A -ne 'user-value') { exit 31 }
+if ($env:B -ne 'keep-me') { exit 32 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 33 }
+if ($null -ne $global:_nvault_last_dir) { exit 34 }
 Remove-Item -Path Function:\Set-Item -Force
 _nvault_hook
 if ($env:A -ne 'x') { exit 25 }
@@ -2355,6 +2395,143 @@ if (($env.NVAULT_LAST_DIR? | default '') | is-empty) {{ exit 36 }}
         assert!(
             stderr.matches("will retry").count() >= 4,
             "expected a diagnostic per rejected body: {stderr}"
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pwsh_hook_rejects_case_mismatched_tracking() {
+        let Some(pwsh) = shell_binary("pwsh") else {
+            return;
+        };
+        let base = temp_base("pwsh-case");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let counter = base.join("count");
+        fake_nvault_sequence(
+            &bin,
+            &counter,
+            &[
+                r#"{"TOKEN":"eA==","NVAULT_LOADED_KEYS":"token"}
+"#,
+                r#"{"TOKEN":"eA==","NVAULT_LOADED_KEYS":"VE9LRU4="}
+"#,
+            ],
+        );
+        let hook_file = write_hook(&base, HookShell::Pwsh, "hook.ps1");
+        let script = base.join("test.ps1");
+        std::fs::write(
+            &script,
+            r#"
+$ErrorActionPreference = 'Stop'
+$env:PATH = '__BIN__' + [IO.Path]::PathSeparator + $env:PATH
+$env:FAKE_NVAULT_DIR = '__ROOT__'
+$env:NVAULT_AUTOLOAD = '1'
+. '__HOOK__'
+if (Test-Path Env:\TOKEN) { exit 21 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 22 }
+if ($null -ne $global:_nvault_last_dir) { exit 23 }
+_nvault_hook
+if ($env:TOKEN -ne 'x') { exit 20 }
+if ($env:NVAULT_LOADED_KEYS -ne 'TOKEN') { exit 24 }
+if ($global:_nvault_last_dir -ne $PWD.Path) { exit 25 }
+"#
+            .replace("__BIN__", &bin.display().to_string())
+            .replace("__ROOT__", &root.display().to_string())
+            .replace("__HOOK__", &hook_file.display().to_string()),
+        )
+        .expect("test script");
+
+        let output = std::process::Command::new(&pwsh)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-File")
+            .arg(&script)
+            .current_dir(&base)
+            .output()
+            .expect("run pwsh");
+        assert_ok(&output, "pwsh case-sensitive tracking");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("will retry"),
+            "no retry diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(base).expect("remove temp hook dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pwsh_hook_rejects_invalid_base64_and_utf8() {
+        let Some(pwsh) = shell_binary("pwsh") else {
+            return;
+        };
+        let base = temp_base("pwsh-bytes");
+        let bin = base.join("bin");
+        let root = base.join("root");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&root).expect("root");
+
+        let counter = base.join("count");
+        fake_nvault_sequence(
+            &bin,
+            &counter,
+            &[
+                r#"{"A":"!!!","NVAULT_LOADED_KEYS":"QQ=="}
+"#,
+                r#"{"A":"//8=","NVAULT_LOADED_KEYS":"QQ=="}
+"#,
+                r#"{"A":"eA==","NVAULT_LOADED_KEYS":"QQ=="}
+"#,
+            ],
+        );
+        let hook_file = write_hook(&base, HookShell::Pwsh, "hook.ps1");
+        let script = base.join("test.ps1");
+        std::fs::write(
+            &script,
+            r#"
+$ErrorActionPreference = 'Stop'
+$env:PATH = '__BIN__' + [IO.Path]::PathSeparator + $env:PATH
+$env:FAKE_NVAULT_DIR = '__ROOT__'
+$env:NVAULT_AUTOLOAD = '1'
+. '__HOOK__'
+if (Test-Path Env:\A) { exit 21 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 22 }
+if ($null -ne $global:_nvault_last_dir) { exit 23 }
+_nvault_hook
+if (Test-Path Env:\A) { exit 24 }
+if (Test-Path Env:\NVAULT_LOADED_KEYS) { exit 25 }
+if ($null -ne $global:_nvault_last_dir) { exit 26 }
+_nvault_hook
+if ($env:A -ne 'x') { exit 20 }
+if ($env:NVAULT_LOADED_KEYS -ne 'A') { exit 27 }
+"#
+            .replace("__BIN__", &bin.display().to_string())
+            .replace("__ROOT__", &root.display().to_string())
+            .replace("__HOOK__", &hook_file.display().to_string()),
+        )
+        .expect("test script");
+
+        let output = std::process::Command::new(&pwsh)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-File")
+            .arg(&script)
+            .current_dir(&base)
+            .output()
+            .expect("run pwsh");
+        assert_ok(&output, "pwsh byte validation");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.matches("will retry").count() >= 2,
+            "expected a diagnostic per rejected body: {stderr}"
+        );
+        assert!(
+            !stderr.contains("//8=") && !stderr.contains("!!!") && !stderr.contains("eA=="),
+            "payload text reached stderr: {stderr}"
         );
         std::fs::remove_dir_all(base).expect("remove temp hook dir");
     }
