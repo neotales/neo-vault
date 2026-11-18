@@ -87,8 +87,8 @@ nvault ensure KEY                  # create only if the provider confirms absenc
 nvault search QUERY                # names only
 nvault exec -- CMD [ARGS...]       # secrets in the child environment
 nvault x -- CMD [ARGS...]          # alias
-nvault env --shell bash|zsh|fish   # shell exports for this directory
-nvault hook bash|zsh|fish          # directory hook
+nvault env --shell bash|zsh|fish|powershell|pwsh|nu|json|json-base64  # exports
+nvault hook bash|zsh|fish|powershell|pwsh|nu          # directory hook
 nvault completion bash|zsh|fish|powershell|elvish
 nvault providers                   # configured profiles, no credentials read
 nvault dir                         # nearest configuration directory
@@ -118,13 +118,158 @@ Collisions and invalid names fail rather than guessing.
 
 ### Directory hooks
 
-`nvault hook bash` (or `zsh`, `fish`) prints a shell function that tracks the
-working directory and sets `NVAULT_DIR`. It does **not** fetch secrets just
-because you changed directory. Set `NVAULT_AUTOLOAD=1` to opt into
-`nvault env` on directory change. On every directory change, names recorded in
-`NVAULT_LOADED_KEYS` are unset first, even if autoload is now disabled; only
-fetching new values is gated by `NVAULT_AUTOLOAD`. A child process or a shell
-history still sees exported values, so autoload is a deliberate trade.
+`nvault hook` prints a directory hook for `bash`, `zsh`, `fish`, `powershell`
+(Windows PowerShell 5.1), `pwsh` (PowerShell 7 and later), or `nu` (Nushell).
+The hook tracks the working directory and sets `NVAULT_DIR`. It does **not**
+fetch secrets just because you changed directory. Set `NVAULT_AUTOLOAD=1` to
+opt into `nvault env` on directory change. On every directory change, names
+recorded in `NVAULT_LOADED_KEYS` are removed first, even if autoload is now
+disabled; only fetching new values is gated by `NVAULT_AUTOLOAD`. A child
+process or a shell history still sees exported values, so autoload is a
+deliberate trade.
+
+Install one hook per interactive shell, for example:
+
+```sh
+# bash, in ~/.bashrc
+eval "$(nvault hook bash)"
+# zsh, in ~/.zshrc
+eval "$(nvault hook zsh)"
+# fish, in ~/.config/fish/config.fish
+nvault hook fish | source
+```
+
+PowerShell has no directory-change event, so `nvault hook powershell` and
+`nvault hook pwsh` print a wrapper that keeps the existing `prompt` function
+and calls it after tracking the directory. Add one line to the file named by
+`$PROFILE`:
+
+```powershell
+# PowerShell 7 and later
+Invoke-Expression (& nvault hook pwsh | Out-String)
+# Windows PowerShell 5.1
+Invoke-Expression (& nvault hook powershell | Out-String)
+```
+
+The `powershell` and `pwsh` names differ only in the header comment and in the
+`--shell` flag the hook passes back; the body is identical and uses no
+PowerShell 7-only operator, so it targets 5.1 and 7 alike. Only PowerShell 7
+was executed here. The hook restores `[Console]::OutputEncoding` around the
+`nvault env` call so a non-ASCII value is not decoded with the console code
+page, and a sentinel keeps a second source of the hook from nesting `prompt`.
+
+The PowerShell hook does not evaluate provider output. It asks for
+`env --shell json-base64`, validates the whole object, decodes the base64 bytes
+itself, and only then copies the values into `Env:` with `Set-Item`, so a value
+is data even if it contains quotes, `$`, or newlines. Values travel encoded
+because `ConvertFrom-Json` turns a timestamp-looking string such as
+`2020-01-01T00:00:00Z` into a `DateTime` and would reformat it; decoding the
+bytes preserves the exact value. That coercion was reproduced on PowerShell
+7.7.0 and is why the hook does not parse plain JSON.
+
+Validation happens before any change: the payload must be one object, every
+value must be a base64 string that decodes as strict UTF-8 (invalid bytes are
+refused rather than replaced), every name must match
+`[A-Za-z_][A-Za-z0-9_]*`, and `NVAULT_LOADED_KEYS` must list exactly the other
+names. Tracking is compared ordinally and case-sensitively: `TOKEN` and
+`token` are different names, because Linux environment names are
+case-sensitive and a case-insensitive match would leave the real variable
+untracked. A malformed object, a missing or extra tracking entry, a non-string
+value, invalid base64 or UTF-8, or a name outside that set is refused with no
+change. `Set-Item` runs with `-ErrorAction Stop`. Before applying anything the
+hook records, for each target variable, whether it existed and its value. That
+record is also written to an in-memory pending-cleanup list before the first
+assignment. If an assignment fails (including the `NVAULT_LOADED_KEYS`
+assignment), every applied name is restored from that record or removed if it
+did not exist. If a restore or removal also fails, the record stays on the
+pending list, the hook prints a distinct fixed line,
+`nvault: could not clean up a failed load; will retry`, and refuses to load
+anything else until the record is applied on a later invocation: an existing
+variable is restored to its previous value, an absent one is removed. Previous
+values are held only in the current PowerShell process and are never printed;
+the diagnostics are fixed strings. This is not an absolute guarantee: if the
+process exits while a restore is still failing, the value can remain until the
+shell exits. The hook says so rather than claiming otherwise.
+
+The recorded directory is compared ordinally and case-sensitively, so on Linux
+`a` and `A` are different directories and each transition cleans and reloads.
+On Windows the same comparison can cause one extra reload, which is harmless.
+
+Windows PowerShell 5.1 and PowerShell before 7.5 cannot store an empty
+environment value, so a load containing an empty value is refused before
+anything is applied and reports the retry line. The refusal applies on every
+edition, so the same payload behaves the same way on 5.1 and 7 and later. A
+response with no exports and an empty `NVAULT_LOADED_KEYS` sets nothing and is
+accepted. The diagnostic is a fixed string and never contains a value or a
+name. `env --shell powershell` and `env --shell pwsh` still print
+`$env:NAME = 'value'` assignments for direct use. PowerShell reads five
+characters as a single quote — `'`, U+2018, U+2019, U+201A, and U+201B — and a
+value containing U+2019 could otherwise close the string. Every one of the five
+is doubled, matching `CharTraits.IsSingleQuote` in the PowerShell source; the
+runtime tests evaluate a rendered assignment containing all five.
+
+Nushell has no `eval`, so `nvault env --shell nu` (and `--shell json`) prints a
+JSON object and the hook applies it with `load-env` only after validation:
+every column must match `[A-Za-z_][A-Za-z0-9_]*`, every value must be a string,
+and `NVAULT_LOADED_KEYS` must list exactly the other columns. Malformed JSON, a
+missing or extra tracking entry, a non-string value, an unsafe name, or a value
+that is not an object prints the retry line and changes nothing. Empty string
+values are accepted because Nushell can store them. Save it once and source
+the file from `config.nu`:
+
+```nu
+# in a shell:
+#   nvault hook nu | save -f ~/.config/nvault/nvault.nu
+# in config.nu:
+source ~/.config/nvault/nvault.nu
+```
+
+Nushell keeps no shell-local variable across `source` calls, so the install
+marker and the recorded directory include `$nu.pid`. A child shell inherits the
+parent's value, sees a different pid, and installs and applies its own hook
+instead of skipping it. The installer also re-registers when the `pre_prompt`
+hook list is empty, so re-sourcing a config that replaced `$env.config`
+restores the hook.
+
+A directory change cleans the names in `NVAULT_LOADED_KEYS` and clears
+`NVAULT_DIR` *before* the new directory is probed, so a failed probe still
+removes the previous directory's exports instead of leaving them active. A
+failed probe or load then prints one fixed redacted line,
+`nvault: could not load this directory; will retry`, and is retried from the
+next prompt; bash retries from `PROMPT_COMMAND`, zsh from both the `chpwd` and
+`precmd` lists, fish from `fish_prompt`, and PowerShell and Nushell from
+`prompt`/`pre_prompt`. The message contains no value and no path. zsh appends
+to the existing hook lists without replacing them.
+
+`render_env` is also the library boundary, so it validates every export name as
+`[A-Za-z_][A-Za-z0-9_]*` and refuses `NVAULT_AUTOLOAD`, `NVAULT_DIR`,
+`NVAULT_LAST_DIR`, and `NVAULT_LOADED_KEYS`, which the hooks own. This is a
+compatibility change: a key whose derived name is not a plain identifier, or is
+one of those four, is refused by `env` and by library callers instead of being
+written into shell code. `exec` is unaffected because it passes names to a
+child process, not to a shell parser.
+
+What was executed here on Linux: the bash hook under GNU bash 5.3.20, zsh
+5.9.2, fish 4.9.3, PowerShell 7.7.0, and Nushell 0.117.0, including directory
+transitions, cleanup with autoload disabled, cleanup when the directory probe
+fails, prompt preservation, base64 decoding of a timestamp value, JSON loading,
+five rejected PowerShell payloads (non-string value, missing tracking, extra
+tracking, empty value, unsafe name), a case-mismatched tracking name, invalid
+base64 and invalid UTF-8, and four rejected Nushell payloads; rollback of a
+partially applied PowerShell load simulated with a failing `Set-Item`, once for
+an export and once for the tracking assignment, with pre-existing values
+restored; a failed restore and a failed pending removal that keep the records on
+the pending list until a later invocation restores the previous value (and
+removes the new one) with autoload disabled and the directory changed; a
+case-sensitive directory transition between `a` and `A`; a valid-base64 case-mismatched tracking value;
+an empty PowerShell export set; malformed and wrong-shaped JSON in
+Nushell, a transient first failure followed by a successful retry, a real zsh
+prompt retrying a failed load while keeping an existing `precmd` hook, a nested
+Nushell install, and values containing `';` or a smart quote plus a command
+that would create a file if it were executed. Windows PowerShell 5.1 and macOS
+were not available and were not executed; the empty-value refusal exists
+because 5.1 cannot store one. Nushell releases older than 0.117.0 were not
+exercised and may use different configuration syntax.
 
 ## Providers
 
@@ -332,7 +477,10 @@ provide a Vault product. No OpenTofu-specific integration is implemented.
 - Windows and macOS were not exercised. The code avoids Unix-only calls outside
   the `bw`/`keepassxc-cli`/`pass-cli` process boundary, but that is not a
   portability claim. The same-user write lock uses Linux `flock` and was not
-  exercised on those systems.
+  exercised on those systems. The PowerShell directory hooks target Windows
+  PowerShell 5.1 and PowerShell 7 alike, but only PowerShell 7.7.0 on Linux was
+  executed here; 5.1 itself was not. Nushell 0.117.0 was executed; older
+  releases were not.
 
 ## Using the Rust crate
 

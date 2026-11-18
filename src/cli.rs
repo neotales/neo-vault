@@ -152,6 +152,15 @@ pub enum HookShell {
     Zsh,
     /// Friendly Interactive Shell.
     Fish,
+    /// Windows PowerShell 5.1 (`powershell.exe`).
+    #[value(name = "powershell")]
+    PowerShell,
+    /// PowerShell 7 and later (`pwsh`).
+    #[value(name = "pwsh")]
+    Pwsh,
+    /// Nushell.
+    #[value(name = "nu")]
+    Nu,
 }
 
 /// Shells supported by `env`.
@@ -163,4 +172,36 @@ pub enum EnvShell {
     Zsh,
     /// Friendly Interactive Shell.
     Fish,
+    /// Windows PowerShell 5.1 (`powershell.exe`).
+    ///
+    /// Renders `$env:NAME = 'value'` assignments, which the 5.1 and 7+
+    /// editions both accept.
+    #[value(name = "powershell")]
+    PowerShell,
+    /// PowerShell 7 and later (`pwsh`).
+    ///
+    /// Renders the same assignments as `powershell`; the name exists so a hook
+    /// can pass the edition it targets and so help can describe the caveats.
+    #[value(name = "pwsh")]
+    Pwsh,
+    /// Nushell.
+    ///
+    /// Renders a JSON object, because Nushell has no `eval`: pipe it to
+    /// `from json | load-env`.
+    #[value(name = "nu")]
+    Nu,
+    /// JSON object.
+    ///
+    /// The data form used by the Nushell hook, so provider output is applied
+    /// without an evaluation step. Contains the same keys as `nu`, including
+    /// `NVAULT_LOADED_KEYS`.
+    #[value(name = "json")]
+    Json,
+    /// JSON object with base64-encoded UTF-8 values.
+    ///
+    /// The form the PowerShell hook applies. `ConvertFrom-Json` can turn a
+    /// timestamp-looking string into a `DateTime`, so values travel encoded
+    /// and the hook decodes the exact bytes itself.
+    #[value(name = "json-base64")]
+    JsonBase64,
 }

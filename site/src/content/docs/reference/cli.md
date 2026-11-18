@@ -63,10 +63,28 @@ Maps each selected key's basename to an environment variable in the child. `apps
 ## `env`
 
 ```sh
-nvault env [--shell bash|zsh|fish] [--env-prefix PREFIX] [--only KEYS]
+nvault env [--shell bash|zsh|fish|powershell|pwsh|nu|json|json-base64] [--env-prefix PREFIX] [--only KEYS]
 ```
 
 Prints shell exports for the current directory. Default shell is bash.
+`powershell` and `pwsh` print `$env:NAME = 'value'` with all five PowerShell
+single-quote characters doubled. `nu` and `json` print a JSON object; `nu` is
+applied by Nushell's `load-env`. `json-base64` prints the same object with
+base64-encoded values and is what the PowerShell hook decodes, because
+`ConvertFrom-Json` can turn a timestamp-looking string into a `DateTime`.
+Export names must be plain identifiers and must not collide with nvault's own
+`NVAULT_*` hook variables; callers of the library's `render_env` get the same
+validation. The PowerShell and Nushell hooks check the decoded object before
+changing the environment: values must be strings, names must be identifiers,
+and `NVAULT_LOADED_KEYS` must list exactly the other names (compared
+case-sensitively). A PowerShell load containing an empty value is refused (5.1
+and pre-7.5 cannot store one), invalid base64 or UTF-8 is refused, a
+case-mismatched tracking name is refused, and a failed assignment restores
+every value that attempt overwrote. A record whose restore or pending removal
+also fails stays on an in-memory cleanup list, is retried on later prompts with
+a distinct fixed diagnostic, and blocks new loads until it is applied: an
+existing variable is restored to its previous value, an absent one is removed.
+Directory comparisons are case-sensitive.
 
 ## `completion`
 
@@ -79,10 +97,17 @@ Prints a static completion script. It does not complete key names from the provi
 ## `hook`
 
 ```sh
-nvault hook bash|zsh|fish
+nvault hook bash|zsh|fish|powershell|pwsh|nu
 ```
 
-Prints a directory hook that sets `NVAULT_DIR`. It does not fetch secrets on `cd` unless `NVAULT_AUTOLOAD=1`.
+Prints a directory hook that sets `NVAULT_DIR`. It does not fetch secrets on
+`cd` unless `NVAULT_AUTOLOAD=1`. PowerShell wraps the existing `prompt`
+function; Nushell registers a `pre_prompt` hook; zsh registers both a `chpwd`
+and a `precmd` hook without replacing existing entries. A directory change
+cleans the previous exports before probing, so a failed probe still removes
+them. A failed probe, malformed load, or wrong-shaped JSON prints one fixed
+line without a value or path and is retried on the next prompt. Installation snippets and the exact evidence for
+what was executed are in the project README.
 
 ## `dir`
 

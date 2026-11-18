@@ -306,6 +306,53 @@ fn lists_reads_writes_and_injects_through_the_cli() {
     assert!(exports.status.success(), "{}", stderr(&exports));
     assert!(stdout(&exports).contains("export DB='s3cr3t'"));
     assert!(stdout(&exports).contains("NVAULT_LOADED_KEYS='DB'"));
+
+    let powershell = run(
+        &directory,
+        &["env", "--shell", "powershell"],
+        &environment,
+        None,
+    );
+    assert!(powershell.status.success(), "{}", stderr(&powershell));
+    assert!(stdout(&powershell).contains("$env:DB = 's3cr3t'"));
+    assert!(stdout(&powershell).contains("$env:NVAULT_LOADED_KEYS = 'DB'"));
+
+    let nushell = run(&directory, &["env", "--shell", "nu"], &environment, None);
+    assert!(nushell.status.success(), "{}", stderr(&nushell));
+    let nushell: serde_json::Value =
+        serde_json::from_str(stdout(&nushell).trim()).expect("nu output is JSON");
+    assert_eq!(nushell["DB"], "s3cr3t");
+    assert_eq!(nushell["NVAULT_LOADED_KEYS"], "DB");
+
+    let json = run(&directory, &["env", "--shell", "json"], &environment, None);
+    assert!(json.status.success(), "{}", stderr(&json));
+    assert_eq!(
+        stdout(&json),
+        stdout(&run(
+            &directory,
+            &["env", "--shell", "nu"],
+            &environment,
+            None,
+        ))
+    );
+
+    let encoded = run(
+        &directory,
+        &["env", "--shell", "json-base64"],
+        &environment,
+        None,
+    );
+    assert!(encoded.status.success(), "{}", stderr(&encoded));
+    assert!(
+        !stdout(&encoded).contains("s3cr3t"),
+        "plaintext in base64 form"
+    );
+    let encoded: serde_json::Value =
+        serde_json::from_str(stdout(&encoded).trim()).expect("base64 output is JSON");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded["DB"].as_str().expect("base64 string"))
+        .expect("base64");
+    assert_eq!(String::from_utf8(bytes).expect("utf8"), "s3cr3t");
 }
 
 #[derive(Default)]
@@ -1154,6 +1201,19 @@ fn completion_and_hooks_work_without_a_configuration() {
     let hook = run(&directory, &["hook", "zsh"], &[], None);
     assert!(hook.status.success(), "{}", stderr(&hook));
     assert!(stdout(&hook).contains("NVAULT_AUTOLOAD"));
+
+    for shell in ["powershell", "pwsh", "nu"] {
+        let hook = run(&directory, &["hook", shell], &[], None);
+        assert!(hook.status.success(), "{}", stderr(&hook));
+        assert!(stdout(&hook).contains("NVAULT_AUTOLOAD"));
+        assert!(stdout(&hook).contains("NVAULT_DIR"));
+    }
+    assert!(
+        stdout(&run(&directory, &["hook", "powershell"], &[], None))
+            .contains("Windows PowerShell 5.1")
+    );
+    assert!(stdout(&run(&directory, &["hook", "pwsh"], &[], None)).contains("PowerShell 7"));
+    assert!(stdout(&run(&directory, &["hook", "nu"], &[], None)).contains("from json"));
 
     let dir = run(&directory, &["dir"], &[], None);
     assert!(dir.status.success());
