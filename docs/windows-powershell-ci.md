@@ -55,17 +55,18 @@ writes.
 
 ## Running it
 
-Manual only:
+Manual, once the file is on the default branch:
 
 ```text
 Actions > windows-powershell51 > Run workflow
 ```
 
-GitHub registers a `workflow_dispatch` workflow only from the default branch. A
-copy of the file that exists only on a feature branch cannot be dispatched, even
-with `gh workflow run --ref`; the run must be started after the file reaches the
-default branch, or from a branch where a `push`/`pull_request` trigger is
-explicitly added (this workflow has none, by design).
+GitHub registers a `workflow_dispatch` workflow only from the default branch, so
+a copy that exists only on `feat/windows-ci` cannot be dispatched, even with
+`gh workflow run --ref`. The workflow therefore also has exactly one automatic
+trigger: a `push` to `feat/windows-ci`. There is no `pull_request`, tag, path
+filter, or other branch. Once the file reaches the default branch the manual
+trigger works there, and the branch-limited push trigger is inert elsewhere.
 
 On a Windows machine with Windows PowerShell 5.1:
 

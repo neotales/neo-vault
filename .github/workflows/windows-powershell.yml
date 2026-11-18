@@ -1,12 +1,15 @@
 # Windows PowerShell 5.1 shell hook tests.
 #
-# Manual only. GitHub registers a `workflow_dispatch` workflow from the default
-# branch; a copy that exists only on a feature branch cannot be dispatched.
-# Run it from Actions > windows-powershell51 > Run workflow.
+# Manual, plus one push trigger limited to feat/windows-ci so the 5.1 test can
+# run before this workflow is registered on the default branch. No other
+# trigger, branch, tag, or path filter.
 name: windows-powershell51
 
 "on":
   workflow_dispatch:
+  push:
+    branches:
+      - feat/windows-ci
 
 permissions:
   contents: read
