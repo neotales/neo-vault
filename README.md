@@ -87,7 +87,7 @@ nvault ensure KEY                  # create only if the provider confirms absenc
 nvault search QUERY                # names only
 nvault exec -- CMD [ARGS...]       # secrets in the child environment
 nvault x -- CMD [ARGS...]          # alias
-nvault env --shell bash|zsh|fish|powershell|pwsh|nu   # shell exports
+nvault env --shell bash|zsh|fish|powershell|pwsh|nu|json   # shell exports
 nvault hook bash|zsh|fish|powershell|pwsh|nu          # directory hook
 nvault completion bash|zsh|fish|powershell|elvish
 nvault providers                   # configured profiles, no credentials read
@@ -158,8 +158,18 @@ was executed here. The hook restores `[Console]::OutputEncoding` around the
 `nvault env` call so a non-ASCII value is not decoded with the console code
 page, and a sentinel keeps a second source of the hook from nesting `prompt`.
 
-Nushell has no `eval`, so `nvault env --shell nu` prints a JSON object instead
-of statements and the hook applies it with `load-env`. Save it once and source
+The PowerShell hook does not evaluate provider output. It asks for
+`env --shell json`, validates each property name, and copies the values into
+`Env:` with `Set-Item`, so a value is data even if it contains quotes, `$`, or
+newlines. `env --shell powershell` and `env --shell pwsh` still print
+`$env:NAME = 'value'` assignments for direct use. PowerShell reads five
+characters as a single quote — `'`, U+2018, U+2019, U+201A, and U+201B — and a
+value containing U+2019 could otherwise close the string. Every one of the five
+is doubled, matching `CharTraits.IsSingleQuote` in the PowerShell source; the
+runtime tests evaluate a rendered assignment containing all five.
+
+Nushell has no `eval`, so `nvault env --shell nu` (and `--shell json`) prints a
+JSON object and the hook applies it with `load-env`. Save it once and source
 the file from `config.nu`:
 
 ```nu
@@ -169,20 +179,30 @@ the file from `config.nu`:
 source ~/.config/nvault/nvault.nu
 ```
 
-The provider output never becomes code in Nushell: it travels as JSON and is
-loaded as data. In PowerShell and the POSIX hooks, values still reach an
-evaluation step (`Invoke-Expression`, `eval`). The generated text quotes each
-value: POSIX single quotes with `'\''`, PowerShell single quotes with `''`,
-fish with backslash escapes, so a value cannot close the string and append a
-command. Environment names are validated against
-`^[A-Za-z_][A-Za-z0-9_]*$` before the PowerShell and Nushell hooks remove them.
+Nushell keeps no shell-local variable across `source` calls, so the install
+marker and the recorded directory include `$nu.pid`. A child shell inherits the
+parent's value, sees a different pid, and installs and applies its own hook
+instead of skipping it. The installer also re-registers when the `pre_prompt`
+hook list is empty, so re-sourcing a config that replaced `$env.config`
+restores the hook.
 
-What was executed here: the bash hook under GNU bash 5.3.20, and the PowerShell
-and Nushell hooks under PowerShell 7.7.0 and Nushell 0.117.0 on Linux,
-including directory transitions, prompt preservation, JSON loading, and a value
-containing `';` plus a command that would create a file if it were executed.
-`zsh`, `fish`, Windows PowerShell 5.1, and macOS were not available in this
-environment and were not executed. Nushell releases older than 0.117.0 were not
+A failed probe or a failed load does not record the directory. The hook prints
+one fixed redacted line, `nvault: could not load this directory; will retry`,
+and the next prompt in the same directory tries again; bash and zsh retry from
+`PROMPT_COMMAND`/`chpwd_functions`, fish from `fish_prompt`, and PowerShell and
+Nushell from `prompt`/`pre_prompt`. The message contains no value and no path.
+
+`render_env` is also the library boundary, so it validates every export name as
+`[A-Za-z_][A-Za-z0-9_]*` and refuses `NVAULT_AUTOLOAD`, `NVAULT_DIR`,
+`NVAULT_LAST_DIR`, and `NVAULT_LOADED_KEYS`, which the hooks own.
+
+What was executed here on Linux: the bash hook under GNU bash 5.3.20, zsh
+5.9.2, fish 4.9.3, PowerShell 7.7.0, and Nushell 0.117.0, including directory
+transitions, cleanup with autoload disabled, prompt preservation, JSON loading,
+a transient first failure followed by a successful retry, a nested Nushell
+install, and values containing `';` or a smart quote plus a command that would
+create a file if it were executed. Windows PowerShell 5.1 and macOS were not
+available and were not executed. Nushell releases older than 0.117.0 were not
 exercised and may use different configuration syntax.
 
 ## Providers

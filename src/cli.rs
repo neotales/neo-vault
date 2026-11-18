@@ -190,4 +190,11 @@ pub enum EnvShell {
     /// `from json | load-env`.
     #[value(name = "nu")]
     Nu,
+    /// JSON object.
+    ///
+    /// The data form used by the PowerShell and Nushell hooks, so provider
+    /// output is applied without an evaluation step. Contains the same keys as
+    /// `nu`, including `NVAULT_LOADED_KEYS`.
+    #[value(name = "json")]
+    Json,
 }

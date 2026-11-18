@@ -323,6 +323,18 @@ fn lists_reads_writes_and_injects_through_the_cli() {
         serde_json::from_str(stdout(&nushell).trim()).expect("nu output is JSON");
     assert_eq!(nushell["DB"], "s3cr3t");
     assert_eq!(nushell["NVAULT_LOADED_KEYS"], "DB");
+
+    let json = run(&directory, &["env", "--shell", "json"], &environment, None);
+    assert!(json.status.success(), "{}", stderr(&json));
+    assert_eq!(
+        stdout(&json),
+        stdout(&run(
+            &directory,
+            &["env", "--shell", "nu"],
+            &environment,
+            None,
+        ))
+    );
 }
 
 #[derive(Default)]
