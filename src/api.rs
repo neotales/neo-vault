@@ -39,7 +39,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::provider::{self, EnsureStatus, ListedKey};
+use crate::provider::{self, Capabilities, EnsureStatus, ListedKey};
 use crate::secret::Secret;
 
 /// A configured, reusable secrets client.
@@ -49,6 +49,26 @@ pub struct Client {
 }
 
 impl Client {
+    /// Reports read, overwrite, listing, and race-safe ensure capabilities.
+    ///
+    /// # Errors
+    /// Returns an error if the provider cannot be selected.
+    pub fn capabilities(&self, selected: Option<&str>) -> Result<Capabilities> {
+        Ok(provider::select(&self.config, selected)?
+            .provider
+            .capabilities())
+    }
+
+    /// Whether `set` can create an absent key, without promising atomicity.
+    ///
+    /// # Errors
+    /// Returns an error if the provider cannot be selected.
+    pub fn can_create(&self, selected: Option<&str>) -> Result<bool> {
+        Ok(provider::select(&self.config, selected)?
+            .provider
+            .can_create())
+    }
+
     /// Opens a configuration file.
     ///
     /// # Errors
@@ -89,6 +109,10 @@ impl Client {
     /// Takes the same-user write lock for this provider scope and may block
     /// behind another nvault writer on this machine. A lock failure is an
     /// error, not an unlocked write.
+    /// Proton only creates absent items, cannot safely update, and its
+    /// list-then-create can race with external writers and create duplicates.
+    /// If its create process fails, the outcome may be indeterminate and the
+    /// item may exist; inspect the vault before retrying.
     ///
     /// # Errors
     ///

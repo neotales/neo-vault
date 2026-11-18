@@ -1553,7 +1553,12 @@ fn proton_create_uses_stdin_template_and_refuses_existing_items() {
 printf '%s\n' "$*" >> "$TRACE"
 case "$*" in
   "item list --output json --vault-name Work") cat "$LISTING" ;;
-  "item create login --from-template - --vault-name Work") cat > "$INPUT" ;;
+  "item create login --from-template - --vault-name Work")
+    cat > "$INPUT"
+    if [ "${FAIL_CREATE:-}" = "yes" ]; then
+      echo "fake-child-output" >&2
+      exit 1
+    fi ;;
   *) exit 2 ;;
 esac
 "#,
@@ -1581,6 +1586,11 @@ token_env = "PROTON_TEST_UNSET_PAT"
         ("INPUT", input.to_str().expect("input")),
         ("LISTING", listing.to_str().expect("listing")),
     ];
+    let providers = run(&directory, &["providers"], &env, None);
+    assert!(stdout(&providers).contains("read=true\twrite=false\tensure=false\tcreate=true"));
+    let client = nvault::Client::open(&directory.join(".nvault.toml")).expect("client");
+    assert!(!client.capabilities(None).expect("capabilities").write);
+    assert!(client.can_create(None).expect("create capability"));
     let result = run(
         &directory,
         &["set", "DB#username"],
@@ -1597,6 +1607,22 @@ token_env = "PROTON_TEST_UNSET_PAT"
         json,
         serde_json::json!({"title":"DB", "username":"fake-value"})
     );
+    let failed = run(
+        &directory,
+        &["set", "DB"],
+        &[env[0], env[1], env[2], ("FAIL_CREATE", "yes")],
+        Some(b"fake-value\n"),
+    );
+    assert!(!failed.status.success());
+    let message = stderr(&failed);
+    assert!(message.contains("outcome indeterminate"), "{message}");
+    assert!(message.contains("item may exist"), "{message}");
+    assert!(
+        message.contains("inspect the vault before retrying"),
+        "{message}"
+    );
+    assert!(!message.contains("fake-child-output"));
+    assert!(!message.contains("fake-value"));
     std::fs::write(&listing, r#"{"items":[{"title":"DB","share_id":"x"}]}"#).expect("listing");
     std::fs::write(&trace, "").expect("clear trace");
     let result = run(&directory, &["set", "DB"], &env, Some(b"fake-value\n"));

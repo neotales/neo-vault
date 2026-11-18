@@ -291,7 +291,11 @@ impl Provider for ProtonProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::READ_WRITE
+        Capabilities::READ_ONLY
+    }
+
+    fn can_create(&self) -> bool {
+        true
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ListedKey>> {
@@ -367,16 +371,14 @@ impl Provider for ProtonProvider {
         let mut child = command
             .spawn()
             .map_err(|_| Error::new("could not start pass-cli"))?;
-        let result = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::new("could not open pass-cli stdin"))?
-            .write_all(&bytes);
+        let result = child.stdin.take().map(|mut stdin| stdin.write_all(&bytes));
         let status = child
             .wait()
-            .map_err(|_| Error::new("pass-cli did not finish"))?;
-        if result.is_err() || !status.success() {
-            return Err(Error::new("pass-cli could not create Proton login"));
+            .map_err(|_| Error::new("Proton create outcome indeterminate; item may exist; inspect the vault before retrying"))?;
+        if !matches!(result, Some(Ok(()))) || !status.success() {
+            return Err(Error::new(
+                "Proton create outcome indeterminate; item may exist; inspect the vault before retrying",
+            ));
         }
         Ok(())
     }

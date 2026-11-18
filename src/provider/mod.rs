@@ -62,7 +62,7 @@ pub enum EnsureStatus {
 pub struct Capabilities {
     /// Values can be read.
     pub read: bool,
-    /// Some values can be written; individual providers may restrict updates.
+    /// Values can be written, including over an existing key.
     pub write: bool,
     /// Names can be enumerated. `list` never returns values.
     pub list: bool,
@@ -71,9 +71,15 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Read and write capabilities. Individual writes can be restricted;
-    /// `ensure` stays false until the adapter
-    /// has a race-safe create-if-absent path.
+    /// Read-only capabilities.
+    pub const READ_ONLY: Self = Self {
+        read: true,
+        write: false,
+        list: true,
+        ensure: false,
+    };
+
+    /// Read and write capabilities; `ensure` requires a race-safe create path.
     #[allow(dead_code)]
     pub const READ_WRITE: Self = Self {
         read: true,
@@ -81,6 +87,24 @@ impl Capabilities {
         list: true,
         ensure: false,
     };
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::Capabilities;
+
+    #[test]
+    fn read_only_does_not_advertise_overwrite_or_ensure() {
+        assert_eq!(
+            Capabilities::READ_ONLY,
+            Capabilities {
+                read: true,
+                write: false,
+                list: true,
+                ensure: false,
+            }
+        );
+    }
 }
 
 /// A configured secret provider.
@@ -94,6 +118,12 @@ pub trait Provider: Send + Sync {
     /// Capabilities implemented by this adapter.
     fn capabilities(&self) -> Capabilities;
 
+    /// Whether `set` can create a missing key. This does not imply atomic
+    /// create-if-absent; use `ensure` where that guarantee is required.
+    fn can_create(&self) -> bool {
+        self.capabilities().write
+    }
+
     /// Lists key names under a prefix. Must not return values. A backend that
     /// fetches item bodies internally, such as the Proton Pass CLI, must
     /// discard them and must not expose them here.
@@ -103,6 +133,12 @@ pub trait Provider: Send + Sync {
     fn get(&self, key: &str) -> Result<Secret>;
 
     /// Writes one value. The default is an explicit unsupported error.
+    ///
+    /// Some providers only create absent items and refuse updates. In
+    /// particular, Proton's list-then-create is not atomic against external
+    /// writers and can produce duplicate titles. If its create process fails,
+    /// the outcome may be indeterminate: the item may exist. Inspect the vault
+    /// before retrying.
     fn set(&self, _key: &str, _value: &Secret) -> Result<()> {
         Err(crate::error::unsupported("set", self.name()))
     }
